@@ -901,7 +901,31 @@ void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
 			return;
 		}
 	}
+	if (size == sizeof(uint32_t)) {
+		// Most reads are single SRT dwords; a fixed-size copy avoids a memmove call.
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), sizeof(uint32_t));
+		return;
+	}
 	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+}
+
+bool TryReadGuestBlockOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	// At most one tracker page, so the block touches at most two pages and the hints at its two
+	// ends cover every page it touches.
+	if (size == 0 || size > Graphics::TRACKER_PAGE_SIZE || g_gpu_resources == nullptr ||
+	    !Graphics::GuestGpu::IsGpuThread() || !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	// Never copy a hinted-dirty page in bulk: bytes of an in-flight download are only safe through
+	// the exact-byte check in TryReadGpuCleanBacking, which ReadGuestOnGpuThread applies per read.
+	const auto& buffers = GetGpuResources().GetBufferCache();
+	if (buffers.IsPageGpuDirtyHint(vaddr) || buffers.IsPageGpuDirtyHint(vaddr + size - 1)) {
+		return false;
+	}
+	// The lock-free hint may be stale. A stale "clean" makes this copy fault and read back, exactly
+	// as the per-dword copy in ReadGuestOnGpuThread would.
+	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+	return true;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

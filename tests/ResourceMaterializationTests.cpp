@@ -260,6 +260,23 @@ struct TableMemory {
     return !memory.reject_strict && Read(userdata, address, values);
   }
 
+  uint32_t direct_reads = 0;
+  uint32_t block_reads = 0;
+  bool reject_blocks = false;
+
+  static bool DirectRead(void *userdata, uint64_t address,
+                         std::span<uint32_t> values) {
+    static_cast<TableMemory *>(userdata)->direct_reads++;
+    return Read(userdata, address, values);
+  }
+
+  static bool BlockRead(void *userdata, uint64_t address,
+                        std::span<uint32_t> values) {
+    auto &memory = *static_cast<TableMemory *>(userdata);
+    memory.block_reads++;
+    return !memory.reject_blocks && Read(userdata, address, values);
+  }
+
   static bool Read(void *userdata, uint64_t address,
                    std::span<uint32_t> values) {
     const auto &memory = *static_cast<const TableMemory *>(userdata);
@@ -387,14 +404,17 @@ struct MemoFixture {
   }
 
   bool block_reads = false;
+  bool direct_blocks = false;
 
   bool Refresh(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan) {
     using namespace Libs::Graphics::ShaderRecompiler::IR;
     const SrtRuntime runtime{.user_data = user_data,
-                             .read_memory = TableMemory::Read,
+                             .read_memory = TableMemory::DirectRead,
                              .userdata = &memory,
                              .read_specialization_memory = TableMemory::StrictRead,
-                             .specialization_block_reads = block_reads};
+                             .specialization_block_reads = block_reads,
+                             .read_memory_block =
+                                 direct_blocks ? TableMemory::BlockRead : nullptr};
     return MaterializeResources(plan, runtime, snapshot, specialization, &memo);
   }
 };
@@ -424,6 +444,37 @@ void TestCleanBlockReads() {
           "block strict reads misread the condition or predicate");
     Check(offset != 0u || blocks.memory.strict_reads < exact.memory.strict_reads,
           "aligned strict reads were not served from one block");
+  }
+}
+
+void TestDirectBlockReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Every refresh is verified against the reference walker, which reads
+  // dword by dword, so the counts below include its reads.
+  const auto plan = MemoPlan(MemoPlanExtra::DynamicRead, true);
+  for (const auto offset : {0u, 0x30u}) {
+    for (const bool reject : {false, true}) {
+      MemoFixture exact;
+      MemoFixture blocks;
+      blocks.direct_blocks = true;
+      blocks.memory.reject_blocks = reject;
+      for (auto *fixture : {&exact, &blocks}) {
+        // With offset 0x30 the table starts inside a block, whose block read
+        // fails; the refresh reads that block's dwords one by one.
+        fixture->memory.base = TableMemory::Base + offset;
+        fixture->user_data[0] = static_cast<uint32_t>(fixture->memory.base);
+        fixture->memory.words[4] = 1u;
+        Check(fixture->Refresh(plan), "block-read plan failed to refresh");
+      }
+      Check(exact.snapshot.buffers == blocks.snapshot.buffers &&
+                exact.snapshot.flattened_srt == blocks.snapshot.flattened_srt,
+            "direct block reads changed the refresh");
+      Check(blocks.memory.block_reads != 0u,
+            "the refresh did not try block reads");
+      Check(reject ? blocks.memory.direct_reads == exact.memory.direct_reads
+                   : blocks.memory.direct_reads < exact.memory.direct_reads,
+            "direct block reads did not replace or fall back to dword reads");
+    }
   }
 }
 
@@ -577,6 +628,7 @@ int main() {
   TestMemoRejectsUntrackedInputs();
   TestCleanBlockReads();
   TestDirectConditions();
+  TestDirectBlockReads();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

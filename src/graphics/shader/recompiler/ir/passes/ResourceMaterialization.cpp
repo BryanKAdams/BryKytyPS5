@@ -1062,6 +1062,7 @@ SrtRuntime ObservedRuntime(const SrtRuntime& runtime, bool capture_reads, ReadCa
 		capture.ranges.clear();
 		observed.userdata = &capture;
 		observed.specialization_userdata = nullptr;
+		observed.read_memory_block       = nullptr;
 		observed.read_specialization_memory = CaptureStrictRead;
 		if (observed.read_memory != nullptr) observed.read_memory = CaptureOrdinaryRead;
 	}
@@ -1246,6 +1247,10 @@ bool MaterializeCompiled(const ResourcePlan& program, const SrtRuntime& runtime,
 		const auto   observed = ObservedRuntime(source, capture_reads, capture);
 		SrtEvaluator clean(program, compiled, CleanRuntime(observed));
 		SrtEvaluator walker(program, compiled, observed, true, &clean);
+		SrtDirectBlocks direct_blocks;
+		if (observed.read_memory != nullptr && observed.read_memory_block != nullptr) {
+			walker.UseDirectBlocks(direct_blocks);
+		}
 		result = Materialize(program, CompiledRoots {compiled}, runtime, observed, capture_reads,
 		                     clean, walker, snapshot, specialization, memo);
 	}

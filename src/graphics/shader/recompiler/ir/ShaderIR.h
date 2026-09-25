@@ -589,6 +589,9 @@ struct CompiledResourcePlan {
 	std::vector<uint32_t>                slots;       // Node per srt_reads entry.
 	std::vector<uint8_t>                 clean_slots; // Copy of ResourcePlan::clean_flat_slots.
 	std::vector<std::array<uint32_t, 8>> descriptors; // Nodes per descriptor source dword.
+	// Per descriptor source dword: the flat SRT offset when the dword is exactly a slot that the
+	// ordinary walker reads (so its value is already in the refreshed flat buffer), else NoNode.
+	std::vector<std::array<uint32_t, 8>> descriptor_slots;
 	std::vector<uint32_t>                key_counts;     // Indirect images, per descriptor source.
 	std::vector<uint32_t>                selector_masks; // Indirect images, per descriptor source.
 	std::vector<uint32_t>                conditions;     // Per control_flow block.

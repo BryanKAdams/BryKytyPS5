@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <set>
@@ -198,6 +199,7 @@ SrtPlanShape AnalyzeSrtPlan(const ShaderRecompiler::IR::ResourcePlan &plan) {
 struct SrtFakeMemory {
   uint64_t direct_reads = 0;
   uint64_t clean_reads = 0;
+  uint64_t block_reads = 0;
   uint32_t pattern = 0;
 
   static uint32_t Word(uint32_t pattern, uint64_t address) {
@@ -228,6 +230,16 @@ struct SrtFakeMemory {
                     std::span<uint32_t> values) {
     auto &memory = *static_cast<SrtFakeMemory *>(userdata);
     memory.clean_reads++;
+    for (size_t i = 0; i < values.size(); ++i) {
+      values[i] = Word(memory.pattern, address + i * 4u);
+    }
+    return true;
+  }
+
+  static bool Block(void *userdata, uint64_t address,
+                    std::span<uint32_t> values) {
+    auto &memory = *static_cast<SrtFakeMemory *>(userdata);
+    memory.block_reads++;
     for (size_t i = 0; i < values.size(); ++i) {
       values[i] = Word(memory.pattern, address + i * 4u);
     }
@@ -335,12 +347,44 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
   }
   std::printf("\n");
 
-  uint32_t memoizable = 0;
+  uint32_t memoizable = 0, conditions = 0, direct_conditions = 0, shown = 0;
   for (const auto &entry : plans) {
-    memoizable += IR::CompileResourcePlan(entry.plan).memoizable;
+    const auto &compiled = IR::CompileResourcePlan(entry.plan);
+    memoizable += compiled.memoizable;
+    for (uint32_t block = 0; block < compiled.conditions.size(); ++block) {
+      if (compiled.conditions[block] == IR::ResourceNode::NoNode) {
+        continue;
+      }
+      conditions++;
+      direct_conditions += compiled.direct_conditions[block] != 0u;
+      if (compiled.direct_conditions[block] == 0u && shown < 4 &&
+          std::getenv("KYTY_SRT_BENCH_SHOW") != nullptr) {
+        shown++;
+        // Print the condition's node tree (depth-limited).
+        std::function<void(uint32_t, int)> print = [&](uint32_t index,
+                                                        int depth) {
+          if (index == IR::ResourceNode::NoNode || depth > 7) {
+            return;
+          }
+          const auto &node = compiled.nodes[index];
+          std::printf("[host]      %*s#%u op=%u aux=%u imm=%llu\n", depth * 2,
+                      "", index, static_cast<uint32_t>(node.op), node.aux,
+                      static_cast<unsigned long long>(node.imm));
+          if (node.op == IR::ResourceNode::Op::ReadConst) {
+            return;
+          }
+          for (const auto arg : node.args) {
+            print(arg, depth + 1);
+          }
+        };
+        std::printf("[host]    %s: strict condition in 0x%016llx:\n", name,
+                    static_cast<unsigned long long>(entry.hash));
+        print(compiled.conditions[block], 0);
+      }
+    }
   }
-  std::printf("[host]    %s: memoizable plans=%u/%zu\n", name, memoizable,
-              plans.size());
+  std::printf("[host]    %s: memoizable plans=%u/%zu; direct conditions=%u/%u\n",
+              name, memoizable, plans.size(), direct_conditions, conditions);
 
   // Two user-data sets: a draw either repeats the previous inputs or moves to
   // the other set, which changes pointers and therefore flat SRT values.
@@ -359,6 +403,7 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
         .read_specialization_memory = SrtFakeMemory::Clean,
         // As in ProgramCache; the reference walker always reads exactly.
         .specialization_block_reads = true,
+        .read_memory_block = SrtFakeMemory::Block,
     };
   };
   const auto same = [](const IR::ResourceSnapshot &a,
@@ -378,22 +423,23 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
     std::vector<uint8_t> usable(plans.size(), 0);
     uint32_t usable_count = 0, mismatches = 0, memo_hits = 0;
     uint64_t reference_direct = 0, reference_clean = 0, compiled_direct = 0,
-             compiled_clean = 0;
+             compiled_clean = 0, compiled_blocks = 0;
     for (size_t i = 0; i < plans.size(); ++i) {
       for (uint32_t set = 0; set < 2; ++set) {
         IR::ResourceSnapshot expected, actual;
         IR::ResourceSpecialization expected_spec, actual_spec;
-        memory.direct_reads = memory.clean_reads = 0;
+        memory.direct_reads = memory.clean_reads = memory.block_reads = 0;
         const bool ok = IR::MaterializeResourcesReference(
             plans[i].plan, runtime_for(plans[i], set), expected,
             expected_spec);
         reference_direct += memory.direct_reads;
         reference_clean += memory.clean_reads;
-        memory.direct_reads = memory.clean_reads = 0;
+        memory.direct_reads = memory.clean_reads = memory.block_reads = 0;
         const bool compiled_ok = IR::MaterializeResources(
             plans[i].plan, runtime_for(plans[i], set), actual, actual_spec);
         compiled_direct += memory.direct_reads;
         compiled_clean += memory.clean_reads;
+        compiled_blocks += memory.block_reads;
         bool match = ok == compiled_ok &&
                      (!ok || same(expected, expected_spec, actual, actual_spec));
         // Memo: evaluate the other set, then this one twice.
@@ -428,13 +474,15 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
     }
     std::printf("[host]    %s: pattern %u: %u/%zu plans materialize; "
                 "mismatches=%u memo hits=%u; reads/pass reference "
-                "direct=%llu clean=%llu, compiled direct=%llu clean=%llu\n",
+                "direct=%llu clean=%llu, compiled direct=%llu clean=%llu "
+                "blocks=%llu\n",
                 name, pattern, usable_count, plans.size(), mismatches,
                 memo_hits,
                 static_cast<unsigned long long>(reference_direct / 2),
                 static_cast<unsigned long long>(reference_clean / 2),
                 static_cast<unsigned long long>(compiled_direct / 2),
-                static_cast<unsigned long long>(compiled_clean / 2));
+                static_cast<unsigned long long>(compiled_clean / 2),
+                static_cast<unsigned long long>(compiled_blocks / 2));
     Require(name, "compiled evaluator", mismatches == 0,
             "compiled materialization differs from the reference walker");
 

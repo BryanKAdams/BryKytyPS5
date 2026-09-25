@@ -21,6 +21,7 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	} else {
 		runtime.read_memory = +[](void*, uint64_t, std::span<uint32_t>) { return false; };
 	}
+	runtime.read_memory_block = nullptr;
 	return runtime;
 }
 
@@ -1517,6 +1518,25 @@ const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
 	for (uint32_t i = 0; i < program.uniform_fill.fill.words && i < compiled->fill.size(); i++) {
 		compiled->fill[i] = compiler.Node(program.uniform_fill.values[i]);
 	}
+	compiled->descriptor_slots.resize(compiled->descriptors.size());
+	for (uint32_t source = 0; source < compiled->descriptors.size(); source++) {
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			auto&      slot  = compiled->descriptor_slots[source][dword];
+			const auto index = compiled->descriptors[source][dword];
+			slot             = ResourceNode::NoNode;
+			if (index == ResourceNode::NoNode) {
+				continue;
+			}
+			const auto& node = compiled->nodes[index];
+			if (node.op != NodeOp::ReadConst || (node.flags & ResourceNode::CleanSlot) != 0u) {
+				continue;
+			}
+			const auto target = compiled->nodes[node.args[0]].op;
+			if (target == NodeOp::RawAddress || target == NodeOp::RawBuffer) {
+				slot = program.srt_reads[node.aux].flat_offset;
+			}
+		}
+	}
 	AnalyzeControlFlow(program, *compiled);
 	AnalyzeMemo(program, *compiled);
 	program.compiled = std::move(compiled);
@@ -1622,7 +1642,11 @@ bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
 		}
 	}
 	uint32_t word = 0;
-	if (m_runtime.read_memory != nullptr) {
+	if (m_direct_blocks != nullptr) {
+		if (!ReadDirectWord(address, word)) {
+			return false;
+		}
+	} else if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			return false;
 		}
@@ -1631,6 +1655,24 @@ bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
 	}
 	result = word;
 	return true;
+}
+
+bool SrtEvaluator::ReadDirectWord(uint64_t address, uint32_t& word) {
+	constexpr auto BlockBytes    = SrtDirectBlocks::BlockBytes;
+	const auto     block_address = address & ~(BlockBytes - 1u);
+	if (block_address != 0u && (address & 3u) == 0u) {
+		auto& block = m_direct_blocks->blocks[(block_address / BlockBytes) % SrtDirectBlocks::Slots];
+		if (block.address != block_address) {
+			block.address = block_address;
+			block.exact =
+			    !m_runtime.read_memory_block(m_runtime.userdata, block_address, block.words);
+		}
+		if (!block.exact) {
+			word = block.words[(address - block_address) / sizeof(uint32_t)];
+			return true;
+		}
+	}
+	return m_runtime.read_memory(m_runtime.userdata, address, {&word, 1});
 }
 
 bool SrtEvaluator::EvaluateInst(const ResourceNode& node, uint64_t& result) {
@@ -1906,10 +1948,14 @@ bool SrtEvaluator::EvaluateDescriptor(uint32_t source, DescriptorValue& result) 
 		return false;
 	}
 	const auto& dwords = m_compiled.descriptors[source];
+	const auto& slots  = m_compiled.descriptor_slots[source];
 	result             = {};
 	result.dword_count = m_program.descriptor_sources[source].dword_count;
 	for (uint32_t index = 0; index < result.dword_count; ++index) {
-		if (!Evaluate(dwords[index], result.dwords[index])) {
+		// A dword that is exactly a slot this walker refreshed evaluates to its flat value.
+		if (m_flat != nullptr && slots[index] != ResourceNode::NoNode) {
+			result.dwords[index] = (*m_flat)[slots[index]];
+		} else if (!Evaluate(dwords[index], result.dwords[index])) {
 			return false;
 		}
 	}
@@ -1979,6 +2025,10 @@ bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (offset >= flat.size() || !evaluator.Evaluate(m_compiled.slots[slot], flat[offset])) {
 			return false;
 		}
+	}
+	// Only this walker's own contexts use the shortcut; nested EXEC walkers evaluate normally.
+	if (m_active_mask == ResourceNode::NoNode) {
+		m_flat = &flat;
 	}
 	return true;
 }

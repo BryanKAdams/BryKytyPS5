@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <array>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -22,6 +23,23 @@ struct SrtRuntime {
 	bool                      specialization_block_reads = false;
 	// Userdata for read_specialization_memory; null means userdata.
 	void*                     specialization_userdata    = nullptr;
+	// Optional, with read_memory: fills an aligned 64-byte block with what read_memory would
+	// return dword by dword, or fails having read nothing. One refresh then serves its direct
+	// reads from blocks and reads a block's dwords one by one after a failure.
+	SrtMemoryReader           read_memory_block          = nullptr;
+};
+
+// One refresh's direct-read blocks (see SrtRuntime::read_memory_block), direct-mapped.
+struct SrtDirectBlocks {
+	static constexpr uint64_t BlockBytes = 64;
+	static constexpr uint32_t Slots      = 16;
+
+	struct Block {
+		uint64_t                                         address = 0; // Zero is never a block.
+		std::array<uint32_t, BlockBytes / sizeof(uint32_t)> words;
+		bool                                             exact = false;
+	};
+	std::array<Block, Slots> blocks;
 };
 
 [[nodiscard]] inline void* SpecializationUserdata(const SrtRuntime& runtime) {
@@ -95,11 +113,14 @@ public:
 	// An empty span means that all sources are active.
 	std::span<const uint8_t> FindActiveSources();
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// Serves this walker's own direct reads from blocks; needs SrtRuntime::read_memory_block.
+	void UseDirectBlocks(SrtDirectBlocks& blocks) { m_direct_blocks = &blocks; }
 
 private:
 	bool EvaluateWide(uint32_t node, uint64_t& result);
 	bool EvaluateInst(const ResourceNode& node, uint64_t& result);
 	bool EvaluateRawRead(const ResourceNode& node, uint64_t& result);
+	bool ReadDirectWord(uint64_t address, uint32_t& word);
 
 	const ResourcePlan&              m_program;
 	const CompiledResourcePlan&      m_compiled;
@@ -111,6 +132,9 @@ private:
 	ResourcePlan::EvaluationContext& m_context;
 	ResourcePlan::EvaluationContext::Entry* m_memo;
 	uint64_t                         m_generation;
+	// Set by a successful RefreshFlatBuffer: this walker's slot values.
+	const std::vector<uint32_t>*     m_flat = nullptr;
+	SrtDirectBlocks*                 m_direct_blocks = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
