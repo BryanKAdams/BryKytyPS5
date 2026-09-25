@@ -2295,6 +2295,161 @@ public:
     std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
   }
 
+  // A 4K game in a 1280x720 window is shrunk 3:1. One linear blit then reads a
+  // single texel per pixel, so a per-pixel dither aliases into a static
+  // diagonal pattern; presentation halves through the frame's mip chain first.
+  void CheckPresentDownscale() {
+    constexpr const char *name = "PresentDownscale";
+    struct LevelCase {
+      vk::Extent2D source;
+      vk::Extent2D target;
+      u32 levels;
+      u32 expected;
+    };
+    constexpr LevelCase level_cases[] = {
+        {{3840, 2160}, {1280, 720}, 12, 1}, {{3840, 2160}, {1920, 1080}, 12, 0},
+        {{3840, 2160}, {2560, 1440}, 12, 0}, {{3840, 2160}, {640, 360}, 12, 2},
+        {{3840, 2160}, {1920, 1000}, 12, 1}, {{1920, 1080}, {2560, 1440}, 11, 0},
+        {{3840, 2160}, {1280, 720}, 1, 0},   {{3840, 2160}, {1, 1}, 12, 11},
+    };
+    for (const auto &c : level_cases) {
+      Require(name, "source level",
+              PresentSourceLevel(c.source, c.target, c.levels) == c.expected,
+              "presentation picked the wrong source mip level");
+    }
+
+    constexpr u32 width = 384;
+    constexpr u32 height = 216;
+    constexpr vk::Extent2D target{width / 3, height / 3};
+    const u32 levels = static_cast<u32>(std::bit_width(width));
+    std::vector<std::vector<u32>> mips(levels);
+    mips[0].resize(width * height);
+    for (u32 y = 0; y < height; y++) {
+      for (u32 x = 0; x < width; x++) {
+        mips[0][y * width + x] = ((x + y) & 1u) != 0 ? 0xffffffffu : 0xff000000u;
+      }
+    }
+    // Returns the largest distance of any red value from mid-grey.
+    auto present = [&](bool downscale) {
+      auto source = CreateImageMips(
+          name, width, height, vk::Format::eR8G8B8A8Unorm, {}, mips, 1,
+          vk::ImageLayout::eTransferSrcOptimal, vk::ImageType::e2D,
+          vk::ImageViewType::e2D, 1);
+      auto destination = CreateImage2D(
+          name, target.width, target.height, vk::Format::eR8G8B8A8Unorm, {},
+          {}, 1, vk::ImageLayout::eTransferDstOptimal);
+      const auto level = downscale
+                             ? PresentSourceLevel({width, height}, target, levels)
+                             : 0u;
+      auto cmd = BeginCommands(name, "present");
+      RecordPresentDownscale(cmd, source.image, {width, height}, level);
+      vk::ImageBlit region{};
+      region.srcSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1};
+      region.srcOffsets[1] = vk::Offset3D{static_cast<int32_t>(width >> level),
+                                          static_cast<int32_t>(height >> level), 1};
+      region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+      region.dstOffsets[1] = vk::Offset3D{static_cast<int32_t>(target.width),
+                                          static_cast<int32_t>(target.height), 1};
+      cmd.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal,
+                    destination.image, vk::ImageLayout::eTransferDstOptimal, 1,
+                    &region, vk::Filter::eLinear);
+      EndSubmitAndFree(name, "present", cmd);
+      const auto pixels = ReadImage(name, &destination);
+      DestroyImage(&destination);
+      DestroyImage(&source);
+      int deviation = 0;
+      for (const auto pixel : pixels) {
+        deviation = std::max(deviation, std::abs(static_cast<int>(pixel & 0xffu) - 128));
+      }
+      return deviation;
+    };
+    const auto single_blit = present(false);
+    const auto downscaled = present(true);
+    Require(name, "fixture", single_blit >= 100,
+            "a single 3:1 linear blit no longer aliases the checkerboard");
+    Require(name, "downscale", downscaled <= 3,
+            "presentation downscale aliased a one-texel checkerboard");
+    std::printf("[host]    %-32s ok (single blit %d, downscaled %d)\n", name,
+                single_blit, downscaled);
+  }
+
+  // --present-benchmark: GPU time to present a 3840x2160 frame to common
+  // window sizes with one linear blit and with the mip-chain downscale.
+  void RunPresentBenchmark() {
+    constexpr const char *name = "PresentBenchmark";
+    constexpr u32 width = 3840;
+    constexpr u32 height = 2160;
+    const u32 levels = static_cast<u32>(std::bit_width(width));
+    std::vector<std::vector<u32>> mips(levels);
+    mips[0].resize(width * height);
+    u32 seed = 1;
+    for (auto &pixel : mips[0]) {
+      seed = seed * 1664525u + 1013904223u;
+      pixel = seed | 0xff000000u;
+    }
+    auto source = CreateImageMips(name, width, height, vk::Format::eR8G8B8A8Unorm,
+                                  {}, mips, 1, vk::ImageLayout::eTransferSrcOptimal,
+                                  vk::ImageType::e2D, vk::ImageViewType::e2D, 1);
+    vk::QueryPoolCreateInfo query_info{};
+    query_info.queryType = vk::QueryType::eTimestamp;
+    query_info.queryCount = 2;
+    vk::QueryPool pool = nullptr;
+    RequireVk(name, "query pool", m_device.createQueryPool(&query_info, nullptr, &pool),
+              "vkCreateQueryPool");
+    vk::PhysicalDeviceProperties properties{};
+    m_physical_device.getProperties(&properties);
+    const double ns_per_tick = properties.limits.timestampPeriod;
+    for (const vk::Extent2D target :
+         {vk::Extent2D{1280, 720}, vk::Extent2D{1920, 1080}, vk::Extent2D{2560, 1440}}) {
+      auto destination = CreateImage2D(name, target.width, target.height,
+                                       vk::Format::eR8G8B8A8Unorm, {}, {}, 1,
+                                       vk::ImageLayout::eTransferDstOptimal);
+      for (const bool downscale : {false, true}) {
+        const auto level =
+            downscale ? PresentSourceLevel({width, height}, target, levels) : 0u;
+        std::vector<double> samples;
+        for (int iteration = 0; iteration < 110; iteration++) {
+          auto cmd = BeginCommands(name, "present");
+          cmd.resetQueryPool(pool, 0, 2);
+          cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, pool, 0);
+          RecordPresentDownscale(cmd, source.image, {width, height}, level);
+          vk::ImageBlit region{};
+          region.srcSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1};
+          region.srcOffsets[1] =
+              vk::Offset3D{static_cast<int32_t>(std::max(width >> level, 1u)),
+                           static_cast<int32_t>(std::max(height >> level, 1u)), 1};
+          region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+          region.dstOffsets[1] = vk::Offset3D{static_cast<int32_t>(target.width),
+                                              static_cast<int32_t>(target.height), 1};
+          cmd.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal,
+                        destination.image, vk::ImageLayout::eTransferDstOptimal, 1,
+                        &region, vk::Filter::eLinear);
+          cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, 1);
+          EndSubmitAndFree(name, "present", cmd);
+          std::array<uint64_t, 2> ticks{};
+          RequireVk(name, "query results",
+                    m_device.getQueryPoolResults(
+                        pool, 0, 2, sizeof(ticks), ticks.data(), sizeof(uint64_t),
+                        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                    "vkGetQueryPoolResults");
+          if (iteration >= 10) {
+            samples.push_back(static_cast<double>(ticks[1] - ticks[0]) * ns_per_tick /
+                              1000.0);
+          }
+        }
+        std::sort(samples.begin(), samples.end());
+        std::printf("[host]    %s: 3840x2160 -> %ux%u %-11s level %u: median %.1f us, "
+                    "p90 %.1f us\n",
+                    name, target.width, target.height,
+                    downscale ? "downscaled" : "single blit", level,
+                    samples[samples.size() / 2], samples[samples.size() * 9 / 10]);
+      }
+      DestroyImage(&destination);
+    }
+    m_device.destroyQueryPool(pool, nullptr);
+    DestroyImage(&source);
+  }
+
   void CheckStreamBufferRing() {
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -34270,6 +34425,16 @@ int main(int argc, char **argv) {
     vulkan.CheckHostImageAllocation();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--present-downscale-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPresentDownscale();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--present-benchmark") == 0) {
+    VulkanHarness vulkan;
+    vulkan.RunPresentBenchmark();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--occlusion-dump-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
@@ -34668,6 +34833,7 @@ int main(int argc, char **argv) {
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
+  vulkan.CheckPresentDownscale();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();

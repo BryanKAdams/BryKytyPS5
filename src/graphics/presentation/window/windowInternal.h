@@ -23,6 +23,18 @@ struct SurfaceCapabilities {
 	std::vector<vk::PresentModeKHR>   present_modes;
 };
 
+// A linear blit reads 2x2 source texels per destination pixel, so a blit that shrinks by more
+// than 2x skips texels and aliases fine guest detail into a static moire (a 4K game's per-pixel
+// dither becomes a diagonal pattern in a 1280x720 window). Prepared frames keep a mip chain: a
+// 2:1 linear blit into the next level is an exact 2x2 box filter, and the blit to the swapchain
+// starts from the first level that is at most twice the target size.
+[[nodiscard]] uint32_t PresentSourceLevel(vk::Extent2D source, vk::Extent2D target,
+                                          uint32_t levels) noexcept;
+// Fills levels 1..level of a 2D color image from level 0, which must be in eTransferSrcOptimal.
+// Levels 1..level are left in eTransferSrcOptimal.
+void RecordPresentDownscale(vk::CommandBuffer command, vk::Image image, vk::Extent2D extent,
+                            uint32_t level);
+
 struct WindowLoopState {
 	SDL_Event        event {};
 	bool             need_exit = false;
