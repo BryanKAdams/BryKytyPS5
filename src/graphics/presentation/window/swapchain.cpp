@@ -15,6 +15,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <bit>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -195,11 +196,15 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 		graphics.DeleteImage(dst);
 	}
 
+	// The mip chain lets presentation shrink the frame without aliasing (see
+	// PresentSourceLevel). Without blit-destination support, frames present from level 0 only.
+	const bool mips = static_cast<bool>(features & vk::FormatFeatureFlagBits::eBlitDst);
 	vk::ImageCreateInfo create {};
 	create.sType         = vk::StructureType::eImageCreateInfo;
 	create.imageType     = vk::ImageType::e2D;
 	create.extent        = {extent.width, extent.height, 1};
-	create.mipLevels     = 1;
+	create.mipLevels =
+	    mips ? static_cast<uint32_t>(std::bit_width(std::max(extent.width, extent.height))) : 1u;
 	create.arrayLayers   = 1;
 	create.format        = format;
 	create.tiling        = vk::ImageTiling::eOptimal;
@@ -263,6 +268,61 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
 	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+}
+
+static vk::Extent2D MipExtent(vk::Extent2D extent, uint32_t level) {
+	return {std::max(extent.width >> level, 1u), std::max(extent.height >> level, 1u)};
+}
+
+uint32_t PresentSourceLevel(vk::Extent2D source, vk::Extent2D target, uint32_t levels) noexcept {
+	uint32_t level = 0;
+	for (; level + 1 < levels; level++) {
+		const auto extent = MipExtent(source, level);
+		if (extent.width <= 2ull * target.width && extent.height <= 2ull * target.height) {
+			break;
+		}
+	}
+	return level;
+}
+
+void RecordPresentDownscale(vk::CommandBuffer command, vk::Image image, vk::Extent2D extent,
+                            uint32_t level) {
+	for (uint32_t mip = 1; mip <= level; mip++) {
+		// Undefined discards the level; the transfer-stage source scope orders this write after
+		// an earlier presentation's read of it.
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+		barrier.oldLayout           = vk::ImageLayout::eUndefined;
+		barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image               = image;
+		barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+
+		const auto  source      = MipExtent(extent, mip - 1);
+		const auto  destination = MipExtent(extent, mip);
+		vk::ImageBlit region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, mip - 1, 0, 1};
+		region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(source.width),
+		                                      static_cast<int32_t>(source.height), 1};
+		region.dstSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, 1};
+		region.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(destination.width),
+		                                      static_cast<int32_t>(destination.height), 1};
+		command.blitImage(image, vk::ImageLayout::eTransferSrcOptimal, image,
+		                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		barrier.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+		barrier.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
+		command.pipelineBarrier2(dependency);
+	}
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
@@ -605,6 +665,11 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	EXIT_IF(m_image_index >= m_images.size());
 	auto vk_command = command.Handle();
 
+	const vk::Extent2D source_extent {source.extent.width, source.extent.height};
+	const auto         source_level = PresentSourceLevel(source_extent, m_extent, source.mip_levels);
+	RecordPresentDownscale(vk_command, source.image, source_extent, source_level);
+	const auto blit_extent = MipExtent(source_extent, source_level);
+
 	vk::ImageMemoryBarrier to_transfer {};
 	to_transfer.sType                           = vk::StructureType::eImageMemoryBarrier;
 	to_transfer.dstAccessMask                   = vk::AccessFlagBits::eTransferWrite;
@@ -625,11 +690,11 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 
 	vk::ImageBlit region {};
 	region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
-	region.srcSubresource.mipLevel       = 0;
+	region.srcSubresource.mipLevel       = source_level;
 	region.srcSubresource.baseArrayLayer = 0;
 	region.srcSubresource.layerCount     = 1;
-	region.srcOffsets[1].x               = static_cast<int>(source.extent.width);
-	region.srcOffsets[1].y               = static_cast<int>(source.extent.height);
+	region.srcOffsets[1].x               = static_cast<int>(blit_extent.width);
+	region.srcOffsets[1].y               = static_cast<int>(blit_extent.height);
 	region.srcOffsets[1].z               = 1;
 	region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 	region.dstSubresource.mipLevel       = 0;

@@ -642,5 +642,65 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// --journal-disasm <journal copy> <hash>...: prints the decoded guest code and
+// the specialized native IR of the first recorded permutation of each hash.
+void RunJournalDisasm(const char *journal_path, std::span<char *const> hashes) {
+  using namespace ShaderRecompiler;
+  auto records = ReadShaderJournalCopy(journal_path);
+  std::set<uint64_t> wanted;
+  for (const auto *text : hashes) {
+    wanted.insert(std::strtoull(text, nullptr, 16));
+  }
+  std::set<uint64_t> printed;
+  for (auto &record : records) {
+    if (!wanted.contains(record.hash) || !printed.insert(record.hash).second) {
+      continue;
+    }
+    CompileOptions options;
+    options.stage = record.stage;
+    options.shader_hash = record.hash;
+    std::array<uint32_t, 40> zeros{};
+    options.user_data = std::span(zeros).first(record.user_data_count);
+    options.back_code = record.back_code;
+    options.user_data_base = record.user_data_base;
+    options.wave_size = record.wave_size;
+    options.dump_ir = true;
+    options.early_dump = false;
+    options.dump_label = "JournalDisasm";
+    std::visit(
+        [&](auto &info) {
+          using Info = std::decay_t<decltype(info)>;
+          if constexpr (std::is_same_v<Info, ShaderVertexInputInfo>) {
+            options.input_info.vertex = &info;
+          } else if constexpr (std::is_same_v<Info, ShaderPixelInputInfo>) {
+            options.input_info.pixel = &info;
+          } else {
+            options.input_info.compute = &info;
+          }
+        },
+        record.info);
+    std::printf("=== shader %016" PRIx64 " stage %d user_data %u base %u "
+                "wave %u words %zu\n",
+                record.hash, static_cast<int>(record.stage),
+                record.user_data_count, record.user_data_base,
+                record.wave_size, record.code.size());
+    auto translated = TranslateProgram(record.code, options);
+    std::printf("--- decoded\n%s", translated.decoded_dump.c_str());
+    if (translated.skip_dispatch ||
+        !translated.program.resource_tracking_complete ||
+        translated.program.info.buffers.size() !=
+            record.specialization.buffers.size() ||
+        translated.program.info.images.size() >
+            record.specialization.images.size()) {
+      std::printf("--- (no IR: record does not specialize)\n");
+      continue;
+    }
+    auto compiled = CompileProgram(std::move(translated), options,
+                                   record.specialization,
+                                   record.push_data_start_dword);
+    std::printf("--- IR\n%s", compiled.ir_dump.c_str());
+  }
+}
+
 } // namespace
 } // namespace Libs::Graphics
