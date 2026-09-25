@@ -81,6 +81,16 @@ validated by this patch set.
   kept as `MaterializeResourcesReference`. Setting `KYTY_VERIFY_SRT=1` compares every refresh
   with it and aborts on a difference, and `KYTY_SRT_STATS=1` logs how often refreshes reuse
   descriptors.
+- **Refresh reads (branch `perf/draw-cpu`):** at 60 fps `Thread_Gpu` was about 4% idle, with
+  materialization at 29.6% of its samples. Direct SRT reads now come from 64-byte blocks
+  (`TryReadGuestBlockOnGpuThread`), which copies a block only when no page it touches has a
+  GPU-dirty hint. Otherwise the refresh reads that block's dwords with `ReadGuestOnGpuThread`,
+  which keeps the exact-byte clean check. Branch conditions that read only flat SRT slots use
+  those direct values, because every refresh reads the slots anyway. A condition is skipped
+  when no block reachable from it guards a source. Descriptor dwords that are exactly flat
+  slots come from the refreshed flat buffer. The strict reader no longer wraps every direct
+  read in a forwarding call. Most Astro Bot conditions test constant-buffer words, so they
+  keep their strict reads.
 
 The dense evaluator, retained resource snapshots, and replacement of the old SRT readability path
 were already present at the base revision. Their historical PR improvements are not additional gains

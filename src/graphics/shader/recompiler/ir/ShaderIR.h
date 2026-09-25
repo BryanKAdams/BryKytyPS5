@@ -601,6 +601,9 @@ struct CompiledResourcePlan {
 	std::vector<uint8_t>                 direct_conditions;
 	// Sources not guarded by any control_flow block start active; empty if a block is invalid.
 	std::vector<uint8_t>                 initial_active;
+	// Per control_flow block: no block reachable from its successors guards a source, so its
+	// condition and successors cannot change the active sources.
+	std::vector<uint8_t>                 inert_successors;
 	std::array<uint32_t, 4>              fill {ResourceNode::NoNode, ResourceNode::NoNode,
 	                                           ResourceNode::NoNode, ResourceNode::NoNode};
 	// Buffer, image and sampler descriptors are a pure function of these inputs and the active

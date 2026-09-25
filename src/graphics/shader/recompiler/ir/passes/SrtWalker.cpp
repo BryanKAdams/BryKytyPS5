@@ -21,7 +21,6 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	} else {
 		runtime.read_memory = +[](void*, uint64_t, std::span<uint32_t>) { return false; };
 	}
-	runtime.read_memory_block = nullptr;
 	return runtime;
 }
 
@@ -1441,6 +1440,34 @@ void AnalyzeControlFlow(const ResourcePlan& program, CompiledResourcePlan& compi
 			compiled.initial_active[source] = 0u;
 		}
 	}
+	// A block's successors are inert when no block reachable from them (along any path) has
+	// sources: whatever the condition, the walk adds nothing.
+	const auto count = program.control_flow.size();
+	compiled.inert_successors.assign(count, 0u);
+	std::vector<uint8_t>  reached;
+	std::vector<uint32_t> stack;
+	for (uint32_t block = 0; block < count; block++) {
+		reached.assign(count, 0u);
+		stack.assign(program.control_flow[block].successors.begin(),
+		             program.control_flow[block].successors.end());
+		bool inert = true;
+		while (!stack.empty() && inert) {
+			const auto index = stack.back();
+			stack.pop_back();
+			if (index >= count) {
+				inert = false;
+				break;
+			}
+			if (reached[index] != 0u) {
+				continue;
+			}
+			reached[index] = 1u;
+			inert          = program.control_flow[index].sources.empty();
+			stack.insert(stack.end(), program.control_flow[index].successors.begin(),
+			             program.control_flow[index].successors.end());
+		}
+		compiled.inert_successors[block] = inert ? 1u : 0u;
+	}
 }
 
 void AnalyzeMemo(const ResourcePlan& program, CompiledResourcePlan& compiled) {
@@ -1642,11 +1669,7 @@ bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
 		}
 	}
 	uint32_t word = 0;
-	if (m_direct_blocks != nullptr) {
-		if (!ReadDirectWord(address, word)) {
-			return false;
-		}
-	} else if (m_runtime.read_memory != nullptr) {
+	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			return false;
 		}
@@ -1655,24 +1678,6 @@ bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
 	}
 	result = word;
 	return true;
-}
-
-bool SrtEvaluator::ReadDirectWord(uint64_t address, uint32_t& word) {
-	constexpr auto BlockBytes    = SrtDirectBlocks::BlockBytes;
-	const auto     block_address = address & ~(BlockBytes - 1u);
-	if (block_address != 0u && (address & 3u) == 0u) {
-		auto& block = m_direct_blocks->blocks[(block_address / BlockBytes) % SrtDirectBlocks::Slots];
-		if (block.address != block_address) {
-			block.address = block_address;
-			block.exact =
-			    !m_runtime.read_memory_block(m_runtime.userdata, block_address, block.words);
-		}
-		if (!block.exact) {
-			word = block.words[(address - block_address) / sizeof(uint32_t)];
-			return true;
-		}
-	}
-	return m_runtime.read_memory(m_runtime.userdata, address, {&word, 1});
 }
 
 bool SrtEvaluator::EvaluateInst(const ResourceNode& node, uint64_t& result) {
@@ -1977,22 +1982,41 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 			}
 		}
 	}
-	auto& strict  = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-	auto& visited = m_program.visited_blocks;
-	auto& pending = m_program.pending_blocks;
-	visited.assign(m_program.control_flow.size(), 0u);
+	auto&      strict      = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	auto&      visited     = m_program.visited_blocks;
+	auto&      pending     = m_program.pending_blocks;
+	const auto block_count = m_program.control_flow.size();
+	// Most plans have at most 64 blocks; track those in a mask instead of clearing a vector.
+	const bool small       = block_count <= 64u;
+	uint64_t   visited_mask = 0;
+	if (!small) {
+		visited.assign(block_count, 0u);
+	}
 	pending.clear();
 	pending.push_back(0u);
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();
-		if (visited.at(index)) {
-			continue;
+		EXIT_IF(index >= block_count);
+		if (small) {
+			const auto bit = uint64_t {1} << index;
+			if ((visited_mask & bit) != 0u) {
+				continue;
+			}
+			visited_mask |= bit;
+		} else {
+			if (visited[index]) {
+				continue;
+			}
+			visited[index] = 1u;
 		}
-		visited[index] = 1u;
 		const auto& block = m_program.control_flow[index];
 		for (const auto source: block.sources) {
 			active[source] = 1u;
+		}
+		// Nothing reachable from here adds a source: skip the condition and its strict reads.
+		if (!m_compiled.inert_successors.empty() && m_compiled.inert_successors[index] != 0u) {
+			continue;
 		}
 		uint32_t   condition      = 0;
 		const auto condition_node = m_compiled.conditions[index];
