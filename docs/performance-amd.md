@@ -81,6 +81,32 @@ validated by this patch set.
   kept as `MaterializeResourcesReference`. Setting `KYTY_VERIFY_SRT=1` compares every refresh
   with it and aborts on a difference, and `KYTY_SRT_STATS=1` logs how often refreshes reuse
   descriptors.
+- **Refresh reads (branch `perf/draw-cpu`):** at 60 fps `Thread_Gpu` was about 4% idle, with
+  materialization at 29.6% of its samples. The strict reader has its own userdata
+  (`SrtRuntime::specialization_userdata`). The 64-byte strict-read cache therefore no longer
+  wraps every direct read in a forwarding call, which had a stack-cookie check. The profile had
+  named that call `vector<pair>::_Emplace_reallocate`, because it had no public symbol. Branch
+  conditions that read only flat SRT slots use those direct values, because every refresh reads
+  the slots anyway. A condition is skipped when no block reachable from it guards a source.
+  Descriptor dwords that are exactly flat slots come from the refreshed flat buffer, and
+  single-dword `ReadGuestOnGpuThread` copies avoid a `memmove` call. Only 16 of the 1,125 Astro
+  Bot conditions read nothing but flat slots, and 4 are skipped. The rest test constant-buffer
+  words and keep their strict reads. Serving direct reads from 64-byte blocks was tried and
+  removed: about one overworld run in three stayed at 51-54 fps instead of 58. A wider copy can
+  fault on GPU-written bytes of a protected page that single dwords never touch.
+
+- **Indexed VGPR reads (`V_MOVRELS_B32`/`V_MOVRELD_B32`):** each one compares M0 with every
+  register index up to the shader's VGPR limit. Constant propagation now tracks the possible
+  values of a U32 when they form a small set (small bit fields and masks, arithmetic on such sets,
+  selects, phis). It folds `==`/`!=` against a constant outside that set, so unreachable
+  chain links and their register operands disappear. Astro Bot's hottest pixel shader
+  (`ef31694ed8d87754`) has 51 `V_MOVRELS` whose M0 is a 3-bit field times 5. Its SPIR-V went
+  from 3,133 to 840 `OpSelect` and from 57,764 to 32,254 words. GPU zones in alternating runs
+  measured it about 5-9% cheaper per run (0.97-1.01 ms to 0.88-0.95 ms), and
+  `92b1436c8042e396` (52 `V_MOVRELS`) about 2% cheaper per pixel. Shaders without `V_MOVRELS`
+  stayed within 1%. The AMD driver already folded most of these selects, so the saving is
+  smaller than the SPIR-V suggests; the smaller modules also compile faster. The overworld fps is
+  unchanged because dynamic resolution spends GPU headroom on render size.
 
 The dense evaluator, retained resource snapshots, and replacement of the old SRT readability path
 were already present at the base revision. Their historical PR improvements are not additional gains
@@ -400,6 +426,8 @@ measured on the Ryzen 7 7800X3D:
 | Compiled evaluator | 1.39-1.45 |
 | Compiled + memo, unchanged inputs | 1.02-1.10 |
 | Compiled + memo, inputs change every call | 1.43-1.51 |
+| Compiled, `perf/draw-cpu` (93a8a7f9) | 1.14-1.21 |
+| Compiled + memo, unchanged inputs, `perf/draw-cpu` | 0.92-0.98 |
 
 Both paths made the same 9,972 direct reads per pass. Strict reads fell from 724-1,147
 to 140-395 per pass with 64-byte blocks. The memo costs about 3% when every refresh misses, so it

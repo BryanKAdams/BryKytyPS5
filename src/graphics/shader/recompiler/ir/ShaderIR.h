@@ -589,9 +589,21 @@ struct CompiledResourcePlan {
 	std::vector<uint32_t>                slots;       // Node per srt_reads entry.
 	std::vector<uint8_t>                 clean_slots; // Copy of ResourcePlan::clean_flat_slots.
 	std::vector<std::array<uint32_t, 8>> descriptors; // Nodes per descriptor source dword.
+	// Per descriptor source dword: the flat SRT offset when the dword is exactly a slot that the
+	// ordinary walker reads (so its value is already in the refreshed flat buffer), else NoNode.
+	std::vector<std::array<uint32_t, 8>> descriptor_slots;
 	std::vector<uint32_t>                key_counts;     // Indirect images, per descriptor source.
 	std::vector<uint32_t>                selector_masks; // Indirect images, per descriptor source.
 	std::vector<uint32_t>                conditions;     // Per control_flow block.
+	// Per control_flow block: the condition reads only flat SRT slots (besides user data, the
+	// shader base and pure operations). Every refresh reads those slots directly anyway, so the
+	// condition uses the direct values instead of strict reads.
+	std::vector<uint8_t>                 direct_conditions;
+	// Sources not guarded by any control_flow block start active; empty if a block is invalid.
+	std::vector<uint8_t>                 initial_active;
+	// Per control_flow block: no block reachable from its successors guards a source, so its
+	// condition and successors cannot change the active sources.
+	std::vector<uint8_t>                 inert_successors;
 	std::array<uint32_t, 4>              fill {ResourceNode::NoNode, ResourceNode::NoNode,
 	                                           ResourceNode::NoNode, ResourceNode::NoNode};
 	// Buffer, image and sampler descriptors are a pure function of these inputs and the active

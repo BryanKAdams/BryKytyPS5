@@ -15,9 +15,12 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
-	runtime.read_memory = runtime.read_specialization_memory != nullptr
-	                          ? runtime.read_specialization_memory
-	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	if (runtime.read_specialization_memory != nullptr) {
+		runtime.read_memory = runtime.read_specialization_memory;
+		runtime.userdata    = SpecializationUserdata(runtime);
+	} else {
+		runtime.read_memory = +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	}
 	return runtime;
 }
 
@@ -1006,7 +1009,10 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
-	auto& active = m_program.active_sources;
+	// Conditions over flat SRT slots use this walker; see CompiledResourcePlan.
+	const auto& direct = CompileResourcePlan(m_program).direct_conditions;
+	auto&       strict = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	auto&       active = m_program.active_sources;
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow) {
 		for (const auto source: block.sources) {
@@ -1030,8 +1036,9 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 			active[source] = 1u;
 		}
 		uint32_t condition = 0;
+		auto&    evaluator = index < direct.size() && direct[index] != 0u ? *this : strict;
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    Evaluate(block.condition, condition)) {
+		    evaluator.Evaluate(block.condition, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
@@ -1374,6 +1381,95 @@ private:
 	std::vector<uint8_t>  m_clean_visited;
 };
 
+// A condition may use the ordinary walker when everything it reads directly is a flat SRT slot,
+// which RefreshFlatBuffer reads (and memoizes) on every refresh anyway. Select predicates still go
+// to the strict walker, as for any ordinary value.
+class DirectConditionAnalysis {
+public:
+	explicit DirectConditionAnalysis(const CompiledResourcePlan& compiled)
+	    : m_compiled(compiled), m_visited(compiled.nodes.size(), 0u) {}
+
+	bool Visit(uint32_t index) {
+		if (index == ResourceNode::NoNode || m_visited[index] != 0u) {
+			return true;
+		}
+		m_visited[index] = 1u;
+		const auto& node = m_compiled.nodes[index];
+		switch (node.op) {
+			case NodeOp::ReadConst: {
+				const auto target = m_compiled.nodes[node.args[0]].op;
+				return (node.flags & ResourceNode::CleanSlot) == 0u &&
+				       (target == NodeOp::RawAddress || target == NodeOp::RawBuffer);
+			}
+			case NodeOp::ReadFirstLane:
+			case NodeOp::RawAddress:
+			case NodeOp::RawBuffer: return false;
+			case NodeOp::Select: return Visit(node.args[1]) && Visit(node.args[2]);
+			default:
+				for (const auto arg: node.args) {
+					if (!Visit(arg)) {
+						return false;
+					}
+				}
+				return true;
+		}
+	}
+
+private:
+	const CompiledResourcePlan& m_compiled;
+	std::vector<uint8_t>        m_visited;
+};
+
+void AnalyzeControlFlow(const ResourcePlan& program, CompiledResourcePlan& compiled) {
+	compiled.direct_conditions.assign(program.control_flow.size(), 0u);
+	const bool clean_slots =
+	    std::ranges::any_of(program.clean_flat_slots, [](uint8_t slot) { return slot != 0u; });
+	for (uint32_t block = 0; block < program.control_flow.size(); block++) {
+		const auto condition = compiled.conditions[block];
+		compiled.direct_conditions[block] =
+		    !clean_slots && condition != ResourceNode::NoNode &&
+		    DirectConditionAnalysis(compiled).Visit(condition);
+	}
+	compiled.initial_active.assign(program.descriptor_sources.size(), 1u);
+	for (const auto& block: program.control_flow) {
+		for (const auto source: block.sources) {
+			if (source >= compiled.initial_active.size()) {
+				compiled.initial_active.clear();
+				return;
+			}
+			compiled.initial_active[source] = 0u;
+		}
+	}
+	// A block's successors are inert when no block reachable from them (along any path) has
+	// sources: whatever the condition, the walk adds nothing.
+	const auto count = program.control_flow.size();
+	compiled.inert_successors.assign(count, 0u);
+	std::vector<uint8_t>  reached;
+	std::vector<uint32_t> stack;
+	for (uint32_t block = 0; block < count; block++) {
+		reached.assign(count, 0u);
+		stack.assign(program.control_flow[block].successors.begin(),
+		             program.control_flow[block].successors.end());
+		bool inert = true;
+		while (!stack.empty() && inert) {
+			const auto index = stack.back();
+			stack.pop_back();
+			if (index >= count) {
+				inert = false;
+				break;
+			}
+			if (reached[index] != 0u) {
+				continue;
+			}
+			reached[index] = 1u;
+			inert          = program.control_flow[index].sources.empty();
+			stack.insert(stack.end(), program.control_flow[index].successors.begin(),
+			             program.control_flow[index].successors.end());
+		}
+		compiled.inert_successors[block] = inert ? 1u : 0u;
+	}
+}
+
 void AnalyzeMemo(const ResourcePlan& program, CompiledResourcePlan& compiled) {
 	if (program.requires_specialization_memory ||
 	    std::ranges::any_of(program.clean_flat_slots, [](uint8_t slot) { return slot != 0u; })) {
@@ -1449,6 +1545,26 @@ const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
 	for (uint32_t i = 0; i < program.uniform_fill.fill.words && i < compiled->fill.size(); i++) {
 		compiled->fill[i] = compiler.Node(program.uniform_fill.values[i]);
 	}
+	compiled->descriptor_slots.resize(compiled->descriptors.size());
+	for (uint32_t source = 0; source < compiled->descriptors.size(); source++) {
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			auto&      slot  = compiled->descriptor_slots[source][dword];
+			const auto index = compiled->descriptors[source][dword];
+			slot             = ResourceNode::NoNode;
+			if (index == ResourceNode::NoNode) {
+				continue;
+			}
+			const auto& node = compiled->nodes[index];
+			if (node.op != NodeOp::ReadConst || (node.flags & ResourceNode::CleanSlot) != 0u) {
+				continue;
+			}
+			const auto target = compiled->nodes[node.args[0]].op;
+			if (target == NodeOp::RawAddress || target == NodeOp::RawBuffer) {
+				slot = program.srt_reads[node.aux].flat_offset;
+			}
+		}
+	}
+	AnalyzeControlFlow(program, *compiled);
 	AnalyzeMemo(program, *compiled);
 	program.compiled = std::move(compiled);
 	return *program.compiled;
@@ -1837,10 +1953,14 @@ bool SrtEvaluator::EvaluateDescriptor(uint32_t source, DescriptorValue& result) 
 		return false;
 	}
 	const auto& dwords = m_compiled.descriptors[source];
+	const auto& slots  = m_compiled.descriptor_slots[source];
 	result             = {};
 	result.dword_count = m_program.descriptor_sources[source].dword_count;
 	for (uint32_t index = 0; index < result.dword_count; ++index) {
-		if (!Evaluate(dwords[index], result.dwords[index])) {
+		// A dword that is exactly a slot this walker refreshed evaluates to its flat value.
+		if (m_flat != nullptr && slots[index] != ResourceNode::NoNode) {
+			result.dwords[index] = (*m_flat)[slots[index]];
+		} else if (!Evaluate(dwords[index], result.dwords[index])) {
 			return false;
 		}
 	}
@@ -1852,33 +1972,58 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 		return {};
 	}
 	auto& active = m_program.active_sources;
-	active.assign(m_program.descriptor_sources.size(), 1u);
-	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) {
-			active.at(source) = 0u;
+	if (!m_compiled.initial_active.empty()) {
+		active.assign(m_compiled.initial_active.begin(), m_compiled.initial_active.end());
+	} else {
+		active.assign(m_program.descriptor_sources.size(), 1u);
+		for (const auto& block: m_program.control_flow) {
+			for (const auto source: block.sources) {
+				active.at(source) = 0u;
+			}
 		}
 	}
-	auto& visited = m_program.visited_blocks;
-	auto& pending = m_program.pending_blocks;
-	visited.assign(m_program.control_flow.size(), 0u);
+	auto&      strict      = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	auto&      visited     = m_program.visited_blocks;
+	auto&      pending     = m_program.pending_blocks;
+	const auto block_count = m_program.control_flow.size();
+	// Most plans have at most 64 blocks; track those in a mask instead of clearing a vector.
+	const bool small       = block_count <= 64u;
+	uint64_t   visited_mask = 0;
+	if (!small) {
+		visited.assign(block_count, 0u);
+	}
 	pending.clear();
 	pending.push_back(0u);
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();
-		if (visited.at(index)) {
-			continue;
+		EXIT_IF(index >= block_count);
+		if (small) {
+			const auto bit = uint64_t {1} << index;
+			if ((visited_mask & bit) != 0u) {
+				continue;
+			}
+			visited_mask |= bit;
+		} else {
+			if (visited[index]) {
+				continue;
+			}
+			visited[index] = 1u;
 		}
-		visited[index] = 1u;
 		const auto& block = m_program.control_flow[index];
 		for (const auto source: block.sources) {
 			active[source] = 1u;
 		}
+		// Nothing reachable from here adds a source: skip the condition and its strict reads.
+		if (!m_compiled.inert_successors.empty() && m_compiled.inert_successors[index] != 0u) {
+			continue;
+		}
 		uint32_t   condition      = 0;
 		const auto condition_node = m_compiled.conditions[index];
+		auto&      evaluator      = m_compiled.direct_conditions[index] != 0u ? *this : strict;
 		if (condition_node != ResourceNode::NoNode &&
 		    m_runtime.read_specialization_memory != nullptr &&
-		    Evaluate(condition_node, condition)) {
+		    evaluator.Evaluate(condition_node, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
@@ -1904,6 +2049,10 @@ bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (offset >= flat.size() || !evaluator.Evaluate(m_compiled.slots[slot], flat[offset])) {
 			return false;
 		}
+	}
+	// Only this walker's own contexts use the shortcut; nested EXEC walkers evaluate normally.
+	if (m_active_mask == ResourceNode::NoNode) {
+		m_flat = &flat;
 	}
 	return true;
 }

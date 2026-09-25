@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <array>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -20,7 +21,14 @@ struct SrtRuntime {
 	// read_specialization_memory succeeds for an aligned, nonzero 64-byte block only when every
 	// dword in it would succeed with the same value, so one refresh may read whole blocks.
 	bool                      specialization_block_reads = false;
+	// Userdata for read_specialization_memory; null means userdata.
+	void*                     specialization_userdata    = nullptr;
 };
+
+[[nodiscard]] inline void* SpecializationUserdata(const SrtRuntime& runtime) {
+	return runtime.specialization_userdata != nullptr ? runtime.specialization_userdata
+	                                                  : runtime.userdata;
+}
 
 enum class RuntimeValueType { Any, Integer };
 
@@ -104,6 +112,8 @@ private:
 	ResourcePlan::EvaluationContext& m_context;
 	ResourcePlan::EvaluationContext::Entry* m_memo;
 	uint64_t                         m_generation;
+	// Set by a successful RefreshFlatBuffer: this walker's slot values.
+	const std::vector<uint32_t>*     m_flat = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

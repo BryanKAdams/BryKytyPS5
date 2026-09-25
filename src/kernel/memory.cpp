@@ -901,6 +901,11 @@ void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
 			return;
 		}
 	}
+	if (size == sizeof(uint32_t)) {
+		// Most reads are single SRT dwords; a fixed-size copy avoids a memmove call.
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), sizeof(uint32_t));
+		return;
+	}
 	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
 }
 
