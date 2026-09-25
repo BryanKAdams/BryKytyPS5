@@ -364,8 +364,14 @@ the shader dump names (`--graphics-debug-dump`). Overlapping work is charged to 
 timestamp it finishes before, so treat the numbers as a ranking. Draw rows also give the render
 area per run and the cost per million pixels of it (`area=… …us/Mpx`), which stays comparable
 when the game's dynamic resolution changes. With zones on, the texture cache prints each image
-the first time it is refreshed from guest memory (size, format, tiling, and whether a CPU write or
-a GPU buffer write caused it). The instrumentation leaves the shader caches valid, and with a warm
+the first time it is refreshed from guest memory (size, format, tiling, whether a CPU write or
+a GPU buffer write caused it, and which binding refreshed it). It also prints the first GPU buffer
+write of each kind (shader store, fill, copy) to land on an image: its range, whether it covers
+the whole image, and whether the image held rendered content. In Astro Bot's overworld, compute
+stores into buffers that alias transient render targets (for example 8.8 MB inside the 66 MB
+3840x2160 surface) make the next render-target use re-upload the whole image from buffer memory.
+That costs about 0.5-0.8 ms of GPU time a frame. The bytes outside the stored range come from a
+buffer copy that the rendered image was never written back to. The instrumentation leaves the shader caches valid, and with a warm
 cache it cost about 0.2 fps in the overworld.
 The `frame-times` line gives p50/p95/p99 of the time between new game frames and the share of
 frames that took 25 ms or more, i.e. missed a 60 Hz vblank. Drain stats also count occlusion

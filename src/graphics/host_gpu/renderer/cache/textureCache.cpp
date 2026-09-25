@@ -42,12 +42,27 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 
 // KYTY_GPU_ZONES: describe an image the first time it is refreshed for each cause, so the guest
 // addresses that key its zone rows can be matched to a size, format, and writer.
+// KYTY_GPU_ZONES: the binding whose lookup is refreshing an image, for the refresh log.
+thread_local const char* t_refresh_via = "other";
+
+class RefreshVia final {
+public:
+	explicit RefreshVia(const char* via) noexcept: m_previous(t_refresh_via) { t_refresh_via = via; }
+	~RefreshVia() { t_refresh_via = m_previous; }
+	RefreshVia(const RefreshVia&)            = delete;
+	RefreshVia& operator=(const RefreshVia&) = delete;
+
+private:
+	const char* m_previous;
+};
+
 void LogZoneRefresh(const Image& image) {
 	static std::mutex                   mutex;
 	static std::unordered_set<uint64_t> seen;
 	const bool     buffer_modified = image.IsBufferModified();
 	const auto&    info            = image.info;
-	const uint64_t key             = info.data.address | (buffer_modified ? 1u : 0u);
+	const uint64_t key             = info.data.address ^ (buffer_modified ? 1u : 0u) ^
+	                     (static_cast<uint64_t>(t_refresh_via[0]) << 56u);
 	{
 		std::scoped_lock lock {mutex};
 		if (!seen.insert(key).second) {
@@ -55,11 +70,38 @@ void LogZoneRefresh(const Image& image) {
 		}
 	}
 	std::printf("gpu-zones: refresh image 0x%016" PRIx64 " size=0x%" PRIx64
-	            " %ux%ux%u guest_format=%u tile=%u levels=%u layers=%u cause=%s\n",
+	            " %ux%ux%u guest_format=%u tile=%u levels=%u layers=%u cause=%s via=%s\n",
 	            info.data.address, info.data.size, info.extent.width, info.extent.height,
 	            info.extent.depth, static_cast<uint32_t>(info.guest_format),
 	            static_cast<uint32_t>(info.tile_mode), info.resources.levels, info.resources.layers,
-	            buffer_modified ? "gpu-buffer-write" : "cpu-write");
+	            buffer_modified ? "gpu-buffer-write" : "cpu-write", t_refresh_via);
+}
+
+// KYTY_GPU_ZONES: the first time each kind of GPU buffer write lands on an image, print it with
+// how much of the image it covers and the PM4 packet that caused it.
+void LogZoneBufferWrite(const Image& image, uint64_t address, uint64_t size,
+                        TextureCache::GpuWriteSource source) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	const auto&                         info = image.info;
+	const uint64_t key = info.data.address ^ ((static_cast<uint64_t>(source) + 1u) << 60u);
+	{
+		std::scoped_lock lock {mutex};
+		if (!seen.insert(key).second) {
+			return;
+		}
+	}
+	const char* kind = source == TextureCache::GpuWriteSource::Fill   ? "fill"
+	                   : source == TextureCache::GpuWriteSource::Copy ? "copy"
+	                                                                  : "shader-store";
+	const bool  whole = address <= info.data.address &&
+	                   address + size >= info.data.address + info.data.size;
+	std::printf("gpu-zones: buffer %s on image 0x%016" PRIx64 " %ux%u guest_format=%u tile=%u "
+	            "write=0x%016" PRIx64 "+0x%" PRIx64 " %s pm4=0x%x image_gpu_modified=%d\n",
+	            kind, info.data.address, info.extent.width, info.extent.height,
+	            static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+	            address, size, whole ? "whole-image" : "partial", DrainStats::t_pm4_op,
+	            image.IsGpuModified() ? 1 : 0);
 }
 
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, uint8_t code,
@@ -1630,6 +1672,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	RefreshVia       via(desc.type == BindingType::Storage ? "storage" : "texture");
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1674,6 +1717,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
 	}
+	RefreshVia       via("render-target");
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1692,6 +1736,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");
 	}
+	RefreshVia       via("depth-target");
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -2154,7 +2199,8 @@ bool TextureCache::HasPendingDownload(uint64_t address, uint64_t size) {
 	});
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
+                                           GpuWriteSource source) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -2163,6 +2209,9 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		auto& image = m_slot_images[id];
 		if (!image.Overlaps(address, size)) {
 			continue;
+		}
+		if (GpuZones::Enabled()) [[unlikely]] {
+			LogZoneBufferWrite(image, address, size, source);
 		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();

@@ -63,7 +63,11 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// What wrote guest memory through a buffer (for the KYTY_GPU_ZONES refresh log); shader
+	// storage-buffer stores are the default.
+	enum class GpuWriteSource : uint8_t { Fill, Copy, Shader };
+	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
+	                                           GpuWriteSource source = GpuWriteSource::Shader);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	// Queued publications remain authoritative until their guest backing writes complete.
 	[[nodiscard]] bool HasPendingDownload(uint64_t address, uint64_t size);
