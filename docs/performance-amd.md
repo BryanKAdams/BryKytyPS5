@@ -95,6 +95,19 @@ validated by this patch set.
   removed: about one overworld run in three stayed at 51-54 fps instead of 58. A wider copy can
   fault on GPU-written bytes of a protected page that single dwords never touch.
 
+- **Indexed VGPR reads (`V_MOVRELS_B32`/`V_MOVRELD_B32`):** each one compares M0 with every
+  register index up to the shader's VGPR limit. Constant propagation now tracks the possible
+  values of a U32 when they form a small set (small bit fields and masks, arithmetic on such sets,
+  selects, phis). It folds `==`/`!=` against a constant outside that set, so unreachable
+  chain links and their register operands disappear. Astro Bot's hottest pixel shader
+  (`ef31694ed8d87754`) has 51 `V_MOVRELS` whose M0 is a 3-bit field times 5. Its SPIR-V went
+  from 3,133 to 840 `OpSelect` and from 57,764 to 32,254 words. GPU zones in alternating runs
+  measured it about 5-9% cheaper per run (0.97-1.01 ms to 0.88-0.95 ms), and
+  `92b1436c8042e396` (52 `V_MOVRELS`) about 2% cheaper per pixel. Shaders without `V_MOVRELS`
+  stayed within 1%. The AMD driver already folded most of these selects, so the saving is
+  smaller than the SPIR-V suggests; the smaller modules also compile faster. The overworld fps is
+  unchanged because dynamic resolution spends GPU headroom on render size.
+
 The dense evaluator, retained resource snapshots, and replacement of the old SRT readability path
 were already present at the base revision. Their historical PR improvements are not additional gains
 from this branch.
