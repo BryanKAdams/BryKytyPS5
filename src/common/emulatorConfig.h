@@ -78,6 +78,7 @@ struct ConfigOptions {
 	bool                   gpu_mesh_indirect_enabled   = true;
 	uint32_t               gpu_frames_ahead            = 0;
 	uint32_t               label_flush_interval_us     = 2000;
+	uint32_t               gpu_timestamp_scale_percent = 100;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -137,6 +138,9 @@ bool GpuMeshIndirectEnabled();
 uint32_t GetGpuFramesAhead();
 // Minimum time between submits made at plain RELEASE_MEM labels; 0 submits at every idle label.
 uint32_t GetLabelFlushIntervalUs();
+// Stretch time measured between guest GPU timestamps within a frame, in percent (100 = off).
+// Games that size their dynamic resolution from GPU timestamps then leave more GPU headroom.
+uint32_t GetGpuTimestampScalePercent();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

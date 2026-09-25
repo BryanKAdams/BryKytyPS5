@@ -176,6 +176,10 @@ uint32_t GetLabelFlushIntervalUs() {
 	return g_config->label_flush_interval_us;
 }
 
+uint32_t GetGpuTimestampScalePercent() {
+	return g_config->gpu_timestamp_scale_percent;
+}
+
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {

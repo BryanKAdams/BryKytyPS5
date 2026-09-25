@@ -270,9 +270,37 @@ about 305 GPU timestamps a frame (RELEASE_MEM/EOP and COPY_DATA of the clock), a
 fills them with the reference clock when Thread_Gpu parses the packet. Rewriting each one with
 the clock at GPU completion made things worse: busy went to 17.9 ms and fps to 52 (alternating
 A/B, 60.0/58.0 vs 52.1/51.7). Completion is only known per command buffer, so a frame's
-timestamps bunched together, the game measured less GPU time, and it raised the resolution. The
-experiment was dropped. In the high mode GPU savings turn into resolution rather than frame rate,
-so compare shader changes with the zone rows' cost per million pixels, not fps.
+timestamps bunched together, the game measured less GPU time, and it raised the resolution.
+Writing each guest timestamp with its own host GPU timestamp (`vkCmdWriteTimestamp` at that point
+in the command buffer, published at completion) was worse still: 53.6 fps with 7-8 Mpx render
+areas and 23% missed vblanks (alternating A/B, 4 rounds). The game budgets for its measured passes,
+which the host GPU runs quickly, while the emulator's own GPU work and CPU-GPU stalls go
+unmeasured. Both experiments were dropped. The parse-time values partly include those stalls,
+which makes them the better default. In the high mode GPU savings turn into resolution rather
+than frame rate, so compare shader changes with the zone rows' cost per million pixels, not fps.
+
+The timestamps are EOP event 0x28: five at the start of each frame (per-frame rings), about 300
+begin/end pairs 0x20 apart from the game's GPU profiler (a multi-buffered region, so a frame's
+values are read a few frames later), and one at the end of the frame. `KYTY_TS_LOG=<skip>` prints
+1200 of them, with flips, after skipping that many.
+
+**Dynamic-resolution headroom (`--gpu-timestamp-scale`):** a percentage (100-200, default 100 =
+off) that stretches the time since the last flip in every guest GPU timestamp, so a game that
+sizes its resolution from them measures more GPU time. Each flip returns to the real clock, so
+timestamps stay within a frame's stretch of the CPU clock. In the overworld (alternating runs,
+45 s each):
+
+| Scale | fps per run | Render area | Frames at 25 ms or more | p99 frame |
+| --- | --- | --- | --- | --- |
+| 100 | 58.1, 59.8, 59.7 | 6.23 Mpx (about 3328x1872) | 11-14% | 31-32 ms |
+| 110 | 60.0, 57.1 | 3.33 Mpx, then 6.23 Mpx | 0%, then 17% | 17, then 33 ms |
+| 115 | 60.0, 59.7 | 2.07 Mpx (about 1920x1080) | 0%, 0.6% | 17-19 ms |
+| 125 | 60.0, 60.0, 60.0 | 2.07 Mpx | 0% | 17 ms |
+
+At 115 and above the GPU keeps about 5 ms of each frame idle (busy about 11.5 ms), and the game
+holds a steady 60. At 110 it still sometimes settles at the 3328x1872 level. The game's
+resolution levels are discrete, so there is no setting between those two outcomes. For a window
+around 1920x1080, a 1080p internal resolution is about native.
 
 Occlusion queries are not a culling lever here: about 8 ZPASS_DONE dumps a frame and no
 predicated draws, which fits sun or lens-flare visibility checks. They still report always
@@ -299,8 +327,11 @@ descriptor reads are already in `main`), #767 (duplicates #702 and the dense mem
 --shader-precompile false     Disable journal recording/replay for comparison or recovery.
 --dcc-gpu-clear true          Default: apply GPU-written DCC clears on the GPU.
 --dcc-gpu-clear false         Read DCC keys back on the CPU (the previous behavior).
+--gpu-timestamp-scale N       Default 100 (off): stretch in-frame GPU timestamp time by N percent.
+                              Astro Bot: 115 holds a steady 60 at about 1080p internal.
 --drain-stats <seconds>       Report GPU waits by cause every N seconds.
 KYTY_GPU_ZONES=1              With --drain-stats: also report GPU time by zone and shader hash.
+KYTY_TS_LOG=<skip>            Print 1200 guest GPU timestamp writes after skipping that many.
 ```
 
 `KYTY_GPU_ZONES=1` (an environment variable, diagnostic only) writes a bottom-of-pipe timestamp

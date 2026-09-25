@@ -93,6 +93,8 @@ static void PrintUsage() {
 	         "thread. 0 waits for idle. Default: 0.\n");
 	::printf("  --label-flush-interval-us <us>       Minimum time between RELEASE_MEM submits. "
 	         "Default: 2000.\n");
+	::printf("  --gpu-timestamp-scale <100-200>      Stretch GPU time the game measures, in "
+	         "percent, so dynamic resolution keeps headroom. Default: 100 (off).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -389,6 +391,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-timestamp-scale") {
+			uint32_t percent = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), percent);
+			if (error != std::errc {} || end != value.data() + value.size() || percent < 100 ||
+			    percent > 200) {
+				::printf("invalid gpu-timestamp-scale (100-200): %s\n", value.c_str());
+				return false;
+			}
+			options.config.gpu_timestamp_scale_percent = percent;
 		} else if (arg == "--async-submit") {
 			if (!ParseBool(value, options.config.async_submit_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

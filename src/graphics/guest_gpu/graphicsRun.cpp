@@ -24,7 +24,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -39,6 +41,43 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+
+// KYTY_TS_LOG=<skip> (diagnostic): after that many GPU timestamp writes, print the next 1200
+// with their destination and value, and the flips between them, to see how a game pairs them.
+static void LogTimestampWrite(const char* kind, uint32_t event, uint64_t dst, uint64_t value,
+                              bool counted = true) {
+	static const int64_t skip = [] {
+		const char* text = std::getenv("KYTY_TS_LOG");
+		return text != nullptr ? std::strtoll(text, nullptr, 10) : int64_t {-1};
+	}();
+	if (skip < 0) {
+		return;
+	}
+	static std::atomic<int64_t> seen {0};
+	const auto index = counted ? seen.fetch_add(1) : seen.load();
+	if (index < skip || index >= skip + 1200) {
+		return;
+	}
+	std::printf("ts #%" PRId64 " %s ev=0x%02" PRIx32 " dst=0x%016" PRIx64 " value=%" PRIu64 "\n",
+	            index, kind, event, dst, value);
+}
+
+// Guest GPU timestamps are the reference clock at the time Thread_Gpu parses the packet, which
+// includes the emulator's own stalls. With --gpu-timestamp-scale above 100, time since the last
+// flip is stretched by that percentage, so a game that sizes its dynamic resolution from GPU
+// timestamps sees more GPU time and leaves headroom. Each flip returns to the real clock, so
+// values never drift from it by more than a frame's stretch.
+static std::atomic<uint64_t> g_timestamp_anchor {0};
+
+static uint64_t GuestGpuTimestamp() {
+	static const uint64_t percent = Config::GetGpuTimestampScalePercent();
+	const auto            now     = Sync::ReadReferenceClock();
+	const auto            anchor  = g_timestamp_anchor.load(std::memory_order_relaxed);
+	if (percent == 100 || anchor == 0 || now <= anchor) {
+		return now;
+	}
+	return anchor + (now - anchor) * percent / 100u;
+}
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -427,9 +466,10 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
-	const auto value = Sync::ReadReferenceClock();
+	const auto value = GuestGpuTimestamp();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	DrainStats::Record(DrainStats::Kind::GpuTimestamp, 1);
+	LogTimestampWrite("clock", num_bytes, dst_address, value);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -1345,8 +1385,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 			} else {
 				if (event_write_source == 0x04) {
-					value = Sync::ReadReferenceClock();
+					value = GuestGpuTimestamp();
 					DrainStats::Record(DrainStats::Kind::GpuTimestamp, 1);
+					LogTimestampWrite("eop", eop_event_type | (event_index << 8u),
+					                  reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
@@ -1569,6 +1611,9 @@ void CommandProcessor::Flip() {
 		LOGF("CommandProcessor::Flip()\n");
 	}
 
+	const auto flip_time = Sync::ReadReferenceClock();
+	g_timestamp_anchor.store(flip_time, std::memory_order_relaxed);
+	LogTimestampWrite("flip", 0, 0, flip_time, false);
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
