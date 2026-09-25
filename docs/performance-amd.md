@@ -82,15 +82,18 @@ validated by this patch set.
   with it and aborts on a difference, and `KYTY_SRT_STATS=1` logs how often refreshes reuse
   descriptors.
 - **Refresh reads (branch `perf/draw-cpu`):** at 60 fps `Thread_Gpu` was about 4% idle, with
-  materialization at 29.6% of its samples. Direct SRT reads now come from 64-byte blocks
-  (`TryReadGuestBlockOnGpuThread`), which copies a block only when no page it touches has a
-  GPU-dirty hint. Otherwise the refresh reads that block's dwords with `ReadGuestOnGpuThread`,
-  which keeps the exact-byte clean check. Branch conditions that read only flat SRT slots use
-  those direct values, because every refresh reads the slots anyway. A condition is skipped
-  when no block reachable from it guards a source. Descriptor dwords that are exactly flat
-  slots come from the refreshed flat buffer. The strict reader no longer wraps every direct
-  read in a forwarding call. Most Astro Bot conditions test constant-buffer words, so they
-  keep their strict reads.
+  materialization at 29.6% of its samples. The strict reader has its own userdata
+  (`SrtRuntime::specialization_userdata`). The 64-byte strict-read cache therefore no longer
+  wraps every direct read in a forwarding call, which had a stack-cookie check. The profile had
+  named that call `vector<pair>::_Emplace_reallocate`, because it had no public symbol. Branch
+  conditions that read only flat SRT slots use those direct values, because every refresh reads
+  the slots anyway. A condition is skipped when no block reachable from it guards a source.
+  Descriptor dwords that are exactly flat slots come from the refreshed flat buffer, and
+  single-dword `ReadGuestOnGpuThread` copies avoid a `memmove` call. Only 16 of the 1,125 Astro
+  Bot conditions read nothing but flat slots, and 4 are skipped. The rest test constant-buffer
+  words and keep their strict reads. Serving direct reads from 64-byte blocks was tried and
+  removed: about one overworld run in three stayed at 51-54 fps instead of 58. A wider copy can
+  fault on GPU-written bytes of a protected page that single dwords never touch.
 
 The dense evaluator, retained resource snapshots, and replacement of the old SRT readability path
 were already present at the base revision. Their historical PR improvements are not additional gains
@@ -367,6 +370,8 @@ measured on the Ryzen 7 7800X3D:
 | Compiled evaluator | 1.39-1.45 |
 | Compiled + memo, unchanged inputs | 1.02-1.10 |
 | Compiled + memo, inputs change every call | 1.43-1.51 |
+| Compiled, `perf/draw-cpu` (93a8a7f9) | 1.14-1.21 |
+| Compiled + memo, unchanged inputs, `perf/draw-cpu` | 0.92-0.98 |
 
 Both paths made the same 9,972 direct reads per pass. Strict reads fell from 724-1,147
 to 140-395 per pass with 64-byte blocks. The memo costs about 3% when every refresh misses, so it
