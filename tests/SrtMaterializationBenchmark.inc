@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -235,6 +236,82 @@ struct SrtFakeMemory {
     return true;
   }
 };
+
+// --dump-shader <journal copy> <hash> <out dir>: writes the guest RDNA disassembly, native IR,
+// SPIR-V and SPIR-V disassembly of every recorded permutation of one shader, as compiled at
+// runtime (the record's own specialization and push data start).
+void DumpJournalShader(const char *journal_path, const char *hash_text,
+                       const char *out_dir) {
+  constexpr const char *name = "DumpShader";
+  using namespace ShaderRecompiler;
+  const auto hash = std::strtoull(hash_text, nullptr, 16);
+  auto records = ReadShaderJournalCopy(journal_path);
+  Require(name, "journal", !records.empty(),
+          std::string("no records read from ") + journal_path);
+  std::filesystem::create_directories(out_dir);
+  uint32_t written = 0;
+  for (auto &record : records) {
+    if (record.hash != hash) {
+      continue;
+    }
+    CompileOptions options;
+    options.stage = record.stage;
+    options.shader_hash = record.hash;
+    std::array<uint32_t, 40> zeros{};
+    options.user_data = std::span(zeros).first(record.user_data_count);
+    options.back_code = record.back_code;
+    options.user_data_base = record.user_data_base;
+    options.wave_size = record.wave_size;
+    options.dump_ir = true;
+    options.early_dump = false;
+    options.dump_label = name;
+    std::visit(
+        [&](auto &info) {
+          using Info = std::decay_t<decltype(info)>;
+          if constexpr (std::is_same_v<Info, ShaderVertexInputInfo>) {
+            options.input_info.vertex = &info;
+          } else if constexpr (std::is_same_v<Info, ShaderPixelInputInfo>) {
+            options.input_info.pixel = &info;
+          } else {
+            options.input_info.compute = &info;
+          }
+        },
+        record.info);
+    auto translated = TranslateProgram(record.code, options);
+    if (translated.skip_dispatch) {
+      std::printf("[host]    %s: permutation %u skips dispatch\n", name, written);
+      continue;
+    }
+    auto result = CompileProgram(std::move(translated), options,
+                                 record.specialization,
+                                 record.push_data_start_dword);
+    std::string disassembly;
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+    (void)tools.Disassemble(result.spirv, &disassembly,
+                            SPV_BINARY_TO_TEXT_OPTION_NO_HEADER |
+                                SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES |
+                                SPV_BINARY_TO_TEXT_OPTION_INDENT);
+    const auto base = std::filesystem::path(out_dir) /
+                      fmt::format("{:016x}_{}", record.hash, written);
+    const auto write = [&](const char *suffix, const void *data, size_t size) {
+      auto path = base;
+      path += suffix;
+      std::ofstream out(path, std::ios::binary);
+      out.write(static_cast<const char *>(data),
+                static_cast<std::streamsize>(size));
+    };
+    write(".rdna2", result.decoded_dump.data(), result.decoded_dump.size());
+    write(".ir", result.ir_dump.data(), result.ir_dump.size());
+    write(".spv", result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
+    write(".spvasm", disassembly.data(), disassembly.size());
+    std::printf("[host]    %s: permutation %u: %zu code dwords, %zu SPIR-V words, "
+                "push start %u -> %s\n",
+                name, written, record.code.size(), result.spirv.size(),
+                record.push_data_start_dword, base.string().c_str());
+    written++;
+  }
+  Require(name, "shader", written != 0, "no record has that hash");
+}
 
 double MedianOf(std::vector<double> values) {
   std::sort(values.begin(), values.end());

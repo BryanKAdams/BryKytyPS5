@@ -511,6 +511,77 @@ void TestOptimizationPipeline() {
         "elimination regressed");
 }
 
+void TestImpossibleEqualitiesFold() {
+  // V_MOVRELS compares M0 with every register index. Here M0 is a 3-bit field
+  // times 5 (Astro Bot's hottest pixel shader), so only 7 of the 49 selects can
+  // ever be taken.
+  Fixture fixture;
+  const auto user = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto field = fixture.Emit(ValueOpcode::BitFieldUExtract,
+                                  {user, Value(12u), Value(3u)});
+  const auto scaled = fixture.Emit(ValueOpcode::IMul32, {field, Value(5u)});
+  const auto m0 = fixture.Emit(ValueOpcode::BitwiseAnd32, {scaled, Value(0xffu)});
+  Value selected = Value(100u);
+  for (uint32_t index = 1; index < 50u; index++) {
+    const auto match = fixture.Emit(ValueOpcode::IEqual32, {m0, Value(index)});
+    selected = fixture.Emit(ValueOpcode::SelectU32,
+                            {match, Value(100u + index), selected});
+  }
+  const auto chain = fixture.Emit(ValueOpcode::ReferenceU32, {selected});
+
+  // An unconstrained value keeps its compare.
+  const auto unknown = fixture.Emit(ValueOpcode::IEqual32, {user, Value(7u)});
+  const auto kept = fixture.Emit(ValueOpcode::ReferenceU32,
+                                 {fixture.Emit(ValueOpcode::SelectU32,
+                                               {unknown, Value(1u), Value(2u)})});
+  // A select of constants takes only those values.
+  const auto either =
+      fixture.Emit(ValueOpcode::SelectU32, {fixture.Emit(ValueOpcode::IEqual32,
+                                                         {user, Value(1u)}),
+                                            Value(3u), Value(9u)});
+  const auto never = fixture.Emit(ValueOpcode::ReferenceU32,
+                                  {fixture.Emit(ValueOpcode::SelectU32,
+                                                {fixture.Emit(ValueOpcode::IEqual32,
+                                                              {either, Value(4u)}),
+                                                 Value(1u), Value(2u)})});
+  const auto always = fixture.Emit(ValueOpcode::ReferenceU32,
+                                   {fixture.Emit(ValueOpcode::SelectU32,
+                                                 {fixture.Emit(ValueOpcode::INotEqual32,
+                                                               {either, Value(4u)}),
+                                                  Value(1u), Value(2u)})});
+
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+
+  // Walk what is left of the chain: every remaining select must test M0
+  // against a reachable index and pick that index's value.
+  std::vector<uint32_t> indices;
+  auto value = chain.ResolveInstruction()->Arg(0).Resolve();
+  while (const auto *select = value.TryInstruction()) {
+    Check(select->GetOpcode() == ValueOpcode::SelectU32, "chain lost its selects");
+    const auto *match = select->Arg(0).ResolveInstruction();
+    Check(match->GetOpcode() == ValueOpcode::IEqual32 &&
+              match->Arg(0).Resolve() == m0.Resolve(),
+          "chain select does not test M0");
+    const auto index = match->Arg(1).Resolve().U32();
+    Check(select->Arg(1).Resolve() == Value(100u + index),
+          "chain select picks the wrong register");
+    indices.push_back(index);
+    value = select->Arg(2).Resolve();
+  }
+  std::ranges::sort(indices);
+  Check(value == Value(100u) &&
+            indices == std::vector<uint32_t>{5u, 10u, 15u, 20u, 25u, 30u, 35u},
+        "impossible M0 compares were kept, or reachable ones were dropped");
+  Check(kept.ResolveInstruction()->Arg(0).Resolve().TryInstruction() != nullptr,
+        "a compare on an unconstrained value was folded");
+  Check(never.ResolveInstruction()->Arg(0).Resolve() == Value(2u) &&
+            always.ResolveInstruction()->Arg(0).Resolve() == Value(1u),
+        "compares against a value a select cannot produce were not folded");
+}
+
 void TestControlFlowValueSurvivesReadLaneFolding() {
   Fixture fixture(3);
   auto *entry = fixture.program.blocks[0];
@@ -595,6 +666,7 @@ int main() {
     TestConstantBufferBounds();
     TestReadLaneElimination();
     TestOptimizationPipeline();
+    TestImpossibleEqualitiesFold();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestUndefinedRuntimeValueFails();
     std::cout << "TypedValuePlanningTests: all cases passed\n";

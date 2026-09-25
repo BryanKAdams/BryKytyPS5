@@ -21526,6 +21526,32 @@ TestCase Vop1MoveRelSource() {
            O::S_ENDPGM}};
 }
 
+// M0 comes from memory as a 3-bit field times 5, like Astro Bot's hottest pixel
+// shader. The recompiler keeps only the selects that such an M0 can reach.
+TestCase Vop1MoveRelSourceBoundedIndex() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSmemLoadOpcode(&code, 0x08, 4, 0);         // s_buffer_load_dword s4
+  AppendSMovLiteral(&code, 5, 0x0003000cu);        // offset 12, width 3
+  code.push_back(EncodeSop2(0x27, 6, 4, 5));       // s_bfe_u32 s6, s4, s5
+  code.push_back(EncodeSop2(0x26, 124, 6, InlineU32(5))); // s_mul_i32 m0, s6, 5
+  for (u32 index = 0; index < 40u; index++) {
+    AppendVMovLiteral(&code, 12 + index, 0x1000u + index);
+  }
+  code.push_back(0x7e6e870cu);                     // v_movrels_b32 v55, v12
+  AppendStoreVgpr(&code, 55, 0);
+  AppendEnd(&code);
+
+  // Bits 12-14 hold 6, so M0 = 30 and the result is v42.
+  return {"Vop1MoveRelSourceBoundedIndex",
+          code,
+          {0xa5a56a5au},
+          {0x1000u + 30u},
+          {O::S_BUFFER_LOAD_DWORD, O::S_MOV_B32, O::S_BFE_U32, O::S_MUL_I32,
+           O::V_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase Vop1MoveRelDestination() {
   using O = ShaderOpcode;
 
@@ -29240,6 +29266,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
+  AddCase(Vop1MoveRelSourceBoundedIndex);
   AddCase(Vop1MoveRelDestination);
   AddCase(VectorFloatSpecialOps);
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
@@ -34047,6 +34074,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-benchmark") == 0) {
     VulkanHarness vulkan;
     RunBdaBenchmark(vulkan);
+    return 0;
+  }
+  if (argc == 5 && std::strcmp(argv[1], "--dump-shader") == 0) {
+    DumpJournalShader(argv[2], argv[3], argv[4]);
     return 0;
   }
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--srt-benchmark") == 0) {

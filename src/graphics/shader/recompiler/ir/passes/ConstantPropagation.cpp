@@ -4,7 +4,10 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <numeric>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -194,8 +197,185 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	return false;
 }
 
+// Every value a U32 can take, when that set is small: small bit fields and masks, arithmetic on
+// such sets, selects and phis. V_MOVRELS/V_MOVRELD compare M0 against every register index, but
+// M0 is usually a small field times a stride, so most of those compares are always false.
+class PossibleValues {
+public:
+	static constexpr size_t MaxValues = 64;
+	static constexpr size_t MaxFieldBits = 6;
+
+	// Sorted and unique; false when unknown or too large.
+	bool Find(Value value, std::vector<uint32_t>& values, uint32_t depth = 0) {
+		value = value.Resolve();
+		if (IsImmediate(value, Type::U32)) {
+			values.assign(1, value.U32());
+			return true;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > 24 || inst->GetType() != Type::U32) {
+			return false;
+		}
+		if (const auto found = m_known.find(inst); found != m_known.end()) {
+			values = found->second;
+			return !values.empty();
+		}
+		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
+			return false; // A loop-carried value can take any value the loop produces.
+		}
+		m_visiting.push_back(inst);
+		const bool known = Compute(*inst, values, depth + 1);
+		m_visiting.pop_back();
+		if (!known) {
+			values.clear();
+		}
+		m_known.emplace(inst, values);
+		return known;
+	}
+
+private:
+	template <typename Function>
+	bool Pairwise(const Inst& inst, std::vector<uint32_t>& values, uint32_t depth,
+	              Function function) {
+		std::vector<uint32_t> lhs;
+		std::vector<uint32_t> rhs;
+		if (!Find(inst.Arg(0), lhs, depth) || !Find(inst.Arg(1), rhs, depth)) {
+			return false;
+		}
+		values.clear();
+		for (const auto a: lhs) {
+			for (const auto b: rhs) {
+				values.push_back(function(a, b));
+			}
+		}
+		return Normalize(values);
+	}
+
+	static bool Normalize(std::vector<uint32_t>& values) {
+		std::ranges::sort(values);
+		values.erase(std::unique(values.begin(), values.end()), values.end());
+		return !values.empty() && values.size() <= MaxValues;
+	}
+
+	bool Compute(const Inst& inst, std::vector<uint32_t>& values, uint32_t depth) {
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::BitFieldUExtract: {
+				std::vector<uint32_t> offset;
+				std::vector<uint32_t> count;
+				if (!Find(inst.Arg(1), offset, depth) || !Find(inst.Arg(2), count, depth) ||
+				    offset.size() != 1u || count.size() != 1u || offset[0] > 32u ||
+				    count[0] > 32u - offset[0]) {
+					return false;
+				}
+				const auto bits = count[0];
+				if (std::vector<uint32_t> source; Find(inst.Arg(0), source, depth)) {
+					for (auto& value: source) {
+						value = bits == 0u ? 0u
+						                   : (value >> offset[0]) &
+						                         (bits == 32u ? UINT32_MAX : (1u << bits) - 1u);
+					}
+					values = std::move(source);
+					return Normalize(values);
+				}
+				if (bits > MaxFieldBits) {
+					return false;
+				}
+				values.resize(size_t {1} << bits);
+				std::iota(values.begin(), values.end(), 0u);
+				return true;
+			}
+			case ValueOpcode::BitwiseAnd32: {
+				if (Pairwise(inst, values, depth, [](uint32_t a, uint32_t b) { return a & b; })) {
+					return true;
+				}
+				// A small mask bounds the result even when the other operand is unknown.
+				for (uint32_t side = 0; side < 2u; side++) {
+					std::vector<uint32_t> mask;
+					if (!Find(inst.Arg(side), mask, depth) || mask.size() != 1u ||
+					    static_cast<size_t>(std::popcount(mask[0])) > MaxFieldBits) {
+						continue;
+					}
+					// Every submask of the mask.
+					values.clear();
+					uint32_t subset = mask[0];
+					do {
+						values.push_back(subset);
+						subset = (subset - 1u) & mask[0];
+					} while (subset != mask[0]);
+					return Normalize(values);
+				}
+				return false;
+			}
+			case ValueOpcode::BitwiseOr32:
+				return Pairwise(inst, values, depth, [](uint32_t a, uint32_t b) { return a | b; });
+			case ValueOpcode::BitwiseXor32:
+				return Pairwise(inst, values, depth, [](uint32_t a, uint32_t b) { return a ^ b; });
+			case ValueOpcode::IAdd32:
+				return Pairwise(inst, values, depth, [](uint32_t a, uint32_t b) { return a + b; });
+			case ValueOpcode::ISub32:
+				return Pairwise(inst, values, depth, [](uint32_t a, uint32_t b) { return a - b; });
+			case ValueOpcode::IMul32:
+				return Pairwise(inst, values, depth, [](uint32_t a, uint32_t b) { return a * b; });
+			case ValueOpcode::ShiftLeftLogical32:
+				return Pairwise(inst, values, depth,
+				                [](uint32_t a, uint32_t b) { return a << (b & 31u); });
+			case ValueOpcode::ShiftRightLogical32:
+				return Pairwise(inst, values, depth,
+				                [](uint32_t a, uint32_t b) { return a >> (b & 31u); });
+			case ValueOpcode::UMin32:
+				return Pairwise(inst, values, depth,
+				                [](uint32_t a, uint32_t b) { return std::min(a, b); });
+			case ValueOpcode::UMax32:
+				return Pairwise(inst, values, depth,
+				                [](uint32_t a, uint32_t b) { return std::max(a, b); });
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::Phi: {
+				values.clear();
+				for (size_t index = inst.GetOpcode() == ValueOpcode::Phi ? 0u : 1u;
+				     index < inst.NumArgs(); index++) {
+					std::vector<uint32_t> operand;
+					if (!Find(inst.Arg(index), operand, depth)) {
+						return false;
+					}
+					values.insert(values.end(), operand.begin(), operand.end());
+				}
+				return Normalize(values);
+			}
+			default: return false;
+		}
+	}
+
+	std::unordered_map<const Inst*, std::vector<uint32_t>> m_known;
+	std::vector<const Inst*>                               m_visiting;
+};
+
+// Folds x == C (or x != C) when C is not among x's possible values, or is its only one.
+bool FoldImpossibleEquality(Inst& inst, bool equal, PossibleValues& possible) {
+	auto lhs = Arg(inst, 0);
+	auto rhs = Arg(inst, 1);
+	if (IsImmediate(lhs, Type::U32)) {
+		std::swap(lhs, rhs);
+	}
+	if (!IsImmediate(rhs, Type::U32) || IsImmediate(lhs, Type::U32)) {
+		return false;
+	}
+	std::vector<uint32_t> values;
+	if (!possible.Find(lhs, values)) {
+		return false;
+	}
+	if (!std::ranges::binary_search(values, rhs.U32())) {
+		Replace(inst, Value(!equal));
+		return true;
+	}
+	if (values.size() == 1u) {
+		Replace(inst, Value(equal));
+		return true;
+	}
+	return false;
+}
+
 void FoldInstruction(Block& block, Block::iterator instruction,
-                      std::unordered_set<Inst*>& lowered_ancillary) {
+                      std::unordered_set<Inst*>& lowered_ancillary, PossibleValues& possible) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::Phi: FoldPhi(inst); return;
@@ -531,10 +711,14 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::max(a, b); });
 			return;
 		case ValueOpcode::IEqual32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a == b; });
+			if (!FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a == b; })) {
+				FoldImpossibleEquality(inst, true, possible);
+			}
 			return;
 		case ValueOpcode::INotEqual32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a != b; });
+			if (!FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a != b; })) {
+				FoldImpossibleEquality(inst, false, possible);
+			}
 			return;
 		case ValueOpcode::ULessThan32:
 			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a < b; });
@@ -648,9 +832,10 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 
 void ConstantPropagationPass(const BlockList& blocks) {
 	std::unordered_set<Inst*> lowered_ancillary;
+	PossibleValues            possible;
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {
-			FoldInstruction(*block, inst, lowered_ancillary);
+			FoldInstruction(*block, inst, lowered_ancillary, possible);
 		}
 	}
 	// Normalize retained PHI/select values only after every supported field read has
