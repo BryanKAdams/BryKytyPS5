@@ -3,6 +3,8 @@
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
+#include "common/settingsFile.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
@@ -18,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <span>
@@ -104,7 +107,12 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Error };
+enum class OverlayKind : uint8_t { None, Ime, Error, Settings };
+
+// The emulator settings panel, toggled with F2. The generation changes on every open and close,
+// so each opening is a new session and the presenter redraws when it closes.
+std::atomic<bool>     g_settings_open {false};
+std::atomic<uint64_t> g_settings_generation {0};
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -128,6 +136,11 @@ bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
 		snapshot->session = {OverlayKind::Ime, snapshot->ime.generation};
 		return true;
 	}
+	if (g_settings_open.load(std::memory_order_acquire)) {
+		snapshot->session = {OverlayKind::Settings,
+		                     g_settings_generation.load(std::memory_order_acquire)};
+		return true;
+	}
 	snapshot->session = {};
 	return false;
 }
@@ -140,7 +153,8 @@ enum class InputKind : uint8_t {
 	MousePosition,
 	MouseButton,
 	MouseWheel,
-	ResetController
+	ResetController,
+	Key // A keyboard navigation key for the settings panel; id is the ImGuiKey.
 };
 
 struct InputEvent {
@@ -234,7 +248,8 @@ void RefreshVisibility() {
 	bool capture_keyboard   = false;
 	bool text_input         = false;
 	bool multiline          = false;
-	if (snapshot.session.kind == OverlayKind::Error) {
+	if (snapshot.session.kind == OverlayKind::Error ||
+	    snapshot.session.kind == OverlayKind::Settings) {
 		capture_controller = true;
 		capture_keyboard   = true;
 	} else if (snapshot.session.kind == OverlayKind::Ime) {
@@ -258,6 +273,15 @@ void RefreshVisibility() {
 			g_missing_visibility_wakeups++;
 		}
 	}
+}
+
+void SetSettingsOpen(bool open) {
+	if (g_settings_open.load(std::memory_order_acquire) == open) {
+		return;
+	}
+	g_settings_generation.fetch_add(1, std::memory_order_acq_rel);
+	g_settings_open.store(open, std::memory_order_release);
+	RefreshVisibility();
 }
 
 void OnCoreVisibilityChanged(bool, uint64_t) {
@@ -431,6 +455,7 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
 	ErrorDialog::SetVisibilityCallback(RefreshVisibility);
 	RefreshVisibility();
+	std::printf("Emulator settings: press F2 in the game window.\n");
 }
 
 void ShutdownSystemOverlayInput() {
@@ -467,8 +492,10 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto error  = ErrorDialog::GetVisualState();
-	return {core.active || dialog.active || error.active,
-	        core.revision + dialog.revision + error.revision};
+	return {core.active || dialog.active || error.active ||
+	            g_settings_open.load(std::memory_order_acquire),
+	        core.revision + dialog.revision + error.revision +
+	            g_settings_generation.load(std::memory_order_acquire)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -504,6 +531,12 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		}
 		return false;
 	}
+	// F2 opens and closes the emulator settings panel, unless a game dialog owns the overlay.
+	if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F2 &&
+	    g_input_session.kind != OverlayKind::Ime && g_input_session.kind != OverlayKind::Error) {
+		SetSettingsOpen(!g_settings_open.load(std::memory_order_acquire));
+		return true;
+	}
 	if (!g_input_active) {
 		return false;
 	}
@@ -520,6 +553,32 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	                            event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
+	}
+	if (keyboard_event && session.kind == OverlayKind::Settings) {
+		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+		    event.key.key == SDLK_ESCAPE) {
+			SetSettingsOpen(false);
+			return true;
+		}
+		if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
+			ImGuiKey key = ImGuiKey_None;
+			switch (event.key.key) {
+				case SDLK_LEFT: key = ImGuiKey_LeftArrow; break;
+				case SDLK_RIGHT: key = ImGuiKey_RightArrow; break;
+				case SDLK_UP: key = ImGuiKey_UpArrow; break;
+				case SDLK_DOWN: key = ImGuiKey_DownArrow; break;
+				case SDLK_TAB: key = ImGuiKey_Tab; break;
+				case SDLK_SPACE: key = ImGuiKey_Space; break;
+				case SDLK_RETURN:
+				case SDLK_KP_ENTER: key = ImGuiKey_Enter; break;
+				default: break;
+			}
+			if (key != ImGuiKey_None) {
+				QueueInput({InputKind::Key, session, static_cast<int>(key),
+				            event.type == SDL_EVENT_KEY_DOWN ? 1.0f : 0.0f, 0.0f});
+			}
+		}
+		return true;
 	}
 	if (keyboard_event && session.kind == OverlayKind::Error) {
 		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
@@ -619,7 +678,7 @@ struct SystemOverlay::Impl {
 		auto& io       = ImGui::GetIO();
 		io.IniFilename = nullptr;
 		io.LogFilename = nullptr;
-		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
@@ -689,6 +748,9 @@ struct SystemOverlay::Impl {
 						} else if (event.id == SDL_GAMEPAD_BUTTON_NORTH) {
 							Ime::HostBackspace(session.generation);
 						}
+					} else if (session.kind == OverlayKind::Settings && down &&
+					           event.id == SDL_GAMEPAD_BUTTON_EAST) {
+						SetSettingsOpen(false);
 					}
 					const ImGuiKey key = ControllerButtonToKey(event.id);
 					if (key != ImGuiKey_None) {
@@ -725,6 +787,9 @@ struct SystemOverlay::Impl {
 					break;
 				}
 				case InputKind::MouseWheel: io.AddMouseWheelEvent(event.x, event.y); break;
+				case InputKind::Key:
+					io.AddKeyEvent(static_cast<ImGuiKey>(event.id), event.x != 0.0f);
+					break;
 				case InputKind::ResetController:
 					io.ClearEventsQueue();
 					io.ClearInputKeys();
@@ -945,6 +1010,90 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	void DrawSettings(vk::Extent2D extent) {
+		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
+		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.75f);
+		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display,
+		                                              IM_COL32(0, 0, 0, 120));
+		ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always,
+		                        {0.5f, 0.5f});
+		ImGui::SetNextWindowSize(
+		    {std::max(std::min(600.0f * scale, display.x - 32.0f), 1.0f), 0.0f}, ImGuiCond_Always);
+		if (focus_pending) {
+			ImGui::SetNextWindowFocus();
+			settings_saved_percent = static_cast<int>(Config::GetGpuTimestampScalePercent());
+			settings_save_failed   = false;
+		}
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 20.0f * scale});
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 12.0f * scale});
+		ImGui::PushFont(nullptr, 18.0f * scale);
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		                                   ImGuiWindowFlags_NoSavedSettings |
+		                                   ImGuiWindowFlags_AlwaysAutoResize;
+		ImGui::Begin("##KytySettings", nullptr, flags);
+		ImGui::TextUnformatted("Emulator settings");
+		ImGui::Separator();
+
+		ImGui::TextUnformatted("Dynamic resolution headroom");
+		int percent = static_cast<int>(Config::GetGpuTimestampScalePercent());
+		ImGui::SetNextItemWidth(-1.0f);
+		bool changed = ImGui::SliderInt("##headroom", &percent, 100, 150,
+		                                percent == 100 ? "Off" : "%d%%",
+		                                ImGuiSliderFlags_AlwaysClamp);
+		if (changed) {
+			percent = (percent + 2) / 5 * 5;
+		}
+		// Left/right (keys or d-pad) step the focused slider without activating it first.
+		if (ImGui::IsItemFocused() && !ImGui::IsItemActive()) {
+			if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) ||
+			    ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft)) {
+				percent = std::max(percent - 5, 100);
+				changed = true;
+			} else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) ||
+			           ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight)) {
+				percent = std::min(percent + 5, 150);
+				changed = true;
+			}
+		}
+		if (changed) {
+			Config::SetGpuTimestampScalePercent(static_cast<uint32_t>(percent));
+		}
+		if (focus_pending) {
+			ImGui::SetItemDefaultFocus();
+			focus_pending = false;
+		}
+		// Saved once the slider is released, not on every step of a drag.
+		if (percent != settings_saved_percent && !ImGui::IsItemActive()) {
+			settings_save_failed   = !Common::SettingsFile::Save("gpu-timestamp-scale",
+			                                                     std::to_string(percent));
+			settings_saved_percent = percent;
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "For games that adjust their render resolution to how busy the GPU is, such as Astro "
+		    "Bot. Higher values keep GPU time in reserve: a steadier frame rate at a lower "
+		    "resolution. Astro Bot holds a steady 60 from 115%%.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
+		if (settings_save_failed) {
+			ImGui::TextColored({1.0f, 0.5f, 0.4f, 1.0f}, "Could not save %s",
+			                   Common::SettingsFile::FileName);
+		} else {
+			ImGui::TextDisabled("Applies immediately; saved to %s.",
+			                    Common::SettingsFile::FileName);
+		}
+		const float button_width = std::min(160.0f * scale, ImGui::GetContentRegionAvail().x);
+		ImGui::SetCursorPosX(ImGui::GetWindowSize().x - button_width -
+		                     ImGui::GetStyle().WindowPadding.x);
+		const bool close = ImGui::Button("Close (F2)", {button_width, 36.0f * scale});
+		ImGui::End();
+		ImGui::PopFont();
+		ImGui::PopStyleVar(2);
+		if (close) {
+			SetSettingsOpen(false);
+		}
+	}
+
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
 		if (!GetOverlaySnapshot(&snapshot)) {
@@ -983,6 +1132,8 @@ struct SystemOverlay::Impl {
 		}
 		if (snapshot.session.kind == OverlayKind::Error) {
 			DrawError(snapshot.error, frame_extent);
+		} else if (snapshot.session.kind == OverlayKind::Settings) {
+			DrawSettings(frame_extent);
 		} else {
 			DrawIme(snapshot.ime, frame_extent);
 		}
@@ -1030,6 +1181,8 @@ struct SystemOverlay::Impl {
 	bool                                  focus_pending      = true;
 	float                                 ui_scale           = 1.0f;
 	float                                 button_height      = 42.0f;
+	int                                   settings_saved_percent = 100;
+	bool                                  settings_save_failed   = false;
 	ImVec2                                panel_offset {};
 	ImVec2                                right_stick {};
 	OverlaySession                        session;

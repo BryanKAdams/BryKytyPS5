@@ -2,6 +2,7 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/settingsFile.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -10,6 +11,7 @@
 
 #include <charconv>
 #include <cstdio>
+#include <string>
 #include <string_view>
 #include <vector>
 #include <fmt/format.h>
@@ -41,6 +43,8 @@ static std::string GetBuildString() {
 static void PrintUsage() {
 	::printf("%s\n", GetBuildString().c_str());
 	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
+	::printf("Options can also be set in kyty_settings.ini in the working directory, one per\n"
+	         "line without \"--\" (e.g. gpu-timestamp-scale = 115). The command line overrides it.\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
@@ -437,10 +441,27 @@ static int Main(int argc, char* argv[]) {
 	RunOptions options;
 	bool       show_help = false;
 
-	if (argc < 2) {
+	std::vector<std::string> settings;
+	if (!SettingsFile::LoadArguments(settings)) {
+		return 1;
+	}
+	if (!settings.empty()) {
+		::printf("Settings: %s\n", SettingsFile::FileName);
+	}
+
+	if (argc < 2 && settings.empty()) {
 		PrintUsage();
 		return 0;
 	}
+
+	// The settings file's options go first, so the same option on the command line overrides it.
+	std::vector<char*> arguments {argv[0]};
+	for (auto& setting: settings) {
+		arguments.push_back(setting.data());
+	}
+	arguments.insert(arguments.end(), argv + 1, argv + argc);
+	argc = static_cast<int>(arguments.size());
+	argv = arguments.data();
 
 	if (!ParseArgs(argc, argv, options, show_help)) {
 		PrintUsage();

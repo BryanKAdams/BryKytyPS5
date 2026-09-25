@@ -302,6 +302,25 @@ holds a steady 60. At 110 it still sometimes settles at the 3328x1872 level. The
 resolution levels are discrete, so there is no setting between those two outcomes. For a window
 around 1920x1080, a 1080p internal resolution is about native.
 
+The setting is also in the in-game settings panel: press F2 in the game window. "Dynamic
+resolution headroom" steps in 5% from Off (100%) to 150% with the mouse, the arrow keys or the
+d-pad. It applies immediately and is saved to `kyty_settings.ini`. Esc, F2, circle or Close closes
+the panel, and the game gets no input while it is open. After a live change, Astro Bot took about
+20-25 s to step its resolution down and settle at a flat 60.
+
+## Settings file
+
+`kyty_settings.ini` in the working directory holds default options, one per line, named like the
+command-line flags without `--`; `#` starts a comment, and a switch needs no value:
+
+```text
+gpu-timestamp-scale = 115   # dynamic-resolution headroom
+fullscreen
+```
+
+It is read at startup, and the same option on the command line overrides it. The settings panel
+writes its changes here.
+
 Occlusion queries are not a culling lever here: about 8 ZPASS_DONE dumps a frame and no
 predicated draws, which fits sun or lens-flare visibility checks. They still report always
 visible.

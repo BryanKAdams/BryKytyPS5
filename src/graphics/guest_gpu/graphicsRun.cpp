@@ -70,9 +70,9 @@ static void LogTimestampWrite(const char* kind, uint32_t event, uint64_t dst, ui
 static std::atomic<uint64_t> g_timestamp_anchor {0};
 
 static uint64_t GuestGpuTimestamp() {
-	static const uint64_t percent = Config::GetGpuTimestampScalePercent();
-	const auto            now     = Sync::ReadReferenceClock();
-	const auto            anchor  = g_timestamp_anchor.load(std::memory_order_relaxed);
+	const uint64_t percent = Config::GetGpuTimestampScalePercent();
+	const auto     now     = Sync::ReadReferenceClock();
+	const auto     anchor  = g_timestamp_anchor.load(std::memory_order_relaxed);
 	if (percent == 100 || anchor == 0 || now <= anchor) {
 		return now;
 	}

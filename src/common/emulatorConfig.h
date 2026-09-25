@@ -141,6 +141,8 @@ uint32_t GetLabelFlushIntervalUs();
 // Stretch time measured between guest GPU timestamps within a frame, in percent (100 = off).
 // Games that size their dynamic resolution from GPU timestamps then leave more GPU headroom.
 uint32_t GetGpuTimestampScalePercent();
+// Changes it while running (the settings panel); takes effect at the next timestamp.
+void     SetGpuTimestampScalePercent(uint32_t percent);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 
 namespace Config {
@@ -176,8 +177,17 @@ uint32_t GetLabelFlushIntervalUs() {
 	return g_config->label_flush_interval_us;
 }
 
+// A runtime change from the settings panel; 0 means the configured value.
+static std::atomic<uint32_t> g_gpu_timestamp_scale_override {0};
+
 uint32_t GetGpuTimestampScalePercent() {
-	return g_config->gpu_timestamp_scale_percent;
+	const auto percent = g_gpu_timestamp_scale_override.load(std::memory_order_relaxed);
+	return percent != 0 ? percent : g_config->gpu_timestamp_scale_percent;
+}
+
+void SetGpuTimestampScalePercent(uint32_t percent) {
+	g_gpu_timestamp_scale_override.store(std::clamp(percent, 100u, 200u),
+	                                     std::memory_order_relaxed);
 }
 
 
