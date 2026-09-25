@@ -147,7 +147,8 @@ struct ReadCapture {
 
 bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
-	if (!capture.source.read_specialization_memory(capture.source.userdata, address, values)) {
+	if (!capture.source.read_specialization_memory(SpecializationUserdata(capture.source), address,
+	                                               values)) {
 		return false;
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
@@ -240,7 +241,7 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
 	const auto prefix = words.first(count);
 	return prefix.size_bytes() - 1u <= AddressMask - address &&
 	       runtime.read_specialization_memory != nullptr &&
-	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
+	       runtime.read_specialization_memory(SpecializationUserdata(runtime), address, prefix);
 }
 
 // Plan roots for the Value-based SrtWalker and the node-based SrtEvaluator.
@@ -989,25 +990,17 @@ public:
 
 	explicit CleanBlockCache(const SrtRuntime& source): m_source(source) {}
 
-	// Both readers share SrtRuntime::userdata.
+	// Direct reads keep their reader and userdata.
 	SrtRuntime Runtime() {
 		auto runtime                       = m_source;
-		runtime.userdata                   = this;
+		runtime.specialization_userdata    = this;
 		runtime.read_specialization_memory = Read;
-		if (runtime.read_memory != nullptr) {
-			runtime.read_memory = Direct;
-		}
 		return runtime;
 	}
 
 private:
 	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
 		return static_cast<CleanBlockCache*>(userdata)->Read(address, values);
-	}
-
-	static bool Direct(void* userdata, uint64_t address, std::span<uint32_t> values) {
-		const auto& source = static_cast<CleanBlockCache*>(userdata)->m_source;
-		return source.read_memory(source.userdata, address, values);
 	}
 
 	static constexpr uint32_t BlockWords = BlockBytes / sizeof(uint32_t);
@@ -1020,7 +1013,7 @@ private:
 	};
 
 	bool Exact(uint64_t address, std::span<uint32_t> values) const {
-		return m_source.read_specialization_memory(m_source.userdata, address, values);
+		return m_source.read_specialization_memory(SpecializationUserdata(m_source), address, values);
 	}
 
 	bool Read(uint64_t address, std::span<uint32_t> values) {
@@ -1049,8 +1042,11 @@ private:
 		if (!block->clean) {
 			return Exact(address, values);
 		}
-		std::copy_n(block->words.begin() + offset / sizeof(uint32_t), values.size(),
-		            values.begin());
+		// Usually one dword: avoid a memmove call.
+		const auto* words = block->words.data() + offset / sizeof(uint32_t);
+		for (size_t index = 0; index < values.size(); index++) {
+			values[index] = words[index];
+		}
 		return true;
 	}
 
@@ -1065,6 +1061,7 @@ SrtRuntime ObservedRuntime(const SrtRuntime& runtime, bool capture_reads, ReadCa
 	if (capture_reads) {
 		capture.ranges.clear();
 		observed.userdata = &capture;
+		observed.specialization_userdata = nullptr;
 		observed.read_specialization_memory = CaptureStrictRead;
 		if (observed.read_memory != nullptr) observed.read_memory = CaptureOrdinaryRead;
 	}
@@ -1114,7 +1111,8 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
                  typename Roots::Walker& walker, ResourceSnapshot& snapshot,
                  ResourceSpecialization& specialization, MaterializationMemo* memo) {
 	auto& reads = program.specialization_reads;
-	const auto active = clean.FindActiveSources();
+	// The ordinary walker sends conditions that are not direct to its strict walker.
+	const auto active = walker.FindActiveSources();
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
 	}

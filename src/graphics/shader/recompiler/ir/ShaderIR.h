@@ -592,6 +592,12 @@ struct CompiledResourcePlan {
 	std::vector<uint32_t>                key_counts;     // Indirect images, per descriptor source.
 	std::vector<uint32_t>                selector_masks; // Indirect images, per descriptor source.
 	std::vector<uint32_t>                conditions;     // Per control_flow block.
+	// Per control_flow block: the condition reads only flat SRT slots (besides user data, the
+	// shader base and pure operations). Every refresh reads those slots directly anyway, so the
+	// condition uses the direct values instead of strict reads.
+	std::vector<uint8_t>                 direct_conditions;
+	// Sources not guarded by any control_flow block start active; empty if a block is invalid.
+	std::vector<uint8_t>                 initial_active;
 	std::array<uint32_t, 4>              fill {ResourceNode::NoNode, ResourceNode::NoNode,
 	                                           ResourceNode::NoNode, ResourceNode::NoNode};
 	// Buffer, image and sampler descriptors are a pure function of these inputs and the active

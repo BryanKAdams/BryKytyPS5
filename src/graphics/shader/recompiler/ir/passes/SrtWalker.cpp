@@ -15,9 +15,12 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
-	runtime.read_memory = runtime.read_specialization_memory != nullptr
-	                          ? runtime.read_specialization_memory
-	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	if (runtime.read_specialization_memory != nullptr) {
+		runtime.read_memory = runtime.read_specialization_memory;
+		runtime.userdata    = SpecializationUserdata(runtime);
+	} else {
+		runtime.read_memory = +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	}
 	return runtime;
 }
 
@@ -1006,7 +1009,10 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
-	auto& active = m_program.active_sources;
+	// Conditions over flat SRT slots use this walker; see CompiledResourcePlan.
+	const auto& direct = CompileResourcePlan(m_program).direct_conditions;
+	auto&       strict = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	auto&       active = m_program.active_sources;
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow) {
 		for (const auto source: block.sources) {
@@ -1030,8 +1036,9 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 			active[source] = 1u;
 		}
 		uint32_t condition = 0;
+		auto&    evaluator = index < direct.size() && direct[index] != 0u ? *this : strict;
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    Evaluate(block.condition, condition)) {
+		    evaluator.Evaluate(block.condition, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
@@ -1374,6 +1381,67 @@ private:
 	std::vector<uint8_t>  m_clean_visited;
 };
 
+// A condition may use the ordinary walker when everything it reads directly is a flat SRT slot,
+// which RefreshFlatBuffer reads (and memoizes) on every refresh anyway. Select predicates still go
+// to the strict walker, as for any ordinary value.
+class DirectConditionAnalysis {
+public:
+	explicit DirectConditionAnalysis(const CompiledResourcePlan& compiled)
+	    : m_compiled(compiled), m_visited(compiled.nodes.size(), 0u) {}
+
+	bool Visit(uint32_t index) {
+		if (index == ResourceNode::NoNode || m_visited[index] != 0u) {
+			return true;
+		}
+		m_visited[index] = 1u;
+		const auto& node = m_compiled.nodes[index];
+		switch (node.op) {
+			case NodeOp::ReadConst: {
+				const auto target = m_compiled.nodes[node.args[0]].op;
+				return (node.flags & ResourceNode::CleanSlot) == 0u &&
+				       (target == NodeOp::RawAddress || target == NodeOp::RawBuffer);
+			}
+			case NodeOp::ReadFirstLane:
+			case NodeOp::RawAddress:
+			case NodeOp::RawBuffer: return false;
+			case NodeOp::Select: return Visit(node.args[1]) && Visit(node.args[2]);
+			default:
+				for (const auto arg: node.args) {
+					if (!Visit(arg)) {
+						return false;
+					}
+				}
+				return true;
+		}
+	}
+
+private:
+	const CompiledResourcePlan& m_compiled;
+	std::vector<uint8_t>        m_visited;
+};
+
+void AnalyzeControlFlow(const ResourcePlan& program, CompiledResourcePlan& compiled) {
+	compiled.direct_conditions.assign(program.control_flow.size(), 0u);
+	const bool clean_slots =
+	    std::ranges::any_of(program.clean_flat_slots, [](uint8_t slot) { return slot != 0u; });
+	for (uint32_t block = 0; block < program.control_flow.size(); block++) {
+		const auto condition = compiled.conditions[block];
+		compiled.direct_conditions[block] =
+		    !clean_slots && condition != ResourceNode::NoNode &&
+		    DirectConditionAnalysis(compiled).Visit(condition);
+	}
+	compiled.initial_active.assign(program.descriptor_sources.size(), 1u);
+	for (const auto& block: program.control_flow) {
+		for (const auto source: block.sources) {
+			if (source >= compiled.initial_active.size()) {
+				compiled.initial_active.clear();
+				return;
+			}
+			compiled.initial_active[source] = 0u;
+		}
+	}
+}
+
 void AnalyzeMemo(const ResourcePlan& program, CompiledResourcePlan& compiled) {
 	if (program.requires_specialization_memory ||
 	    std::ranges::any_of(program.clean_flat_slots, [](uint8_t slot) { return slot != 0u; })) {
@@ -1449,6 +1517,7 @@ const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
 	for (uint32_t i = 0; i < program.uniform_fill.fill.words && i < compiled->fill.size(); i++) {
 		compiled->fill[i] = compiler.Node(program.uniform_fill.values[i]);
 	}
+	AnalyzeControlFlow(program, *compiled);
 	AnalyzeMemo(program, *compiled);
 	program.compiled = std::move(compiled);
 	return *program.compiled;
@@ -1852,12 +1921,17 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 		return {};
 	}
 	auto& active = m_program.active_sources;
-	active.assign(m_program.descriptor_sources.size(), 1u);
-	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) {
-			active.at(source) = 0u;
+	if (!m_compiled.initial_active.empty()) {
+		active.assign(m_compiled.initial_active.begin(), m_compiled.initial_active.end());
+	} else {
+		active.assign(m_program.descriptor_sources.size(), 1u);
+		for (const auto& block: m_program.control_flow) {
+			for (const auto source: block.sources) {
+				active.at(source) = 0u;
+			}
 		}
 	}
+	auto& strict  = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
 	visited.assign(m_program.control_flow.size(), 0u);
@@ -1876,9 +1950,10 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 		}
 		uint32_t   condition      = 0;
 		const auto condition_node = m_compiled.conditions[index];
+		auto&      evaluator      = m_compiled.direct_conditions[index] != 0u ? *this : strict;
 		if (condition_node != ResourceNode::NoNode &&
 		    m_runtime.read_specialization_memory != nullptr &&
-		    Evaluate(condition_node, condition)) {
+		    evaluator.Evaluate(condition_node, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
