@@ -5,10 +5,12 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -103,8 +105,15 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (GpuZones::g_context == this) {
+		GpuZones::g_marker  = nullptr;
+		GpuZones::g_context = nullptr;
+	}
 	if (m_timestamp_pool != nullptr) {
 		m_graphics.device.destroyQueryPool(m_timestamp_pool, nullptr);
+	}
+	if (m_zone_pool != nullptr) {
+		m_graphics.device.destroyQueryPool(m_zone_pool, nullptr);
 	}
 }
 
@@ -379,6 +388,9 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.Begin();
 	if (m_async_submit && DrainStats::Enabled()) {
 		WriteStartTimestamp();
+		if (m_zones) {
+			BeginZones();
+		}
 	}
 	return m_command;
 }
@@ -405,6 +417,88 @@ void CommandScheduler::WriteEndTimestamp() {
 	// Runs on this thread once the buffer's tick completes, in tick order.
 	std::lock_guard lock(m_operation_mutex);
 	m_pending_operations.push({[this, slot] { ReadTimestamps(slot); }, CurrentTick()});
+}
+
+void CommandScheduler::MarkZoneThunk(void* context, vk::CommandBuffer buffer,
+                                     DrainStats::Zone zone, uint64_t key, uint64_t pixels) {
+	auto* self = static_cast<CommandScheduler*>(context);
+	if (self->m_zone_chunk != UINT32_MAX && buffer == self->m_command.m_buffer) {
+		self->MarkZone(zone, key, pixels);
+	}
+}
+
+void CommandScheduler::BeginZones() {
+	if (m_zone_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = ZoneChunkQueries * ZoneChunks;
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&info, nullptr, &m_zone_pool),
+		                     "create GPU zone timestamp pool");
+	}
+	m_zone_chunk = m_zone_next_chunk++ % ZoneChunks;
+	m_command.m_buffer.resetQueryPool(m_zone_pool, m_zone_chunk * ZoneChunkQueries,
+	                                  ZoneChunkQueries);
+	m_zone_marks.clear();
+	MarkZone(DrainStats::Zone::Unmarked, 0);
+}
+
+void CommandScheduler::MarkZone(DrainStats::Zone zone, uint64_t key, uint64_t pixels) {
+	if (!m_zone_marks.empty() && m_zone_marks.back().zone == zone &&
+	    m_zone_marks.back().key == key) {
+		return;
+	}
+	// The chunk's last query closes the buffer; work past a full chunk joins the current zone.
+	if (m_zone_marks.size() + 1 >= ZoneChunkQueries) {
+		return;
+	}
+	// Bottom of pipe: the timestamp lands once the work recorded before it has finished.
+	m_command.m_buffer.writeTimestamp(
+	    vk::PipelineStageFlagBits::eBottomOfPipe, m_zone_pool,
+	    m_zone_chunk * ZoneChunkQueries + static_cast<uint32_t>(m_zone_marks.size()));
+	m_zone_marks.push_back({zone, key, pixels});
+}
+
+void CommandScheduler::EndZones() {
+	if (m_zone_chunk == UINT32_MAX) {
+		return;
+	}
+	const auto chunk = m_zone_chunk;
+	m_zone_chunk     = UINT32_MAX;
+	m_command.m_buffer.writeTimestamp(
+	    vk::PipelineStageFlagBits::eBottomOfPipe, m_zone_pool,
+	    chunk * ZoneChunkQueries + static_cast<uint32_t>(m_zone_marks.size()));
+	std::lock_guard lock(m_operation_mutex);
+	m_pending_operations.push(
+	    {[this, chunk, marks = std::move(m_zone_marks)] { ReadZones(chunk, marks); },
+	     CurrentTick()});
+	m_zone_marks = {};
+}
+
+void CommandScheduler::ReadZones(uint32_t chunk, const std::vector<ZoneMark>& marks) {
+	if (marks.empty()) {
+		return;
+	}
+	std::vector<uint64_t> values(marks.size() + 1);
+	const auto            result = m_graphics.device.getQueryPoolResults(
+        m_zone_pool, chunk * ZoneChunkQueries, static_cast<uint32_t>(values.size()),
+        values.size() * sizeof(uint64_t), values.data(), sizeof(uint64_t),
+        vk::QueryResultFlagBits::e64);
+	if (result != vk::Result::eSuccess) {
+		return;
+	}
+	const double period = m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+	std::vector<DrainStats::ZoneSample> samples;
+	samples.reserve(marks.size());
+	for (size_t i = 0; i < marks.size(); i++) {
+		// A later buffer that reused this chunk before the read leaves values out of order.
+		if (values[i + 1] < values[i]) {
+			return;
+		}
+		samples.push_back(
+		    {marks[i].zone, marks[i].key, marks[i].pixels,
+		     static_cast<uint64_t>(static_cast<double>(values[i + 1] - values[i]) * period)});
+	}
+	DrainStats::RecordZones(samples.data(), samples.size());
 }
 
 void CommandScheduler::ReadTimestamps(uint32_t slot) {
@@ -439,6 +533,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	if (m_timestamp_slot != UINT32_MAX) {
 		WriteEndTimestamp();
 	}
+	EndZones();
 	m_last_submit = std::chrono::steady_clock::now();
 	m_command.End();
 	EXIT_IF(m_graphics.queue == nullptr);
@@ -529,6 +624,13 @@ void CommandScheduler::EnableAsyncSubmit() {
 	// Switching needs no other submitter running; the owner enables it during construction.
 	EXIT_IF(m_async_submit);
 	m_async_submit  = true;
+	// Only the render scheduler submits asynchronously, so it alone owns the zone marker.
+	if (const char* zones = std::getenv("KYTY_GPU_ZONES");
+	    zones != nullptr && zones[0] == '1' && GpuZones::g_marker == nullptr) {
+		m_zones             = true;
+		GpuZones::g_context = this;
+		GpuZones::g_marker  = &MarkZoneThunk;
+	}
 	m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
 }
 

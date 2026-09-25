@@ -5,6 +5,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 
@@ -150,6 +151,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 
 	auto& command_buffer = m_scheduler.Current();
 	auto  command        = command_buffer.Handle();
+	GpuZones::Mark(command, DrainStats::Zone::Blit);
 	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
 	               command);
 	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},

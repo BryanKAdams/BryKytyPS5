@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
@@ -143,6 +144,27 @@ private:
 	uint32_t                  m_timestamp_next = 0;
 	uint32_t                  m_timestamp_slot = UINT32_MAX; // Slot of the recording buffer.
 	uint64_t                  m_gpu_last_end   = 0;          // Latest end seen, in ticks.
+	// KYTY_GPU_ZONES=1 with --drain-stats: a timestamp at each change of zone (gpuZones.h) in
+	// the recording buffer. Each buffer takes one chunk of the pool, reset when it begins, and
+	// its intervals are read once its tick completes.
+	static constexpr uint32_t ZoneChunkQueries = 4096;
+	static constexpr uint32_t ZoneChunks       = 64;
+	struct ZoneMark {
+		DrainStats::Zone zone;
+		uint64_t         key;
+		uint64_t         pixels; // Render area of the interval's first draw.
+	};
+	static void MarkZoneThunk(void* context, vk::CommandBuffer buffer, DrainStats::Zone zone,
+	                          uint64_t key, uint64_t pixels);
+	void        BeginZones();
+	void        MarkZone(DrainStats::Zone zone, uint64_t key, uint64_t pixels = 0);
+	void        EndZones();
+	void        ReadZones(uint32_t chunk, const std::vector<ZoneMark>& marks);
+	bool                  m_zones           = false;
+	vk::QueryPool         m_zone_pool       = nullptr;
+	uint32_t              m_zone_next_chunk = 0;
+	uint32_t              m_zone_chunk      = UINT32_MAX; // Chunk of the recording buffer.
+	std::vector<ZoneMark> m_zone_marks;
 	std::chrono::steady_clock::time_point m_last_submit {};
 };
 

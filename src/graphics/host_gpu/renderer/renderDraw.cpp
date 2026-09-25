@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/meshDispatch.h"
 #include "graphics/host_gpu/renderer/meshIndirect.h"
@@ -1185,6 +1186,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
+	if (GpuZones::Enabled()) [[unlikely]] {
+		const auto* program =
+		    state.ps_active ? state.ps_input_info.stage.program : state.vertex_info[0].stage.program;
+		GpuZones::Mark(vk_buffer,
+		               DrainStats::t_predicated ? DrainStats::Zone::GameDrawPredicated
+		                                        : DrainStats::Zone::GameDraw,
+		               program != nullptr ? program->shader_hash : 0,
+		               uint64_t {rendering.width} * rendering.height * rendering.num_layers);
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);

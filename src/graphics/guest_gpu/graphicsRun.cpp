@@ -429,6 +429,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	DrainStats::Record(DrainStats::Kind::GpuTimestamp, 1);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -816,6 +817,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 		DrainStats::SetPm4Op(DrainStats::Pm4Op(opcode, KYTY_PM4_R(packet_header)));
+		DrainStats::t_predicated = (packet_header & 1u) != 0;
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -931,6 +933,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			DrainStats::Record(DrainStats::Kind::OcclusionPredicate, 1);
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
@@ -1343,6 +1346,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				if (event_write_source == 0x04) {
 					value = Sync::ReadReferenceClock();
+					DrainStats::Record(DrainStats::Kind::GpuTimestamp, 1);
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
@@ -1535,6 +1539,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			DrainStats::Record(DrainStats::Kind::OcclusionQuery, 1);
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
 				std::printf("Warning: game uses occlusion queries, which are currently treated as "

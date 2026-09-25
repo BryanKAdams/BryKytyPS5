@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -23,12 +24,14 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
+#include <unordered_set>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -36,6 +39,28 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// KYTY_GPU_ZONES: describe an image the first time it is refreshed for each cause, so the guest
+// addresses that key its zone rows can be matched to a size, format, and writer.
+void LogZoneRefresh(const Image& image) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	const bool     buffer_modified = image.IsBufferModified();
+	const auto&    info            = image.info;
+	const uint64_t key             = info.data.address | (buffer_modified ? 1u : 0u);
+	{
+		std::scoped_lock lock {mutex};
+		if (!seen.insert(key).second) {
+			return;
+		}
+	}
+	std::printf("gpu-zones: refresh image 0x%016" PRIx64 " size=0x%" PRIx64
+	            " %ux%ux%u guest_format=%u tile=%u levels=%u layers=%u cause=%s\n",
+	            info.data.address, info.data.size, info.extent.width, info.extent.height,
+	            info.extent.depth, static_cast<uint32_t>(info.guest_format),
+	            static_cast<uint32_t>(info.tile_mode), info.resources.levels, info.resources.layers,
+	            buffer_modified ? "gpu-buffer-write" : "cpu-write");
+}
 
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -656,6 +681,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
+	GpuZones::KeyScope zone_key(destination.info.data.address);
 	TrackImage(destination_id);
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
@@ -693,6 +719,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
+	GpuZones::KeyScope zone_key(destination.info.data.address);
 	TrackImage(destination_id);
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
@@ -1033,6 +1060,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	GpuZones::KeyScope zone_key(image.info.data.address);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -1244,6 +1272,7 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 	if (!m_dcc_gpu_clear || count == 0) {
 		return false;
 	}
+	GpuZones::KeyScope zone_key(m_slot_images[id].info.data.address);
 	std::array<vk::ClearColorValue, DccClearResolver::CodeCount> colors {};
 	uint32_t                                                     code_mask = 0;
 	for (uint32_t index = 0; index < DccClearResolver::CodeCount; index++) {
@@ -1419,6 +1448,9 @@ void TextureCache::RefreshImage(ImageId id) {
 	}
 	if (!cpu_dirty) {
 		return;
+	}
+	if (GpuZones::Enabled()) [[unlikely]] {
+		LogZoneRefresh(image);
 	}
 	InitializeImage(id);
 }
@@ -1839,6 +1871,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
 	              command.Handle());
 	auto native_range = range;
+	GpuZones::Mark(command.Handle(), DrainStats::Zone::ImageCopy);
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
@@ -1946,6 +1979,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                      uint64_t destination_size, ImageDownload transfer) {
+	GpuZones::KeyScope zone_key(image.info.data.address | GpuZones::DownloadKey);
 	if (!transfer.valid) {
 		EXIT("TextureCache: invalid image download transfer\n");
 	}

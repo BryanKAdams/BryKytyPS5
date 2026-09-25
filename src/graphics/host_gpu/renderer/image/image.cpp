@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
@@ -241,6 +242,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::ImageCopy);
 	command.pipelineBarrier2(dependency);
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
@@ -281,6 +283,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::ImageCopy);
 	command.pipelineBarrier2(dependency);
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
@@ -358,6 +361,7 @@ void Image::CopyImage(Image& source) {
 		return;
 	}
 	auto command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::ImageCopy);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
@@ -400,6 +404,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::ImageCopy);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               resolved_source_range, command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
@@ -467,6 +472,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &barrier;
 	auto command                        = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::ImageCopy);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
@@ -549,6 +555,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 		copy.extent         = {width, height, depth};
 	}
 	auto command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::ImageCopy);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -387,6 +388,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	const auto command = scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::ImageCopy);
 	const ImageSubresourceRange range {read_desc.view_info.base_level, 1,
 	                                  read_desc.view_info.base_layer,
 	                                  read_desc.view_info.layer_count};

@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "gpu_tiler_shaders/mesh_indirect_args_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -84,6 +85,7 @@ MeshIndirectArgs::~MeshIndirectArgs() {
 void MeshIndirectArgs::Record(vk::CommandBuffer command, const Buffer& arguments,
                               uint64_t arguments_offset, const Buffer& output,
                               uint64_t output_offset, const Params& params) {
+	GpuZones::Mark(command, DrainStats::Zone::MeshArgs);
 	const auto alignment = m_graphics.StorageMinAlignment();
 	EXIT_IF(arguments_offset % sizeof(uint32_t) != 0 || output_offset % sizeof(uint32_t) != 0 ||
 	        params.primitive_size == 0 || params.primitive_step == 0 ||

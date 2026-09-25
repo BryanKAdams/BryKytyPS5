@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include <algorithm>
@@ -296,6 +297,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 
 	m_scheduler.EndRendering();
 	auto                    command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::Tiler);
 	vk::BufferMemoryBarrier barriers[3] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
@@ -510,6 +512,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 
 	m_scheduler.EndRendering();
 	auto                    command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::Tiler);
 	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -646,6 +649,7 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::Tiler);
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);

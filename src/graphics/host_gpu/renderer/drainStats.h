@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 
 // Opt-in accounting of host waits on the GPU (--drain-stats). Wait sites record their kind and
@@ -50,7 +51,35 @@ enum class Kind : uint8_t {
 	IndirectArgsGpu, // An indirect draw read GPU-written args; the value counts mesh-emulated draws.
 	GpuBusy,       // GPU execution time (union of command-buffer intervals), in ns.
 	GpuGap,        // GPU time between command buffers with none executing, in ns.
+	OcclusionQuery,     // A ZPASS_DONE occlusion-counter dump.
+	OcclusionPredicate, // SET_PREDICATION on occlusion results.
+	GpuTimestamp,       // A GPU timestamp write (RELEASE_MEM/EOP or COPY_DATA of the clock).
 	Count,
+};
+
+// GPU work zones (KYTY_GPU_ZONES=1 with --drain-stats). The render scheduler timestamps each
+// change of zone in its recording buffer and charges the interval up to the next timestamp to
+// the zone that opened it. Work recorded without a mark joins the zone before it.
+enum class Zone : uint8_t {
+	Unmarked,           // From the start of a command buffer to its first mark.
+	GameDraw,           // A guest draw, keyed by its pixel shader hash (vertex shader without one).
+	GameDrawPredicated, // A GameDraw under SET_PREDICATION, e.g. behind an occlusion query.
+	GameDispatch,       // A guest compute dispatch, keyed by its shader hash.
+	MeshArgs,           // The mesh indirect-arguments pre-pass.
+	Tiler,              // Tiling and detiling compute for texture uploads and downloads.
+	DccClear,           // DCC fast-clear resolves.
+	FaultBuffer,        // The GPU page-fault buffer scan.
+	Blit,               // Blit-helper draws (format conversions and scaled copies).
+	ImageCopy,          // Image copies and clears recorded by images and the texture cache.
+	BufferCopy,         // Buffer cache and stream-buffer copies, uploads, and downloads.
+	Count,
+};
+
+struct ZoneSample {
+	Zone     zone;
+	uint64_t key;
+	uint64_t pixels; // Render area of the interval's first draw, or 0.
+	uint64_t ns;
 };
 
 // PM4 packets are indexed by opcode; IT_NOP packets carrying a Kyty custom code use 256 + code.
@@ -60,6 +89,8 @@ constexpr uint32_t NoPm4Op    = Pm4OpCount;
 inline std::atomic_bool         g_enabled {false};
 inline thread_local Reason      t_reason = Reason::Unattributed;
 inline thread_local uint32_t    t_pm4_op = NoPm4Op;
+// The PM4 packet being executed carries the predication bit.
+inline thread_local bool        t_predicated = false;
 // Guest instruction that raised the page fault being handled on this thread.
 inline thread_local uint64_t    t_fault_pc = 0;
 
@@ -78,6 +109,8 @@ void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noe
 // A recorded GPU command writes [vaddr, vaddr+size). Read fault sites report the newest such
 // writer of their address and how many frames ago it was recorded.
 void RecordGpuWrite(uint64_t vaddr, uint64_t size) noexcept;
+// GPU time of one command buffer's zone intervals.
+void RecordZones(const ZoneSample* samples, size_t count) noexcept;
 
 inline void Record(Kind kind, uint64_t value) noexcept {
 	if (Enabled()) {

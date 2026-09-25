@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <fmt/format.h>
+#include <map>
 #include <mutex>
 #include <stop_token>
 #include <string>
@@ -28,7 +30,10 @@ struct Cell {
 	std::atomic<uint64_t> value {0};
 };
 
+constexpr size_t FrameBuckets = 101;
+
 struct Snapshot {
+	std::array<uint64_t, FrameBuckets> frame_ms {};
 	std::vector<uint64_t> count = std::vector<uint64_t>(CellCount);
 	std::vector<uint64_t> value = std::vector<uint64_t>(CellCount);
 	uint64_t              frames   = 0;
@@ -38,6 +43,8 @@ struct Snapshot {
 Cell                  g_cells[CellCount];
 std::atomic<uint64_t> g_frames {0};
 std::atomic<uint64_t> g_presents {0};
+// Time between new game frames: one bucket per millisecond, the last collects the rest.
+std::array<std::atomic<uint64_t>, FrameBuckets> g_frame_ms {};
 
 struct FaultSite {
 	std::string thread;
@@ -71,6 +78,16 @@ std::mutex            g_write_mutex;
 std::vector<GpuWrite> g_writes(WriteHistory);
 size_t                g_write_next = 0;
 
+struct ZoneCell {
+	uint64_t count  = 0;
+	uint64_t ns     = 0;
+	uint64_t pixels = 0; // Summed render area of the intervals that report one.
+};
+
+// Per-interval zone time, keyed by zone and key. One command buffer's samples arrive together.
+std::mutex                                    g_zone_mutex;
+std::map<std::pair<Zone, uint64_t>, ZoneCell> g_zones;
+
 std::mutex                  g_reporter_mutex;
 std::condition_variable_any g_reporter_wake;
 std::jthread                g_reporter;
@@ -99,6 +116,9 @@ const char* KindName(Kind kind) {
 		case Kind::IndirectArgsGpu: return "indirect-gpu";
 		case Kind::GpuBusy: return "gpu-busy";
 		case Kind::GpuGap: return "gpu-gap";
+		case Kind::OcclusionQuery: return "occlusion-query";
+		case Kind::OcclusionPredicate: return "occlusion-pred";
+		case Kind::GpuTimestamp: return "gpu-timestamp";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -129,6 +149,114 @@ const char* ReasonName(Reason reason) {
 		case Reason::Count: break;
 	}
 	return "?";
+}
+
+const char* ZoneName(Zone zone) {
+	switch (zone) {
+		case Zone::Unmarked: return "unmarked";
+		case Zone::GameDraw: return "game-draw";
+		case Zone::GameDrawPredicated: return "game-draw-pred";
+		case Zone::GameDispatch: return "game-dispatch";
+		case Zone::MeshArgs: return "mesh-args";
+		case Zone::Tiler: return "tiler";
+		case Zone::DccClear: return "dcc-clear";
+		case Zone::FaultBuffer: return "fault-buffer";
+		case Zone::Blit: return "blit";
+		case Zone::ImageCopy: return "image-copy";
+		case Zone::BufferCopy: return "buffer-copy";
+		case Zone::Count: break;
+	}
+	return "?";
+}
+
+// GPU time per frame by zone, then the costliest zone keys (shader hashes for game work).
+std::string ZoneSummary(uint64_t frames) {
+	std::map<std::pair<Zone, uint64_t>, ZoneCell> zones;
+	{
+		std::lock_guard lock(g_zone_mutex);
+		zones.swap(g_zones);
+	}
+	if (zones.empty() || frames == 0) {
+		return {};
+	}
+	const auto per_frame = [frames](uint64_t ns) {
+		return static_cast<double>(ns) / 1e6 / static_cast<double>(frames);
+	};
+	std::array<ZoneCell, static_cast<size_t>(Zone::Count)> totals {};
+	uint64_t                                               all_ns = 0;
+	for (const auto& [key, cell]: zones) {
+		auto& total = totals[static_cast<size_t>(key.first)];
+		total.count += cell.count;
+		total.ns += cell.ns;
+		all_ns += cell.ns;
+	}
+	std::string text = fmt::format("  gpu-zones      {:.2f}ms/frame:", per_frame(all_ns));
+	for (size_t zone = 0; zone < totals.size(); zone++) {
+		if (totals[zone].count != 0) {
+			text += fmt::format(" {}={:.2f}ms/{:.0f}", ZoneName(static_cast<Zone>(zone)),
+			                    per_frame(totals[zone].ns),
+			                    static_cast<double>(totals[zone].count) /
+			                        static_cast<double>(frames));
+		}
+	}
+	text += '\n';
+	std::vector<std::pair<std::pair<Zone, uint64_t>, ZoneCell>> rows(zones.begin(), zones.end());
+	std::sort(rows.begin(), rows.end(),
+	          [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+	for (size_t i = 0; i < std::min<size_t>(rows.size(), 24); i++) {
+		const auto& [key, cell] = rows[i];
+		text += fmt::format("  gpu-zone       {:<14} key={:016x} {:6.3f}ms/frame n/frame={:.1f} "
+		                    "avg={:.1f}us",
+		                    ZoneName(key.first), key.second, per_frame(cell.ns),
+		                    static_cast<double>(cell.count) / static_cast<double>(frames),
+		                    static_cast<double>(cell.ns) / 1e3 / static_cast<double>(cell.count));
+		// Draws: the render area per run and the cost per million pixels of it, which stay
+		// comparable across the resolutions the game's dynamic scaling picks.
+		if (cell.pixels != 0) {
+			const auto mpx = static_cast<double>(cell.pixels) / 1e6;
+			text += fmt::format(" area={:.2f}Mpx {:.1f}us/Mpx", mpx / static_cast<double>(cell.count),
+			                    static_cast<double>(cell.ns) / 1e3 / mpx);
+		}
+		text += '\n';
+	}
+	return text;
+}
+
+// Percentiles of the time between new game frames, and frames that took an extra refresh.
+std::string FrameTimeSummary(const Snapshot& before, const Snapshot& after) {
+	std::array<uint64_t, FrameBuckets> counts {};
+	uint64_t                           total = 0;
+	for (size_t i = 0; i < FrameBuckets; i++) {
+		counts[i] = after.frame_ms[i] - before.frame_ms[i];
+		total += counts[i];
+	}
+	if (total == 0) {
+		return {};
+	}
+	const auto percentile = [&](double p) {
+		const auto target = static_cast<uint64_t>(p * static_cast<double>(total - 1)) + 1;
+		uint64_t   seen   = 0;
+		for (size_t i = 0; i < FrameBuckets; i++) {
+			seen += counts[i];
+			if (seen >= target) {
+				return i;
+			}
+		}
+		return FrameBuckets - 1;
+	};
+	uint64_t long_frames = 0;
+	size_t   worst       = 0;
+	for (size_t i = 0; i < FrameBuckets; i++) {
+		if (counts[i] != 0) {
+			worst = i;
+		}
+		if (i >= 25) {
+			long_frames += counts[i];
+		}
+	}
+	return fmt::format("  frame-times    p50={}ms p95={}ms p99={}ms max={}ms >=25ms={} of {} ({:.1f}%)\n",
+	                   percentile(0.5), percentile(0.95), percentile(0.99), worst, long_frames, total,
+	                   100.0 * static_cast<double>(long_frames) / static_cast<double>(total));
 }
 
 std::string OpName(uint32_t op) {
@@ -184,6 +312,9 @@ Snapshot Take() {
 	}
 	snapshot.frames   = g_frames.load(std::memory_order_relaxed);
 	snapshot.presents = g_presents.load(std::memory_order_relaxed);
+	for (size_t i = 0; i < FrameBuckets; i++) {
+		snapshot.frame_ms[i] = g_frame_ms[i].load(std::memory_order_relaxed);
+	}
 	return snapshot;
 }
 
@@ -209,7 +340,7 @@ bool IsTimeKind(Kind kind) {
 	}
 }
 
-void Report(const Snapshot& before, const Snapshot& after, double seconds) {
+void Report(const Snapshot& before, const Snapshot& after, double seconds, bool interval = true) {
 	const auto frames = after.frames - before.frames;
 	const auto per    = [frames](double value) { return frames == 0 ? 0.0 : value / frames; };
 
@@ -247,6 +378,11 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 	text += fmt::format(" | readback n={} {:.1f}MiB clean={}\n", kind_count[rb],
 	                    static_cast<double>(kind_value[rb]) / (1024.0 * 1024.0),
 	                    kind_count[static_cast<size_t>(Kind::ReadbackClean)]);
+	text += FrameTimeSummary(before, after);
+	// Zones are swapped out per interval, so the session total leaves them out.
+	if (interval) {
+		text += ZoneSummary(frames);
+	}
 
 	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
 		const bool a_time = IsTimeKind(a.kind);
@@ -266,6 +402,11 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds) {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} {:8.2f}ms avg={:.3f}ms\n",
 			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
 			                    row.count, ms, ms / static_cast<double>(row.count));
+		} else if (row.kind == Kind::OcclusionQuery || row.kind == Kind::OcclusionPredicate ||
+		           row.kind == Kind::GpuTimestamp) {
+			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} ({:.1f}/frame)\n", KindName(row.kind),
+			                    ReasonName(row.reason), OpName(row.op), row.count,
+			                    per(static_cast<double>(row.count)));
 		} else if (row.kind == Kind::IndirectArgsCpu || row.kind == Kind::IndirectArgsGpu) {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} mesh={}\n", KindName(row.kind),
 			                    ReasonName(row.reason), OpName(row.op), row.count, row.value);
@@ -332,7 +473,7 @@ void Run(std::stop_token stop, uint32_t interval_seconds) {
 			if (g_final_report.load(std::memory_order_acquire)) {
 				Log::WriteToConsoleAndLog("drain-stats: session total\n");
 				Report(first, current,
-				       std::chrono::duration<double>(current_time - start).count());
+				       std::chrono::duration<double>(current_time - start).count(), false);
 			}
 			break;
 		}
@@ -418,6 +559,19 @@ void RecordGpuWrite(uint64_t vaddr, uint64_t size) noexcept {
 	g_write_next = (g_write_next + 1) % WriteHistory;
 }
 
+void RecordZones(const ZoneSample* samples, size_t count) noexcept {
+	if (!Enabled() || count == 0) {
+		return;
+	}
+	std::lock_guard lock(g_zone_mutex);
+	for (size_t i = 0; i < count; i++) {
+		auto& cell = g_zones[{samples[i].zone, samples[i].key}];
+		cell.count++;
+		cell.ns += samples[i].ns;
+		cell.pixels += samples[i].pixels;
+	}
+}
+
 void CountFrame(bool new_frame) noexcept {
 	if (!Enabled()) {
 		return;
@@ -425,6 +579,15 @@ void CountFrame(bool new_frame) noexcept {
 	g_presents.fetch_add(1, std::memory_order_relaxed);
 	if (new_frame) {
 		g_frames.fetch_add(1, std::memory_order_relaxed);
+		// Presents come from one thread; time between new game frames, in whole milliseconds.
+		static std::chrono::steady_clock::time_point last;
+		const auto now = std::chrono::steady_clock::now();
+		if (last != std::chrono::steady_clock::time_point {}) {
+			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
+			g_frame_ms[static_cast<size_t>(std::clamp<int64_t>(ms, 0, FrameBuckets - 1))]
+			    .fetch_add(1, std::memory_order_relaxed);
+		}
+		last = now;
 	}
 }
 

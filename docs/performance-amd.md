@@ -228,6 +228,30 @@ move the frame rate, which stayed near 51 fps:
 - A 100 Hz virtual vblank.
 - Merging the SRT materialization work.
 
+**GPU-bound, and dynamic resolution:** at about 58 fps the overworld keeps the GPU busy
+16.1-16.5 ms of every frame, with under 1 ms idle, while the CPU threads wait 12-15 ms a frame for it.
+GPU zones put about 1.65 ms of that in emulator work (tiler 0.77, image copies 0.39, DCC clears
+0.31, buffer copies 0.16). The rest is the game's own shaders: one pixel shader,
+`ef31694ed8d87754`, took about 5.3 ms. The per-frame tiler and copy cost comes from full-screen
+8-byte-per-pixel surfaces (guest format 71, tile mode 27) that the game writes with GPU buffer
+stores and then samples, so each one is detiled again every frame.
+
+Astro Bot scales its render resolution: refreshed surfaces in one run ranged from 3840x2160
+through 3328x1872 and 2432x1368 down to 1216x684. Each run settles in either a low mode, where
+the GPU is busy about 12.2 ms a frame with 4.4 ms idle and holds a flat 60, or a high mode, where it
+is busy about 16.3 ms, holds about 58 fps, and misses a vblank on 13-19% of frames. The game writes
+about 305 GPU timestamps a frame (RELEASE_MEM/EOP and COPY_DATA of the clock), and the emulator
+fills them with the reference clock when Thread_Gpu parses the packet. Rewriting each one with
+the clock at GPU completion made things worse: busy went to 17.9 ms and fps to 52 (alternating
+A/B, 60.0/58.0 vs 52.1/51.7). Completion is only known per command buffer, so a frame's
+timestamps bunched together, the game measured less GPU time, and it raised the resolution. The
+experiment was dropped. In the high mode GPU savings turn into resolution rather than frame rate,
+so compare shader changes with the zone rows' cost per million pixels, not fps.
+
+Occlusion queries are not a culling lever here: about 8 ZPASS_DONE dumps a frame and no
+predicated draws, which fits sun or lens-flare visibility checks. They still report always
+visible.
+
 Reviewed but not ported: #506 (its texture-residency change would raise memory to the pressure
 threshold, where eviction drains the GPU; read-only compute barriers almost never apply; block
 descriptor reads are already in `main`), #767 (duplicates #702 and the dense memo), #628, #484,
@@ -250,7 +274,26 @@ descriptor reads are already in `main`), #767 (duplicates #702 and the dense mem
 --dcc-gpu-clear true          Default: apply GPU-written DCC clears on the GPU.
 --dcc-gpu-clear false         Read DCC keys back on the CPU (the previous behavior).
 --drain-stats <seconds>       Report GPU waits by cause every N seconds.
+KYTY_GPU_ZONES=1              With --drain-stats: also report GPU time by zone and shader hash.
 ```
+
+`KYTY_GPU_ZONES=1` (an environment variable, diagnostic only) writes a bottom-of-pipe timestamp
+wherever the recorded work changes zone: a guest draw (keyed by pixel shader hash, or vertex shader
+hash without one), a predicated guest draw, a guest dispatch (keyed by compute shader hash), or
+emulator work (tiler, DCC clear, fault buffer, blit, image copy, buffer copy, mesh-args pre-pass).
+Texture uploads, downloads, copies and DCC clears key their emulator work by the image's guest
+address (bit 63 set for downloads to guest memory). Each drain-stats interval then prints a
+`gpu-zones` line with ms/frame per zone, and the 24 costliest zone keys. The shader hashes match
+the shader dump names (`--graphics-debug-dump`). Overlapping work is charged to the zone whose
+timestamp it finishes before, so treat the numbers as a ranking. Draw rows also give the render
+area per run and the cost per million pixels of it (`area=… …us/Mpx`), which stays comparable
+when the game's dynamic resolution changes. With zones on, the texture cache prints each image
+the first time it is refreshed from guest memory (size, format, tiling, and whether a CPU write or
+a GPU buffer write caused it). The instrumentation leaves the shader caches valid, and with a warm
+cache it cost about 0.2 fps in the overworld.
+The `frame-times` line gives p50/p95/p99 of the time between new game frames and the share of
+frames that took 25 ms or more, i.e. missed a 60 Hz vblank. Drain stats also count occlusion
+queries, occlusion predications, and GPU timestamp writes per frame.
 
 The driver cache and shader journal require a Release build. They are keyed on a SHA-256 of the
 recompiler and pipeline sources (`src/graphics/shader/**` and

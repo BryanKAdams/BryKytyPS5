@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "gpu_tiler_shaders/dcc_clear_check_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -104,6 +105,7 @@ vk::Buffer DccClearResolver::PredicateBuffer() const noexcept {
 void DccClearResolver::Record(vk::CommandBuffer command, const Buffer& metadata,
                               uint64_t metadata_offset, uint64_t slice_size, uint32_t slices,
                               uint32_t code_mask, bool consume) {
+	GpuZones::Mark(command, DrainStats::Zone::DccClear);
 	EXIT_IF(!Available() || slices == 0 || slices > MaxSlices || slice_size == 0 ||
 	        slice_size % sizeof(uint32_t) != 0 || metadata_offset % sizeof(uint32_t) != 0);
 	const auto alignment      = m_graphics.StorageMinAlignment();
