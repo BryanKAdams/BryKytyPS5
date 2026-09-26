@@ -921,11 +921,12 @@ bool UsesLibraries(const GraphicContext& graphics, const GraphicsPipelineState& 
 	// pixel shader pair, and Astro Bot draws none to test a library form with. Static feedback
 	// loop flags only appear where the dynamic feedback loop state is unsupported.
 	//
-	// Known issue: with mesh pipelines built from libraries, 2 of about 14 Astro Bot runs rendered
-	// the whole desert blown out to saturated yellow from the first gameplay frame, and none of
-	// the 18 runs before did. That fits a separately compiled fragment part reading a mesh output
-	// a monolithic compile would have zeroed, poisoning the game's auto-exposure. Mesh libraries
-	// stay on at the user's choice (they cut a cold start's stalls by about 4 s); adding
+	// Known issue: 4 of 98 cold Astro Bot runs with mesh pipelines built from libraries rendered
+	// the whole desert blown out to saturated yellow from the first gameplay frame. At that rate,
+	// the 18 clean runs before mesh libraries don't show they are the cause. Ruled out: pixel
+	// inputs with default values (none recorded), pixel inputs no mesh shader writes (all are
+	// written), and the fast-linked form itself (3 of 3 runs that never relinked mesh pipelines
+	// rendered correctly). Mesh libraries cut a cold start's stalls by about 4 s; adding
 	// `&& !state.mesh` here makes mesh pipelines monolithic again.
 	return graphics.pipeline_library_enabled && graphics.pipeline_library_fast_linking &&
 	       Config::PipelineLibrariesEnabled() && !state.rect_list && !state.flags;
