@@ -27,6 +27,7 @@ struct ShaderParams {
 	uint32_t max_groups;
 	uint32_t max_instances;
 	uint32_t max_total;
+	uint32_t plain;
 };
 
 } // namespace
@@ -88,8 +89,8 @@ void MeshIndirectArgs::Record(vk::CommandBuffer command, const Buffer& arguments
 	GpuZones::Mark(command, DrainStats::Zone::MeshArgs);
 	const auto alignment = m_graphics.StorageMinAlignment();
 	EXIT_IF(arguments_offset % sizeof(uint32_t) != 0 || output_offset % sizeof(uint32_t) != 0 ||
-	        params.primitive_size == 0 || params.primitive_step == 0 ||
-	        params.primitives_per_group == 0);
+	        (!params.plain && (params.primitive_size == 0 || params.primitive_step == 0 ||
+	                            params.primitives_per_group == 0)));
 	const auto arguments_binding = Common::AlignDown(arguments_offset, alignment);
 	const auto output_binding    = Common::AlignDown(output_offset, alignment);
 	const auto arguments_size    = arguments_offset - arguments_binding + ArgumentsSize;
@@ -135,6 +136,7 @@ void MeshIndirectArgs::Record(vk::CommandBuffer command, const Buffer& arguments
 	    .max_groups           = params.max_groups,
 	    .max_instances        = params.max_instances,
 	    .max_total            = params.max_total,
+	    .plain                = params.plain ? 1u : 0u,
 	};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, writes);

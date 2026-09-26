@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
+#include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -9652,6 +9653,101 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "captured scene allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The indirect-arguments pass in plain mode: a guest DrawIndexedIndirectArgs block becomes a
+  // VkDrawIndexedIndirectCommand with the count clamped to INDEX_BUFFER_SIZE, as the CPU path
+  // clamps it, and every other field unchanged.
+  void CheckIndexedIndirectCommand() {
+    constexpr const char *name = "IndexedIndirectCommand";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "arguments allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "arguments mapping failed");
+    // Index count, instance count, first index, base vertex (-2), first instance.
+    const uint32_t arguments[] {1000u, 3u, 5u, 0xfffffffeu, 7u};
+    std::memcpy(mapped, arguments, sizeof(arguments));
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetBufferCache();
+      auto &records = cache.GetDrawRecordBuffer();
+      MeshIndirectArgs pass(context.GetGraphics());
+      const auto command_for = [&](uint32_t index_limit) {
+        const auto [source, source_offset] =
+            cache.ObtainBuffer(base, MeshIndirectArgs::ArgumentsSize, false);
+        Require(name, "arguments buffer", source != nullptr, "the arguments had no buffer");
+        const auto [output, output_offset] = records.Map(MeshIndirectArgs::OutputSize, 64);
+        Require(name, "record slot", output != nullptr, "the record ring had no slot");
+        records.Commit();
+        auto native = scheduler.Current().Handle();
+        pass.Record(native, *source, source_offset, records, output_offset,
+                    {.index_limit = index_limit, .plain = true});
+        auto readback = CreateHostBuffer(name, sizeof(arguments),
+                                         vk::BufferUsageFlagBits::eTransferDst, {0});
+        vk::MemoryBarrier written{};
+        written.sType = vk::StructureType::eMemoryBarrier;
+        written.srcAccessMask = vk::AccessFlagBits::eIndirectCommandRead |
+                                vk::AccessFlagBits::eShaderWrite |
+                                vk::AccessFlagBits::eMemoryWrite;
+        written.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                               vk::PipelineStageFlagBits::eTransfer, {}, 1, &written, 0,
+                               nullptr, 0, nullptr);
+        const vk::BufferCopy copy{output_offset + MeshIndirectArgs::RecordOffset, 0,
+                                  sizeof(arguments)};
+        native.copyBuffer(records.Handle(), readback.buffer, 1, &copy);
+        vk::MemoryBarrier host{};
+        host.sType = vk::StructureType::eMemoryBarrier;
+        host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eHost, {}, 1, &host, 0, nullptr, 0,
+                               nullptr);
+        scheduler.Finish();
+        auto values = ReadBuffer(name, readback, std::size(arguments));
+        DestroyBuffer(&readback);
+        return values;
+      };
+      Require(name, "clamped count",
+              command_for(600u) == std::vector<u32>{600u, 3u, 5u, 0xfffffffeu, 7u},
+              "the count was not clamped to the index buffer size, or another field changed");
+      Require(name, "count within the buffer",
+              command_for(4096u) == std::vector<u32>{1000u, 3u, 5u, 0xfffffffeu, 7u},
+              "a count within the index buffer size changed");
+      Require(name, "unknown buffer size",
+              command_for(0u) == std::vector<u32>{1000u, 3u, 5u, 0xfffffffeu, 7u},
+              "an unknown index buffer size clamped the count");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "arguments mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "arguments allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -34969,6 +35065,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckSampledDccClear();
+  vulkan.CheckIndexedIndirectCommand();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();

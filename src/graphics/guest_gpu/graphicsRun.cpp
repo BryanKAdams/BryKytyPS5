@@ -1284,9 +1284,16 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		                   mesh ? 1 : 0);
 	}
 	// Reading GPU-written arguments here would wait for the dispatch that wrote them. A
-	// mesh-emulated indexed draw instead builds its mesh dispatch from them on the GPU.
-	if (indexed && gpu_args && mesh && m_index_buffer_size != 0 &&
-	    Config::GpuMeshIndirectEnabled()) {
+	// mesh-emulated indexed draw instead builds its mesh dispatch from them on the GPU, and an
+	// indexed list draw with 16- or 32-bit indices draws from them directly: the guest layout is
+	// VkDrawIndexedIndirectCommand's. (Strips could need a primitive restart scan, and 8-bit
+	// indices are widened on the CPU.)
+	const auto prim_type = m_ucfg.GetPrimType();
+	const bool list      = prim_type == Prospero::PrimitiveType::kTriList ||
+	                  prim_type == Prospero::PrimitiveType::kLineList ||
+	                  prim_type == Prospero::PrimitiveType::kPointList;
+	if (indexed && gpu_args && (mesh || (list && m_index_type_and_size != 2u)) &&
+	    m_index_buffer_size != 0 && Config::GpuMeshIndirectEnabled()) {
 		m_num_instances_address = address + offsetof(DrawIndexedIndirectArgs, instance_count);
 		DrawIndex({.index_count    = 1,
 		           .index_addr     = reinterpret_cast<const void*>(m_index_base_addr),

@@ -31,6 +31,9 @@ public:
 		uint32_t max_groups           = 0;
 		uint32_t max_instances        = 0;
 		uint32_t max_total            = 0;
+		// Write a VkDrawIndexedIndirectCommand with the count clamped, for a draw that is not
+		// mesh-emulated; the primitive and host-limit fields are unused.
+		bool     plain                = false;
 	};
 
 	explicit MeshIndirectArgs(GraphicContext& graphics);

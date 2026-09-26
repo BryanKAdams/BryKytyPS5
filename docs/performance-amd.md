@@ -195,9 +195,19 @@ game fast-clear a target and sample it without drawing to it, once a frame; that
 the GPU behind the frame's heaviest draw (pixel shader 6996d4e234bd5b8e, up to 18.7 ms), about
 25 ms a frame. A texture whose image can be a color attachment now takes the GPU path. Warm, same
 route: the stretch after reaching the sand went from 16-25 fps for about 18 s to 27-39 fps for
-about 11 s. What remains there is that shader and a GPU-thread read of a GPU-written indirect
-draw's arguments, once a frame, which drains too (8.5-9.6 ms a frame on the sand, 2.6 ms
-elsewhere).
+about 11 s.
+
+**GPU-built indexed indirect draws:** once a frame, everywhere at the crash site, the game issues
+an indexed indirect draw (not mesh-emulated) whose arguments a compute dispatch wrote. Reading
+them on Thread_Gpu faulted and drained the GPU: 2.6-3.5 ms a frame, and 8.5-9.6 ms on the sand,
+where the drain waited behind the expensive shader. An indexed list draw with 16- or 32-bit
+indices now draws from the arguments on the GPU (`vkCmdDrawIndexedIndirect`): the mesh
+arguments pass, in a plain mode, copies them into the draw record ring with the count clamped to
+INDEX_BUFFER_SIZE, as the CPU path clamps it (the guest layout is VkDrawIndexedIndirectCommand's).
+Strips (which could need a primitive restart scan) and 8-bit indices keep the CPU path;
+`--gpu-mesh-indirect false` turns both GPU paths off. Full drains dropped from one a frame to none;
+on the sand, frames went from GPU and CPU in series to GPU-bound (35-48 fps, busy up to 19 ms,
+gaps 6-10 ms).
 
 The planet in the overworld shows blotchy dark patches and the background a fine dot pattern.
 Upstream `main` (5a705dd) renders the same artifacts, so they predate this branch.

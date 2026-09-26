@@ -3,6 +3,8 @@
 // Converts a guest DRAW_INDEX_INDIRECT argument block into a mesh draw without a CPU readback:
 // the draw's parameter record (the same seven dwords the CPU writes for direct mesh draws; see
 // EmitMeshDrawParameter) and a VkDrawMeshTasksIndirectCommandEXT.
+// With `plain` set it writes a VkDrawIndexedIndirectCommand instead, for a draw that is not
+// mesh-emulated: the guest layout is the same, and only the count is clamped.
 
 layout(local_size_x = 1) in;
 
@@ -30,6 +32,7 @@ layout(push_constant) uniform Params {
 	uint max_groups;
 	uint max_instances;
 	uint max_total;
+	uint plain;
 } params;
 
 void main() {
@@ -42,6 +45,16 @@ void main() {
 	// The CPU path clamps the count to INDEX_BUFFER_SIZE the same way.
 	if (params.index_limit != 0u) {
 		count = min(count, params.index_limit);
+	}
+
+	if (params.plain != 0u) {
+		const uint command = params.output_word;
+		outputs[command + 0u] = count;
+		outputs[command + 1u] = instances;
+		outputs[command + 2u] = first_index;
+		outputs[command + 3u] = base_vertex;
+		outputs[command + 4u] = first_instance;
+		return;
 	}
 
 	// Index address = base + first_index * element size, carried into the high word.

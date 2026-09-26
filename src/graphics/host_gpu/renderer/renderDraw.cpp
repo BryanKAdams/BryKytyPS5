@@ -1068,9 +1068,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
 		}
 	}
-	// The command processor sends GPU-args draws here only when the stages select mesh
-	// emulation (the same merged-stage bit PrepareProgram checks).
-	EXIT_IF(gpu_args && (!mesh_active || !draw.IsIndexed()));
+	// The command processor sends GPU-args draws here when the stages select mesh emulation (the
+	// same merged-stage bit PrepareProgram checks), or for indexed list draws, which draw from the
+	// arguments directly.
+	EXIT_IF(gpu_args && !draw.IsIndexed());
 
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
@@ -1172,27 +1173,34 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (gpu_args) {
-		// Build the record and mesh-tasks command from the GPU-written arguments. This compute
-		// pass and its barriers must precede rendering and the graphics bindings below.
+		// Build the draw's command (and for mesh emulation its record) from the GPU-written
+		// arguments. This compute pass and its barriers must precede rendering and the
+		// graphics bindings below.
 		m_context.GetCommandScheduler().EndRendering();
 		if (m_mesh_indirect == nullptr) {
 			m_mesh_indirect = std::make_unique<MeshIndirectArgs>(m_context.GetGraphics());
 		}
-		const auto& mesh      = state.vertex_info[0].mesh;
-		const auto& limits    = m_context.GetGraphics().mesh_shader_properties;
-		const auto  max_total = std::max(1u, limits.maxMeshWorkGroupTotalCount);
-		m_mesh_indirect->Record(
-		    vk_buffer, *gpu_arguments.first, gpu_arguments.second, records, gpu_output,
-		    {.index_bytes          = index_source.guest_element_size,
-		     .index_address        = index_source.address,
-		     .index_limit          = static_cast<uint32_t>(index_source.size /
-		                                                   index_source.guest_element_size),
-		     .primitive_size       = mesh.InputPrimitiveSize(),
-		     .primitive_step       = mesh.InputPrimitiveStep(),
-		     .primitives_per_group = mesh.primitives_per_group,
-		     .max_groups = std::min(std::max(1u, limits.maxMeshWorkGroupCount[0]), max_total),
-		     .max_instances = std::max(1u, limits.maxMeshWorkGroupCount[1]),
-		     .max_total     = max_total});
+		const auto index_limit =
+		    static_cast<uint32_t>(index_source.size / index_source.guest_element_size);
+		if (mesh_active) {
+			const auto& mesh      = state.vertex_info[0].mesh;
+			const auto& limits    = m_context.GetGraphics().mesh_shader_properties;
+			const auto  max_total = std::max(1u, limits.maxMeshWorkGroupTotalCount);
+			m_mesh_indirect->Record(
+			    vk_buffer, *gpu_arguments.first, gpu_arguments.second, records, gpu_output,
+			    {.index_bytes          = index_source.guest_element_size,
+			     .index_address        = index_source.address,
+			     .index_limit          = index_limit,
+			     .primitive_size       = mesh.InputPrimitiveSize(),
+			     .primitive_step       = mesh.InputPrimitiveStep(),
+			     .primitives_per_group = mesh.primitives_per_group,
+			     .max_groups = std::min(std::max(1u, limits.maxMeshWorkGroupCount[0]), max_total),
+			     .max_instances = std::max(1u, limits.maxMeshWorkGroupCount[1]),
+			     .max_total     = max_total});
+		} else {
+			m_mesh_indirect->Record(vk_buffer, *gpu_arguments.first, gpu_arguments.second, records,
+			                        gpu_output, {.index_limit = index_limit, .plain = true});
+		}
 	}
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1255,7 +1263,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			vk_buffer.drawMeshTasksEXT(slice.group_count, slice.instance_count, 1);
 		}
 	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		if (gpu_args) {
+			vk_buffer.drawIndexedIndirect(records.Handle(), gpu_output + MeshIndirectArgs::RecordOffset, 1,
+			                              sizeof(vk::DrawIndexedIndirectCommand));
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		}
 	}
 
 	if (!draw.IsIndexed()) {
