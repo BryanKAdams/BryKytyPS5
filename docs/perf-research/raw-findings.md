@@ -1034,6 +1034,16 @@ encounter. The recompile also repeats at boot for every journal record. Measured
     compute 5.87 to 5.40 s. Adopted.
   - A "yellow sand" run during this A/B came from the perf session's mesh pipeline libraries:
     a baseline run showed it too. Compare screenshots across all runs before blaming a change.
+- **Dead ends after b3ffaa5f** (AMD compile time, `900aba` / `01d6f2`, interleaved rounds):
+  - Folding each store's, atomic's and LDS load's bounds check into its EXEC branch (one
+    `if (exec && in_bounds)` instead of nested ifs) removed 39-124 branches per big shader. It
+    changed compile time by +1.8% / +0.4%, i.e. nothing.
+  - Dropping the EXEC branch around storage-buffer loads (select `exec ? value : 0`) gave -10% on
+    `900aba` but +18% on `01d6f2`, whose 8 loops then carry unconditional loads. It also costs
+    memory traffic for inactive lanes. Not viable.
+  - `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` does nothing on the AMD Windows driver (the
+    same 1025 and 796 ms), so a quick unoptimized first compile is not an option there.
+    `--pipeline-compile-time` takes `noopt:<file>` to time it.
 - **Stores** keep their bounds branches: 181 storage stores in `01d6f2`, and 249-307 LDS stores in
   the big mesh shaders. A branch-free storage store needs an index that is guaranteed out of
   range (for example 0x3FFFFFFF) and a discard guarantee, which only `robustBufferAccess2`
