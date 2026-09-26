@@ -104,7 +104,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
-	if (g_render_debug_counters.log_barriers.load(std::memory_order_relaxed)) [[unlikely]] {
+	if (g_render_debug_counters.counting.load(std::memory_order_relaxed)) [[unlikely]] {
 		g_render_debug_counters.render_begins.fetch_add(1, std::memory_order_relaxed);
 	}
 	m_render_state = state;
@@ -116,7 +116,7 @@ void CommandBuffer::EndRendering() const {
 		return;
 	}
 	Handle().endRendering();
-	if (g_render_debug_counters.log_barriers.load(std::memory_order_relaxed)) [[unlikely]] {
+	if (g_render_debug_counters.counting.load(std::memory_order_relaxed)) [[unlikely]] {
 		g_render_debug_counters.render_ends.fetch_add(1, std::memory_order_relaxed);
 	}
 	m_rendering    = false;

@@ -137,6 +137,60 @@ static void Flush() {
 	});
 }
 
+// KYTY_DEBUG_DRAW_STATS=1 prints, every 5 s, the draws per second and the rendering restarts and
+// barriers they caused, overall and for the pixel shaders causing the most, to find draw patterns
+// that stall the GPU (like the sand trail's).
+static bool StatsEnabled() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_DRAW_STATS") != nullptr;
+	return enabled;
+}
+
+struct ShaderTotals {
+	uint64_t vertex   = 0;
+	uint64_t draws    = 0;
+	uint64_t restarts = 0;
+	uint64_t barriers = 0;
+};
+
+static void Account(uint64_t pixel, uint64_t vertex, uint64_t restarts, uint64_t barriers) {
+	static std::unordered_map<uint64_t, ShaderTotals> totals;
+	static auto window_start = std::chrono::steady_clock::now();
+	auto&       entry        = totals[pixel];
+	entry.vertex             = vertex;
+	entry.draws++;
+	entry.restarts += restarts;
+	entry.barriers += barriers;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - window_start < std::chrono::seconds(5)) {
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - window_start).count();
+	std::vector<std::pair<uint64_t, ShaderTotals>> rows(totals.begin(), totals.end());
+	ShaderTotals all;
+	for (const auto& [hash, row]: rows) {
+		all.draws += row.draws;
+		all.restarts += row.restarts;
+		all.barriers += row.barriers;
+	}
+	std::printf("draw-stats: %.1fs draws/s=%.0f restarts/s=%.0f barriers/s=%.0f shaders=%zu\n",
+	            seconds, all.draws / seconds, all.restarts / seconds, all.barriers / seconds,
+	            rows.size());
+	const auto print_top = [&](const char* order, auto&& key) {
+		std::ranges::sort(rows, [&](const auto& a, const auto& b) { return key(a.second) > key(b.second); });
+		for (size_t i = 0; i < std::min<size_t>(rows.size(), 6); i++) {
+			const auto& [hash, row] = rows[i];
+			std::printf("draw-stats   by-%s ps=%016" PRIx64 " vs=%016" PRIx64
+			            " draws/s=%.0f restarts/s=%.0f barriers/s=%.0f\n",
+			            order, hash, row.vertex, row.draws / seconds, row.restarts / seconds,
+			            row.barriers / seconds);
+		}
+	};
+	print_top("stalls", [](const ShaderTotals& row) { return row.restarts + row.barriers; });
+	print_top("draws", [](const ShaderTotals& row) { return row.draws; });
+	totals.clear();
+	window_start = now;
+}
+
 } // namespace DrawLog
 
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
@@ -1111,22 +1165,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool draw_logged = DrawLog::Hash() != 0 && state.ps_active &&
 	                         state.ps_input_info.stage.program != nullptr &&
 	                         state.ps_input_info.stage.program->shader_hash == DrawLog::Hash();
+	const bool draw_counted = draw_logged || DrawLog::StatsEnabled();
 	std::array<uint64_t, 3> counters_before {};
-	if (draw_logged) [[unlikely]] {
+	struct BarrierLogScope {
+		bool logged  = false;
+		bool counted = false;
+		~BarrierLogScope() {
+			if (logged) {
+				g_render_debug_counters.log_barriers.store(false, std::memory_order_relaxed);
+			}
+			if (counted) {
+				g_render_debug_counters.counting.store(false, std::memory_order_relaxed);
+			}
+		}
+	} barrier_log_scope {draw_logged, draw_counted};
+	if (draw_counted) [[unlikely]] {
+		g_render_debug_counters.counting.store(true, std::memory_order_relaxed);
+		g_render_debug_counters.log_barriers.store(draw_logged, std::memory_order_relaxed);
 		counters_before = {g_render_debug_counters.render_begins.load(std::memory_order_relaxed),
 		                   g_render_debug_counters.render_ends.load(std::memory_order_relaxed),
 		                   g_render_debug_counters.image_barriers.load(std::memory_order_relaxed)};
-	}
-	struct BarrierLogScope {
-		bool active = false;
-		~BarrierLogScope() {
-			if (active) {
-				g_render_debug_counters.log_barriers.store(false, std::memory_order_relaxed);
-			}
-		}
-	} barrier_log_scope {draw_logged};
-	if (draw_logged) [[unlikely]] {
-		g_render_debug_counters.log_barriers.store(true, std::memory_order_relaxed);
 	}
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	const bool gpu_args    = draw.indirect_args != 0;
@@ -1409,6 +1467,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    g_render_debug_counters.image_barriers.load(std::memory_order_relaxed) -
 		        counters_before[2],
 		    static_cast<uint32_t>(static_cast<bool>(shader_write_stages)));
+	}
+	if (DrawLog::StatsEnabled()) [[unlikely]] {
+		const auto* pixel  = state.ps_active ? state.ps_input_info.stage.program : nullptr;
+		const auto* vertex = state.vertex_info[0].stage.program;
+		DrawLog::Account(
+		    pixel != nullptr ? pixel->shader_hash : 0, vertex != nullptr ? vertex->shader_hash : 0,
+		    g_render_debug_counters.render_begins.load(std::memory_order_relaxed) - counters_before[0],
+		    g_render_debug_counters.image_barriers.load(std::memory_order_relaxed) -
+		        counters_before[2] + (shader_write_stages ? 1u : 0u));
 	}
 }
 

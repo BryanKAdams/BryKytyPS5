@@ -926,6 +926,11 @@ about 250 ms later), and how many rendering instances began and ended and image 
 recorded during the draw, with each barrier's image, layouts and access. It costs nothing when
 unset.
 
+`KYTY_DEBUG_DRAW_STATS=1` prints every 5 s the draws per second and the rendering restarts and
+barriers they caused, in total and for the six pixel shaders causing the most of each, to find
+draw patterns that stall the GPU (as the sand trail did) anywhere in a scene. Pair it with
+`KYTY_GPU_ZONES=1` for each shader's GPU time.
+
 `KYTY_DEBUG_LOOP_HEAT=<hash>:<pc>[,<pc>[,<pc>]]` (hexadecimal) makes one pixel shader export, in
 place of its colour targets, how many times its wave ran each guest PC (red, green, blue), in
 bands: 0 black, 1-15 0.0625, 16-63 0.25, 64-255 1, 256-1023 4, 1024 or more 32. The shader's own

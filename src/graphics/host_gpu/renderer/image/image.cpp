@@ -214,8 +214,10 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
-	if (g_render_debug_counters.log_barriers.load(std::memory_order_relaxed)) [[unlikely]] {
+	if (g_render_debug_counters.counting.load(std::memory_order_relaxed)) [[unlikely]] {
 		g_render_debug_counters.image_barriers.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (g_render_debug_counters.log_barriers.load(std::memory_order_relaxed)) [[unlikely]] {
 		std::printf("draw-log barrier: image=%ux%u format=%d depth=%u layout %d->%d "
 		            "access 0x%llx->0x%llx\n",
 		            info.extent.width, info.extent.height, static_cast<int>(backing.format),

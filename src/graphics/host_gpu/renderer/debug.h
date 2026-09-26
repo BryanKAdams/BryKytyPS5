@@ -15,6 +15,7 @@ struct RenderDebugCounters {
 	std::atomic<uint64_t> render_begins {0};
 	std::atomic<uint64_t> render_ends {0};
 	std::atomic<uint64_t> image_barriers {0};
+	std::atomic<bool>     counting {false};     // Set while draws are logged or summarized.
 	std::atomic<bool>     log_barriers {false}; // Set while a logged draw records.
 };
 inline RenderDebugCounters g_render_debug_counters;
