@@ -461,6 +461,17 @@ on, so the dropped selects did not pay for the EXEC switches. An earlier run loo
 win because the game's dynamic resolution settled at different levels on each side; compare
 shader changes at a pinned resolution, in ms per frame. The patch is kept in the branch history.
 
+**The walking dip is the sand trail, not its lighting.** At the resolution floor the ship route
+still dips to 26-35 fps, and in that window pixel shader 6996d4e2 costs about 6.7 ms per draw
+against 0.16 ms standing still. Its guest code has only waterfalls over cascade and tile keys, a
+walk of each tile's light list, and a uniform loop over a game-supplied count. A loop-trip heat
+map (`KYTY_DEBUG_LOOP_HEAT`) shows that 6996d4e2 draws the groove Astro drags through the sand
+and that every loop there stays in the lowest band (fewer than 16 passes per wave), so the light
+lists are short. With the heat map on, the driver drops all of the shader's lighting and
+texture work, and the dip was unchanged (t=13-18: 25.6-32.7 fps against 26.5-33.0). The cost is
+the trail's geometry or rasterization (it draws through the mesh-emulated path), not its pixel
+shading.
+
 ## First-use stutter (pipeline compiles)
 
 `--drain-stats` prints a `hitch:` line for every game frame of 50 ms or more, listing what was
@@ -908,6 +919,13 @@ AMD: used VGPRs and SGPRs, LDS, scratch). With `KYTY_PIPELINE_ISA=<dir>` it writ
 LLVM IR and ISA there. `--journal-opcodes <journal> <OPCODE>` lists the recorded shaders that use
 a guest opcode. Together they answer codegen questions (scalar vs vector loads, register
 pressure) without a game run.
+
+`KYTY_DEBUG_LOOP_HEAT=<hash>:<pc>[,<pc>[,<pc>]]` (hexadecimal) makes one pixel shader export, in
+place of its colour targets, how many times its wave ran each guest PC (red, green, blue), in
+bands: 0 black, 1-15 0.0625, 16-63 0.25, 64-255 1, 256-1023 4, 1024 or more 32. The shader's own
+results stay referenced, so its resources and recorded specializations do not change, but the
+driver drops their computation. Loop headers are the backward-branch targets in `--dump-shader`'s
+guest disassembly.
 
 Recompiler time for the 308 Astro Bot permutations, by pass, on the 7800X3D (September 25,
 after the structurizer change): `TranslateProgram` about 616 ms, `RewriteToSsa` 427,

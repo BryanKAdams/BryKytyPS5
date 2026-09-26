@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <unordered_map>
 #include <utility>
 
@@ -120,6 +121,32 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 	result.dpp                = false;
 	result.dpp8               = false;
 	return result;
+}
+
+const LoopHeat& DebugLoopHeat() {
+	static const LoopHeat heat = [] {
+		LoopHeat    result;
+		const char* text = std::getenv("KYTY_DEBUG_LOOP_HEAT");
+		if (text == nullptr) {
+			return result;
+		}
+		char* end   = nullptr;
+		result.hash = std::strtoull(text, &end, 16);
+		for (auto& pc: result.pcs) {
+			if (end == nullptr || (*end != ':' && *end != ',')) {
+				break;
+			}
+			pc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		}
+		return result;
+	}();
+	return heat;
+}
+
+// Counts, in every lane, each time the wave runs this point: the lane's exec does not matter.
+void Translator::CountLoopHeat(uint32_t counter) {
+	const auto reg = static_cast<IR::VectorReg>(LoopHeat::FirstRegister + counter);
+	ir.SetVectorReg(reg, ir.IAdd(ir.GetVectorReg(reg), IR::U32(IR::Value(1u))));
 }
 
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
@@ -1042,6 +1069,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		entry_ir.SetExecLo(entry_ir.CompositeExtract(initial_mask, 0));
 		entry_ir.SetExecHi(options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
 		                                            : IR::U32(IR::Value(0u)));
+		if (DebugLoopHeat().Active(result)) {
+			for (uint32_t counter = 0; counter < 3u; counter++) {
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(LoopHeat::FirstRegister + counter),
+				                      IR::U32(IR::Value(0u)));
+			}
+		}
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.input_info.compute;
 			const auto  thread_ids =
@@ -1257,11 +1290,18 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      builtin(IR::StageInputKind::InstanceIndex));
 		}
 	}
+	const auto& heat        = DebugLoopHeat();
+	const bool  heat_active = heat.Active(result);
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
+			for (uint32_t counter = 0; heat_active && counter < heat.pcs.size(); counter++) {
+				if (instruction.pc == heat.pcs[counter]) {
+					translator.CountLoopHeat(counter);
+				}
+			}
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
 				continue;
 			}

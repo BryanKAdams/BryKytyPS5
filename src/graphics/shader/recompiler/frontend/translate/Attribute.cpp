@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -100,6 +102,39 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 	                                     IR::Value(0u)};
 	for (uint32_t source = 0; source < std::min(inst.src_count, 4u); source++) {
 		components[source] = ReadRawU32(PlainOperand(SourceAt(inst, source)));
+	}
+	if (DebugLoopHeat().Active(program) && inst.exp.target < 8u && inst.exp.en != 0u) {
+		// Keep the shader's own results alive, so its resources (and the recorded specializations
+		// that index them) stay the same.
+		for (uint32_t source = 0; source < std::min(inst.src_count, 4u); source++) {
+			ir.Emit(IR::ValueOpcode::ReferenceU32, {components[source]});
+		}
+		// Band each counter as a float (F16 halves when the export is compressed).
+		const auto band = [&](uint32_t counter, bool half) {
+			const auto count =
+			    ir.GetVectorReg(static_cast<IR::VectorReg>(LoopHeat::FirstRegister + counter));
+			constexpr std::array<std::pair<uint32_t, float>, 5> bands {
+			    {{1u, 0.0625f}, {16u, 0.25f}, {64u, 1.0f}, {256u, 4.0f}, {1024u, 32.0f}}};
+			constexpr std::array<uint32_t, 5> half_bits {0x2c00u, 0x3400u, 0x3c00u, 0x4400u,
+			                                             0x5000u};
+			IR::U32 value(IR::Value(0u));
+			for (size_t index = 0; index < bands.size(); index++) {
+				const auto bits =
+				    half ? half_bits[index] : std::bit_cast<uint32_t>(bands[index].second);
+				const auto at_least = IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32,
+				                                     {count, IR::Value(bands[index].first)}));
+				value = ir.Select(at_least, IR::U32(IR::Value(bits)), value);
+			}
+			return value;
+		};
+		if (inst.exp.compr) {
+			const auto shift = IR::U32(IR::Value(16u));
+			components[0] = ir.BitwiseOr(band(0, true), ir.ShiftLeftLogical(band(1, true), shift));
+			components[1] = ir.BitwiseOr(band(2, true), IR::U32(IR::Value(0x3c000000u)));
+		} else {
+			components = {band(0, false), band(1, false), band(2, false),
+			              IR::Value(std::bit_cast<uint32_t>(1.0f))};
+		}
 	}
 	const auto data = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
 	                          {components[0], components[1], components[2], components[3]});

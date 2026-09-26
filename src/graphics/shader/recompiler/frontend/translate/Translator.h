@@ -7,12 +7,27 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+// Debug: KYTY_DEBUG_LOOP_HEAT=<hash>:<pc>[,<pc>[,<pc>]] makes that pixel shader export, in place of
+// every colour target, how many times its wave ran each of those guest PCs (red, green, blue), in
+// bands: 0 black, 1-15 0.0625, 16-63 0.25, 64-255 1, 256-1023 4, 1024 and more 32.
+struct LoopHeat {
+	static constexpr uint32_t FirstRegister = 250; // Spare VGPRs holding the counters.
+	uint64_t                  hash          = 0;
+	std::array<uint32_t, 3>   pcs {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+
+	[[nodiscard]] bool Active(const IR::Program& program) const {
+		return hash != 0 && program.shader_hash == hash && program.stage == ShaderType::Pixel;
+	}
+};
+const LoopHeat& DebugLoopHeat();
+
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit)
 	    : program(program), ir(block), current_vector_limit(vector_limit) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
+	void CountLoopHeat(uint32_t counter);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info);
