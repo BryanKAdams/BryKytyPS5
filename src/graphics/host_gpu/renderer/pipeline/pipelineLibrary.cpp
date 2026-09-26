@@ -11,9 +11,9 @@ namespace Libs::Graphics {
 
 namespace {
 
-// Prefetched parts compile while Thread_Gpu is stalled on a loading burst's first pipeline; four
-// threads keep most of an 8-core CPU free for the game.
-constexpr uint32_t CompileThreadCount = 4;
+// Prefetched parts compile while Thread_Gpu is stalled on a loading burst's first pipeline; six
+// threads leave the game two cores of an 8-core CPU during loads, when it needs little.
+constexpr uint32_t CompileThreadCount = 6;
 
 } // namespace
 
@@ -67,6 +67,12 @@ PipelineLibraryCache::Found PipelineLibraryCache::Find(const std::string& key) {
 		}
 	}
 	return {entry.pipeline, entry.prefetched};
+}
+
+vk::Pipeline PipelineLibraryCache::Take(const std::string& key) {
+	const auto found = Find(key);
+	m_libraries.erase(key);
+	return found.pipeline;
 }
 
 vk::Pipeline PipelineLibraryCache::Insert(std::string key, vk::Pipeline library) {

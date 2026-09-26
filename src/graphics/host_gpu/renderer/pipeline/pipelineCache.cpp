@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -44,6 +45,24 @@
 namespace Libs::Graphics {
 
 namespace {
+
+// The library cache key a prefetched compute pipeline compiles under.
+std::string ComputePrefetchKey(uint64_t program_id) {
+	std::string key(1, 'C');
+	key.append(reinterpret_cast<const char*>(&program_id), sizeof(program_id));
+	return key;
+}
+
+void DestroyPipelineObjects(const GraphicContext& graphics, const PipelineCache::Pipeline& pipeline) {
+	if (pipeline.pipeline != nullptr) {
+		graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	}
+	graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	if (pipeline.pixel_set_layout != nullptr) {
+		graphics.device.destroyDescriptorSetLayout(pipeline.pixel_set_layout, nullptr);
+	}
+}
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
@@ -620,6 +639,11 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// Prefetched compute pipelines no dispatch took: their pipelines belong to the library cache.
+	for (const auto& [id, pipeline]: m_compute_prefetched) {
+		(void)id;
+		DestroyPipelineObjects(m_graphics, *pipeline);
+	}
 	m_libraries.reset();
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
@@ -1318,6 +1342,39 @@ uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const H
 	                            *m_libraries, m_driver_cache);
 }
 
+uint32_t PipelineCache::PrefetchComputePipeline(const HW::Context& ctx, const HW::Shader& sh,
+                                                uint32_t dispatch_initiator) {
+	KYTY_PROFILER_FUNCTION();
+	if (m_libraries == nullptr || !Config::PipelineLibrariesEnabled()) {
+		return 0;
+	}
+	const auto& cs = sh.GetCs();
+	if (cs.cs_regs.data_addr == 0) {
+		return 0;
+	}
+	// As the dispatch path prepares it (see RenderExecutor::DispatchDirect/DispatchIndirect).
+	ShaderComputeInputInfo input_info {};
+	input_info.dispatch_thread_dimensions =
+	    (dispatch_initiator & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	const auto program = GetComputeProgram(cs, ctx.GetShaderRegisters(), input_info);
+	if (!program) {
+		return 0;
+	}
+	Common::LockGuard lock(m_mutex);
+	if (m_compute_pipelines.contains(program.id) || m_compute_prefetched.contains(program.id)) {
+		return 0;
+	}
+	auto pipeline = std::make_unique<Pipeline>();
+	auto create   = PrepareComputePipeline(m_graphics, *pipeline, input_info, program.module,
+	                                       m_driver_cache);
+	if (!m_libraries->Prefetch(ComputePrefetchKey(program.id), std::move(create))) {
+		DestroyPipelineObjects(m_graphics, *pipeline);
+		return 0;
+	}
+	m_compute_prefetched.emplace(program.id, std::move(pipeline));
+	return 1;
+}
+
 void PipelineCache::LogLookahead(uint32_t draws, uint32_t parts) const {
 	if (PermutationLogEnabled()) [[unlikely]] {
 		std::printf("lookahead: draws=%u prefetched parts=%u\n", draws, parts);
@@ -1358,15 +1415,33 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto       cached       = std::make_unique<Pipeline>();
 	const auto create_start = std::chrono::steady_clock::now();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	std::unique_ptr<Pipeline> cached;
+	if (const auto prefetched = m_compute_prefetched.find(compute_program.id);
+	    prefetched != m_compute_prefetched.end()) {
+		// A look-ahead already made its layouts and compiled (or is compiling) the pipeline.
+		cached = std::move(prefetched->second);
+		m_compute_prefetched.erase(prefetched);
+		cached->pipeline = m_libraries->Take(ComputePrefetchKey(compute_program.id));
+		if (cached->pipeline == nullptr) {
+			DestroyPipelineObjects(m_graphics, *cached);
+			cached = nullptr;
+		}
+	}
+	const bool prefetched = cached != nullptr;
+	if (!prefetched) {
+		cached = std::make_unique<Pipeline>();
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                       m_driver_cache);
+	}
+	m_compute_pipelines_created++;
 	if (PermutationLogEnabled()) [[unlikely]] {
-		std::printf("pipeline: cs=%llu ms=%.1f\n",
+		std::printf("pipeline: cs=%llu ms=%.1f%s\n",
 		            static_cast<unsigned long long>(compute_program.id),
 		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
 		                                                      create_start)
-		                .count());
+		                .count(),
+		            prefetched ? " pre=C" : "");
 	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

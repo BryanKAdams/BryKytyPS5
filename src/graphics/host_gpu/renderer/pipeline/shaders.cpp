@@ -1007,24 +1007,13 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
 	return -1;
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+Common::UniqueFunction<vk::Pipeline> PrepareComputePipeline(GraphicContext&               graphics,
+                                                            PipelineCache::Pipeline&      pipeline,
+                                                            const ShaderComputeInputInfo& input_info,
+                                                            vk::ShaderModule  compute_module,
+                                                            vk::PipelineCache driver_cache) {
 	EXIT_IF(compute_module == nullptr);
-
-	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
-	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
-	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module = compute_module;
-	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
-	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
-		comp_shader_stage_info.pNext            = &comp_subgroup_size;
-	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
@@ -1040,32 +1029,45 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
-
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
-	     1u);
-	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                  &pipeline.pipeline_layout);
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+	const auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                                         &pipeline.pipeline_layout);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
-	vk::ComputePipelineCreateInfo info {};
-	info.stage             = comp_shader_stage_info;
-	info.layout            = pipeline.pipeline_layout;
-	info.basePipelineIndex = -1;
+	const auto wave_size         = input_info.stage.program->wave_size;
+	const bool required_subgroup = graphics.compute_subgroup_size_control_enabled &&
+	                               wave_size >= graphics.min_subgroup_size &&
+	                               wave_size <= graphics.max_subgroup_size;
+	return [&graphics, layout = pipeline.pipeline_layout, compute_module, driver_cache, wave_size,
+	        required_subgroup] {
+		vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size {};
+		vk::ComputePipelineCreateInfo                         info {};
+		info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		info.stage.module = compute_module;
+		info.stage.pName  = "main";
+		if (required_subgroup) {
+			subgroup_size.requiredSubgroupSize = wave_size;
+			info.stage.pNext                   = &subgroup_size;
+		}
+		info.layout            = layout;
+		info.basePipelineIndex = -1;
+		vk::Pipeline pipeline  = nullptr;
+		if (graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline) !=
+		    vk::Result::eSuccess) {
+			LOGF("PipelineCache: compute pipeline creation failed\n");
+			return vk::Pipeline {};
+		}
+		return pipeline;
+	};
+}
 
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderComputeInputInfo& input_info,
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+	const auto create =
+	    PrepareComputePipeline(graphics, pipeline, input_info, compute_module, driver_cache);
 	EXIT_IF(pipeline.pipeline != nullptr);
-
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-	     static_cast<void*>(pipeline.pipeline_layout));
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
+	pipeline.pipeline = create();
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }
 

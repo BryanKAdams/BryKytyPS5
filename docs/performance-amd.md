@@ -447,6 +447,17 @@ new pipelines, which a look-ahead cannot overlap. In one checked run, 150 of 209
 pipelines used prefetched parts. With mesh library pipelines still on (three rounds), the same
 comparison was 35.6, 35.1 and 33.7 s against 28.2, 27.1 and 28.6 s.
 
+The walk also predicts dispatches (DISPATCH_DIRECT and DISPATCH_INDIRECT, reading the dispatch
+initiator for the thread-dimension flag, and skipping zero-sized direct dispatches as the
+dispatch path does): the pipeline cache translates the compute shader, makes the pipeline's
+layouts, and compiles the pipeline on a worker; GetComputePipeline takes it over. A compute
+pipeline miss also starts a walk, and there are six workers. On the best build (mesh libraries,
+look-ahead, the branch-free storage-buffer loads), one cold round each: stalls 25.5 to 23.8 s,
+worst frame 3.3 to 3.0 s, with 18 of 52 compute pipelines prefetched. The largest compute
+pipelines (1.1 s, 0.83 s and 0.65 s) still compile when their dispatch arrives: each is the
+first miss of its loading burst, which no look-ahead precedes, or runs on an asynchronous
+compute queue, whose command stream this walk does not follow.
+
 Pixel shader resources use descriptor set 1 and vertex-side stages set 0. Layouts with
 independent sets would let each shader part ignore the other stage's set, but on this driver any
 pipeline whose layout has independent sets, even a monolithic one, lost the device within the

@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -190,6 +191,15 @@ public:
 	// or bound; a wrong prediction only costs the compile. Returns the number of parts queued.
 	uint32_t PrefetchGraphicsPipeline(const HW::Context& ctx, const HW::Shader& sh,
 	                                  const HW::UserConfig& user_config);
+	// Compute pipelines created so far, for the same purpose.
+	[[nodiscard]] uint64_t ComputePipelinesCreated() const noexcept {
+		return m_compute_pipelines_created;
+	}
+	// Predicts the compute pipeline a dispatch with these registers and dispatch initiator will
+	// need, translating its shader, and compiles it on a worker thread; GetComputePipeline takes
+	// it over. Returns 1 when a compile was queued.
+	uint32_t PrefetchComputePipeline(const HW::Context& ctx, const HW::Shader& sh,
+	                                 uint32_t dispatch_initiator);
 	// Prints a look-ahead's result with KYTY_PERMUTATION_LOG=1.
 	void LogLookahead(uint32_t draws, uint32_t parts) const;
 
@@ -263,6 +273,10 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::unique_ptr<PipelineLibraryCache> m_libraries;
 	uint64_t                              m_graphics_pipelines_created = 0;
+	uint64_t                              m_compute_pipelines_created  = 0;
+	// Prefetched compute pipelines by program id: layouts made, pipeline compiling in the
+	// library cache under ComputePrefetchKey.
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_prefetched;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -299,6 +313,13 @@ uint32_t PrefetchLibraryParts(GraphicContext& graphics, const PipelineRenderingS
                               const PipelineCache::GraphicsPrograms& programs,
                               const PipelineStaticParameters&        static_params,
                               PipelineLibraryCache& libraries, vk::PipelineCache driver_cache);
+// Creates a compute pipeline's layouts and returns the call that creates the pipeline itself. That
+// call reads only its own copies, so it may run on another thread; it returns null on failure.
+Common::UniqueFunction<vk::Pipeline> PrepareComputePipeline(GraphicContext&               graphics,
+                                                            PipelineCache::Pipeline&      pipeline,
+                                                            const ShaderComputeInputInfo& input_info,
+                                                            vk::ShaderModule  compute_module,
+                                                            vk::PipelineCache driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

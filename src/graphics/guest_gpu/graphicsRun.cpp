@@ -809,6 +809,10 @@ static bool IsDrawOpcode(uint32_t opcode) {
 	}
 }
 
+static bool IsDispatchOpcode(uint32_t opcode) {
+	return opcode == Pm4::IT_DISPATCH_DIRECT || opcode == Pm4::IT_DISPATCH_INDIRECT;
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
@@ -889,9 +893,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
-		const bool     draw            = IsDrawOpcode(opcode);
+		const bool     draw     = IsDrawOpcode(opcode) || IsDispatchOpcode(opcode);
+		const auto&    pipelines = m_renderer.GetPipelineCache();
 		const uint64_t pipelines_before =
-		    draw ? m_renderer.GetPipelineCache().GraphicsPipelinesCreated() : 0;
+		    draw ? pipelines.GraphicsPipelinesCreated() + pipelines.ComputePipelinesCreated() : 0;
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -912,7 +917,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (draw) {
 			if (m_lookahead_draws_left > 0) {
 				m_lookahead_draws_left--;
-			} else if (m_renderer.GetPipelineCache().GraphicsPipelinesCreated() != pipelines_before &&
+			} else if (pipelines.GraphicsPipelinesCreated() + pipelines.ComputePipelinesCreated() !=
+			               pipelines_before &&
 			           !IsAsyncComputeQueue()) {
 				RunPipelineLookahead(execution);
 			}
@@ -1031,6 +1037,27 @@ void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
 				}
 				continue;
 			}
+			case Pm4::IT_DISPATCH_DIRECT:
+				// Dispatches count as draws for the covered range, as ProcessPm4 counts them.
+				draws++;
+				// The dispatch path skips zero-sized dispatches before translating (see
+				// CpOpDispatchDirect for the layout: groups x, y, z, then the initiator).
+				if (packet_dw == 5u && packet[1] != 0 && packet[2] != 0 && packet[3] != 0) {
+					parts += pipelines.PrefetchComputePipeline(shadow->m_ctx, shadow->m_sh_ctx,
+					                                           packet[4]);
+				}
+				break;
+			case Pm4::IT_DISPATCH_INDIRECT:
+				draws++;
+				// See CpOpDispatchIndirect: the initiator follows the argument address or offset.
+				if ((header & ~1u) == 0xc0021600u) {
+					parts += pipelines.PrefetchComputePipeline(shadow->m_ctx, shadow->m_sh_ctx,
+					                                           packet[3]);
+				} else if ((header & ~1u) == 0xc0011600u) {
+					parts += pipelines.PrefetchComputePipeline(shadow->m_ctx, shadow->m_sh_ctx,
+					                                           packet[2]);
+				}
+				break;
 			default:
 				if (IsDrawOpcode(opcode)) {
 					draws++;

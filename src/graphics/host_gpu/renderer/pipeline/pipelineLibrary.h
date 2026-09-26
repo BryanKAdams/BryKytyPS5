@@ -49,8 +49,12 @@ public:
 	[[nodiscard]] bool  Contains(const std::string& key) const { return m_libraries.contains(key); }
 
 	// Compiles a part on a worker thread under `key`, unless the key is already present. `compile`
-	// owns everything its create info points to. Returns whether a job was queued.
+	// owns everything its create info points to. Returns whether a job was queued. The workers
+	// also compile whole compute pipelines, which the compute path then takes out with Take.
 	bool Prefetch(std::string key, Common::UniqueFunction<vk::Pipeline>&& compile);
+	// Removes `key` and hands its pipeline to the caller, waiting while it compiles; null when the
+	// key is absent or its compile failed.
+	[[nodiscard]] vk::Pipeline Take(const std::string& key);
 	// Layouts a prefetch created its parts with; destroyed with the cache.
 	void KeepLayout(vk::PipelineLayout layout, std::span<const vk::DescriptorSetLayout> set_layouts);
 
