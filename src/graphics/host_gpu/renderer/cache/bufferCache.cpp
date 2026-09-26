@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -352,6 +353,13 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write) 
 	if (!state.gpu_dirty) {
 		return;
 	}
+	// Relaxed readback: a download already carries the GPU's new bytes, so the read may see the
+	// previous ones meanwhile, as on hardware when the CPU reads before the GPU has written.
+	if (!is_write && !state.unarmed && Config::RelaxedReadbackEnabled() &&
+	    m_memory_tracker.GrantStaleRead(vaddr, size)) {
+		DrainStats::Record(DrainStats::Kind::StaleRead, 1);
+		return;
+	}
 	if (state.unarmed || tick >= m_scheduler.CurrentTick()) {
 		const auto reason = DrainStats::CurrentReason();
 		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, reason, &tick] {
@@ -393,11 +401,14 @@ void BufferCache::MarkReadbackHot(uint64_t vaddr) {
 	}
 	if (m_hot_pages.size() >= HotReadbackPages) {
 		// Replace the page whose latest fault is the oldest.
-		m_hot_pages.erase(std::min_element(
+		const auto oldest = std::min_element(
 		    m_hot_pages.begin(), m_hot_pages.end(),
-		    [](const auto& a, const auto& b) { return a.second < b.second; }));
+		    [](const auto& a, const auto& b) { return a.second < b.second; });
+		m_memory_tracker.SetReadbackHot(oldest->first, TRACKER_PAGE_SIZE, false);
+		m_hot_pages.erase(oldest);
 	}
 	m_hot_pages.emplace(page, tick);
+	m_memory_tracker.SetReadbackHot(page, TRACKER_PAGE_SIZE, true);
 }
 
 void BufferCache::QueueEagerReadback(uint64_t vaddr, uint64_t size) {

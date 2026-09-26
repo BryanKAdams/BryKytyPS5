@@ -244,6 +244,22 @@ guest-thread reads fault on are now "hot" (at most 64). A recorded write to a ho
 downloaded at the next command-processor flush point, and the next read usually finds it
 already published.
 
+**Relaxed readback (optional):** the read still waits when the GPU has not reached the write
+yet, and at the crash site that is most frames: Astro Bot's DrawThread reads a compute-written
+value at guest PC 0x90736fa9e about twice a frame, 2.5-5 ms a read at 60 fps and about 12.6 ms
+on the open sand, where the frame's heaviest draw delays the dispatch (21 ms of waiting a
+frame). With "Relaxed GPU readback" in the settings panel (`relaxed-readback`, off by default),
+a guest read of a hot, GPU-dirty page whose download is already recorded does not wait: the
+page opens read-only with its previous bytes, as memory reads on hardware return whatever is
+there before the GPU writes, and the download publishes the new bytes as usual. The next GPU
+write to the page closes it again. Only hot pages open, since Thread_Gpu reads some GPU-written
+memory directly and relies on the fault; guest writes still fault and synchronize. Warm, sand
+route, same build: tick waits fell from up to 27 ms a frame to under 1 ms in every 5 s window,
+the worst sand window from 38 to 44-50 fps, and loading and cutscene windows from 24-28 to
+58-60 fps; 20-110 reads a second took the previous bytes. Screenshots and the cold render check
+show no difference. It does not change first-use stalls (cold whole run 23.4 s against 22.7 s,
+within noise).
+
 **Queue thread:** `vkQueueSubmit` took about 13 ms of each frame on Thread_Gpu, the saturated
 thread: about 330 submits at 18 us each, plus waits for the queue lock held by present. The
 render scheduler now allocates the tick and hands the command buffer to a dedicated thread,
@@ -599,6 +615,7 @@ command-line flags without `--`; `#` starts a comment, and a switch needs no val
 gpu-timestamp-scale = 115   # dynamic-resolution headroom
 pipeline-libraries = false  # build every graphics pipeline in one piece
 async-pipelines = true      # skip draws whose new pipeline is compiling
+relaxed-readback = true     # game reads of GPU-written memory may see the previous value
 fullscreen
 ```
 

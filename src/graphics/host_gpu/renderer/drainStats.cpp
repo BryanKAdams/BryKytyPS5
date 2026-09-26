@@ -125,6 +125,7 @@ const char* KindName(Kind kind) {
 		case Kind::PipelineCreate: return "pipeline-create";
 		case Kind::Lookahead: return "lookahead";
 		case Kind::GpuThreadIdle: return "gpu-thread-idle";
+		case Kind::StaleRead: return "stale-read";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -413,7 +414,7 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds, bool 
 			                    KindName(row.kind), ReasonName(row.reason), OpName(row.op),
 			                    row.count, ms, ms / static_cast<double>(row.count));
 		} else if (row.kind == Kind::OcclusionQuery || row.kind == Kind::OcclusionPredicate ||
-		           row.kind == Kind::GpuTimestamp) {
+		           row.kind == Kind::GpuTimestamp || row.kind == Kind::StaleRead) {
 			text += fmt::format("  {:<14} {:<26} {:<26} n={:<6} ({:.1f}/frame)\n", KindName(row.kind),
 			                    ReasonName(row.reason), OpName(row.op), row.count,
 			                    per(static_cast<double>(row.count)));

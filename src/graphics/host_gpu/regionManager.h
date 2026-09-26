@@ -147,6 +147,7 @@ public:
 			// A new GPU write or an explicit unmark supersedes any recorded download: its
 			// publication must no longer clear these pages.
 			Disarm(start, end);
+			m_stale_readable.UnsetRange(start, end);
 		}
 		if constexpr (enable) {
 			bits.SetRange(start, end);
@@ -173,6 +174,7 @@ public:
 		if constexpr (clear) {
 			if constexpr (source == DirtySource::Gpu) {
 				Disarm(start, end);
+				m_stale_readable.UnsetRange(start, end);
 			}
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
@@ -233,6 +235,7 @@ public:
 			if (m_arms->armed.Get(page) && m_arms->token[page] == token) {
 				m_arms->armed.Unset(page);
 				m_gpu_dirty.Unset(page);
+				m_stale_readable.Unset(page);
 				finalized++;
 			}
 		}
@@ -240,6 +243,45 @@ public:
 			m_armed_pages.fetch_sub(finalized, std::memory_order_relaxed);
 			UpdateProtection<false, true>();
 		}
+	}
+
+	// Caller holds lock.
+	void SetReadbackHot(uint64_t vaddr, uint64_t size, bool hot) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (hot) {
+			m_hot.SetRange(start, end);
+		} else {
+			m_hot.UnsetRange(start, end);
+		}
+	}
+
+	// Relaxed readback: lets guest threads read hot GPU-dirty pages of the range that a recorded
+	// download is already publishing, with their previous bytes, until that publication or
+	// the next GPU write to them. Returns false, granting nothing, when a GPU-dirty page of
+	// the range is not armed or not hot. Only hot pages, which guest reads keep faulting on,
+	// are opened: Thread_Gpu may read other GPU-dirty pages directly and rely on the fault.
+	// Caller holds lock.
+	[[nodiscard]] bool GrantStaleRead(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		bool       granted      = false;
+		for (const auto [first, last]: RegionBits(m_gpu_dirty, start, end)) {
+			for (size_t page = first; page < last; page++) {
+				if (m_arms == nullptr || !m_arms->armed.Get(page) || !m_hot.Get(page)) {
+					return false;
+				}
+			}
+			granted = true;
+		}
+		if (!granted) {
+			return false;
+		}
+		for (const auto [first, last]: RegionBits(m_gpu_dirty, start, end)) {
+			for (size_t page = first; page < last; page++) {
+				m_stale_readable.Set(page);
+			}
+		}
+		UpdateProtection<false, true>();
+		return true;
 	}
 
 	// Caller holds lock.
@@ -296,7 +338,7 @@ private:
 
 	template <bool track, bool is_read>
 	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
+		const auto protection = is_read ? ~m_gpu_dirty | m_stale_readable : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
 		if (mask.None()) {
@@ -340,6 +382,10 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// GPU-dirty pages guest threads may read with their previous bytes (GrantStaleRead).
+	RegionBits   m_stale_readable;
+	// Pages guest reads keep faulting on (BufferCache's hot readback pages).
+	RegionBits   m_hot;
 	std::atomic<uint64_t>& m_bda_hint_word;
 	uint64_t               m_bda_hint_mask;
 	std::atomic<uint64_t>& m_bda_summary_word;

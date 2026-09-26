@@ -38,6 +38,27 @@ public:
 	[[nodiscard]] ReadbackState QueryReadback(uint64_t vaddr, uint64_t size);
 	void ArmReadback(uint64_t vaddr, uint64_t size, uint64_t token, uint64_t tick);
 	void FinalizeReadback(uint64_t vaddr, uint64_t size, uint64_t token);
+	// Hot pages (guest threads keep reading them after GPU writes; see BufferCache) are the only
+	// ones GrantStaleRead opens.
+	void SetReadbackHot(uint64_t vaddr, uint64_t size, bool hot) {
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->SetReadbackHot(manager->GetCpuAddr() + offset, bytes, hot);
+		});
+	}
+	// Relaxed readback: when every GPU-dirty page of the range is armed and hot, lets guest
+	// threads read those pages with their previous bytes until the download publishes them or
+	// the GPU writes them again. Returns whether it did.
+	[[nodiscard]] bool GrantStaleRead(uint64_t vaddr, uint64_t size) {
+		CheckNotInUploadCallback();
+		bool granted = true;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			granted = manager->GrantStaleRead(manager->GetCpuAddr() + offset, bytes) && granted;
+		});
+		return granted;
+	}
 	[[nodiscard]] bool HasArmedPages(uint64_t vaddr, uint64_t size);
 	// Lock-free and possibly stale: whether the tracker page holding vaddr is GPU-dirty. Only
 	// for choosing a read path whose outcome stays correct either way.

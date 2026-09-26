@@ -496,6 +496,58 @@ void TestReadbackArming() {
   Release(memory);
 }
 
+void TestStaleReadGrant() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto second = address + page_size;
+
+  tracker.ForEachUploadRange(
+      address, page_size * 2, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  // Only armed, hot pages open.
+  tracker.SetReadbackHot(address, page_size * 2, true);
+  Check(!tracker.GrantStaleRead(address, page_size) &&
+            Protection(memory) == PAGE_NOACCESS,
+        "an unarmed page was opened for stale reads");
+  tracker.ArmReadback(address, page_size * 2, 1, 5);
+  tracker.SetReadbackHot(second, page_size, false);
+  Check(!tracker.GrantStaleRead(second, page_size) &&
+            Protection(memory + page_size) == PAGE_NOACCESS,
+        "a page that is not hot was opened for stale reads");
+  Check(tracker.GrantStaleRead(address, page_size) &&
+            Protection(memory) == PAGE_READONLY &&
+            tracker.IsRegionGpuModified(address, page_size) &&
+            !tracker.QueryReadback(address, page_size).unarmed,
+        "an armed hot page did not open read-only, or lost its GPU state");
+
+  // The next GPU write closes it again and supersedes the download.
+  tracker.MarkRegionAsGpuModified(address + 16, 16);
+  Check(Protection(memory) == PAGE_NOACCESS &&
+            tracker.QueryReadback(address, page_size).unarmed,
+        "a GPU write left a stale-readable page open");
+  tracker.FinalizeReadback(address, page_size * 2, 1);
+  Check(Protection(memory) == PAGE_NOACCESS &&
+            tracker.IsRegionGpuModified(address, page_size),
+        "an old publication cleared a re-dirtied page");
+
+  // Publication of the current download leaves the page clean and readable.
+  tracker.ArmReadback(address, page_size, 2, 6);
+  Check(tracker.GrantStaleRead(address, page_size) && Protection(memory) == PAGE_READONLY,
+        "a re-armed hot page did not reopen");
+  tracker.FinalizeReadback(address, page_size, 2);
+  Check(!tracker.IsRegionGpuModified(address, page_size) &&
+            Protection(memory) == PAGE_READONLY,
+        "publication did not leave the page clean and readable");
+
+  tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestExactDirtyIntervalsSharingTrackerPage() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1243,6 +1295,7 @@ int main(int argc, char **argv) {
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestReadbackArming();
+  TestStaleReadGrant();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();

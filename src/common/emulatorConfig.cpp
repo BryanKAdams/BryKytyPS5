@@ -213,6 +213,17 @@ void SetAsyncPipelinesEnabled(bool enabled) {
 	g_async_pipelines_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
+static std::atomic<int> g_relaxed_readback_override {-1};
+
+bool RelaxedReadbackEnabled() {
+	const auto enabled = g_relaxed_readback_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->relaxed_readback_enabled;
+}
+
+void SetRelaxedReadbackEnabled(bool enabled) {
+	g_relaxed_readback_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {

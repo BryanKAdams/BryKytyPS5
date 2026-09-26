@@ -58,6 +58,7 @@ enum class Kind : uint8_t {
 	PipelineCreate,     // Pipeline lookup that took at least 1 ms (a new pipeline), in ns.
 	Lookahead,          // A pipeline look-ahead walk, including the shaders it translated, in ns.
 	GpuThreadIdle,      // Thread_Gpu waiting for a submission or command, in ns.
+	StaleRead,          // A guest read answered with previous bytes (relaxed readback).
 	Count,
 };
 

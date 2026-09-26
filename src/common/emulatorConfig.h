@@ -81,6 +81,7 @@ struct ConfigOptions {
 	uint32_t               gpu_timestamp_scale_percent = 100;
 	bool                   pipeline_libraries_enabled  = true;
 	bool                   async_pipelines_enabled     = false;
+	bool                   relaxed_readback_enabled    = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -156,6 +157,12 @@ void SetPipelineLibrariesEnabled(bool enabled);
 bool AsyncPipelinesEnabled();
 // Changes it while running (the settings panel).
 void SetAsyncPipelinesEnabled(bool enabled);
+// A game thread reading memory the GPU is still writing gets the previous bytes at once instead
+// of waiting, as on hardware when the CPU reads before the GPU has written; the new bytes follow
+// with the download already under way. Off by default: a value can be a frame old.
+bool RelaxedReadbackEnabled();
+// Changes it while running (the settings panel).
+void SetRelaxedReadbackEnabled(bool enabled);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

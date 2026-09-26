@@ -1103,6 +1103,20 @@ struct SystemOverlay::Impl {
 		    "appear a few frames late. Needs pipeline libraries.");
 		ImGui::PopTextWrapPos();
 		ImGui::Separator();
+
+		bool relaxed_readback = Config::RelaxedReadbackEnabled();
+		if (ImGui::Checkbox("Relaxed GPU readback", &relaxed_readback)) {
+			Config::SetRelaxedReadbackEnabled(relaxed_readback);
+			settings_save_failed = !Common::SettingsFile::Save("relaxed-readback",
+			                                                   relaxed_readback ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "When the game reads memory the GPU is still writing, it gets the previous value at "
+		    "once instead of waiting for the GPU, so GPU-heavy scenes stall less. A value the game "
+		    "reads can then be one frame old.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
 		if (settings_save_failed) {
 			ImGui::TextColored({1.0f, 0.5f, 0.4f, 1.0f}, "Could not save %s",
 			                   Common::SettingsFile::FileName);

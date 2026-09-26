@@ -103,6 +103,8 @@ static void PrintUsage() {
 	         "separately compiled parts where the driver supports it. Default: true.\n");
 	::printf("  --async-pipelines <true|false>       Skip draws whose new pipeline is still "
 	         "compiling instead of stalling; they appear a few frames late. Default: false.\n");
+	::printf("  --relaxed-readback <true|false>      Let game threads read memory the GPU is still "
+	         "writing without waiting; a value can be a frame old. Default: false.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -447,6 +449,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--async-pipelines") {
 			if (!ParseBool(value, options.config.async_pipelines_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--relaxed-readback") {
+			if (!ParseBool(value, options.config.relaxed_readback_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
