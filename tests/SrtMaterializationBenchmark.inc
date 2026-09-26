@@ -388,6 +388,37 @@ void PrintSpirvDigests(const char *journal_path) {
               static_cast<unsigned long long>(slowest_hash), slowest_ms);
 }
 
+// --journal-opcodes <journal copy> <OPCODE>: lists the recorded shaders whose guest
+// code uses an opcode (as the decoder names it, for example V_READFIRSTLANE_B32), with
+// their stage, code size and use count.
+void ListJournalOpcodes(const char *journal_path, const char *opcode) {
+  constexpr const char *name = "JournalOpcodes";
+  auto records = ReadShaderJournalCopy(journal_path);
+  Require(name, "journal", !records.empty(),
+          std::string("no records read from ") + journal_path);
+  const auto needle = std::string(": ") + opcode + " ";
+  std::set<uint64_t> listed;
+  for (const auto &record : records) {
+    // Fused and hull-front programs need their own decode path; skip them.
+    if (!listed.insert(record.hash).second || !record.back_code.empty() ||
+        record.stage == ShaderType::Local) {
+      continue;
+    }
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(record.code, decoded);
+    const auto text = ShaderRecompiler::Decoder::ProgramToString(decoded);
+    size_t count = 0;
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+      count++;
+    }
+    if (count != 0) {
+      std::printf("opcode %016llx stage=%u code=%zu uses=%zu\n",
+                  static_cast<unsigned long long>(record.hash),
+                  static_cast<unsigned>(record.stage), record.code.size(), count);
+    }
+  }
+}
+
 // --pipeline-compile-time <journal copy> <hash> <rounds> [spv files...]: times
 // vkCreateComputePipelines for one recorded compute shader. Without files it
 // times the SPIR-V this build produces; with files (for example --dump-shader
@@ -517,6 +548,109 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
       }
     }
   }
+  // With VK_KHR_pipeline_executable_properties, print the driver's statistics for each
+  // input (VGPRs, SGPRs, instruction count, ...), and with KYTY_PIPELINE_ISA=<dir> write its
+  // internal representations (the ISA) there.
+  const auto *isa_dir = std::getenv("KYTY_PIPELINE_ISA");
+  const auto capture = [&](const std::string &label, std::vector<uint32_t> &words) {
+    words[2] = ++generator;
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = words.size() * sizeof(uint32_t);
+    module_info.pCode = words.data();
+    vk::ShaderModule module = nullptr;
+    RequireVk(name, "module", device.createShaderModule(&module_info, nullptr, &module),
+              "vkCreateShaderModule");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline_layout;
+    pipeline_info.flags = vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+    if (isa_dir != nullptr) {
+      pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+    }
+    if (label.starts_with(no_optimization)) {
+      pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+    }
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "pipeline",
+              device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateComputePipelines");
+    vk::PipelineInfoKHR info{};
+    info.pipeline = pipeline;
+    uint32_t executables = 0;
+    RequireVk(name, "executables",
+              device.getPipelineExecutablePropertiesKHR(&info, &executables, nullptr),
+              "vkGetPipelineExecutablePropertiesKHR");
+    for (uint32_t index = 0; index < executables; index++) {
+      vk::PipelineExecutableInfoKHR executable{};
+      executable.pipeline = pipeline;
+      executable.executableIndex = index;
+      uint32_t count = 0;
+      RequireVk(name, "statistics",
+                device.getPipelineExecutableStatisticsKHR(&executable, &count, nullptr),
+                "vkGetPipelineExecutableStatisticsKHR");
+      std::vector<vk::PipelineExecutableStatisticKHR> statistics(count);
+      RequireVk(name, "statistics",
+                device.getPipelineExecutableStatisticsKHR(&executable, &count,
+                                                          statistics.data()),
+                "vkGetPipelineExecutableStatisticsKHR");
+      std::string line;
+      for (const auto &statistic : statistics) {
+        line += fmt::format(" {}=", statistic.name.data());
+        switch (statistic.format) {
+          case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+            line += statistic.value.b32 ? "true" : "false";
+            break;
+          case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+            line += fmt::format("{}", statistic.value.i64);
+            break;
+          case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+            line += fmt::format("{}", statistic.value.u64);
+            break;
+          case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
+            line += fmt::format("{:.3f}", statistic.value.f64);
+            break;
+        }
+      }
+      std::printf("[host]    %s: stats %s:%s\n", name, label.c_str(), line.c_str());
+      if (isa_dir == nullptr) {
+        continue;
+      }
+      count = 0;
+      RequireVk(name, "isa",
+                device.getPipelineExecutableInternalRepresentationsKHR(&executable, &count,
+                                                                       nullptr),
+                "vkGetPipelineExecutableInternalRepresentationsKHR");
+      std::vector<vk::PipelineExecutableInternalRepresentationKHR> representations(count);
+      RequireVk(name, "isa",
+                device.getPipelineExecutableInternalRepresentationsKHR(
+                    &executable, &count, representations.data()),
+                "vkGetPipelineExecutableInternalRepresentationsKHR");
+      std::vector<std::vector<char>> storage(count);
+      for (uint32_t item = 0; item < count; item++) {
+        storage[item].resize(representations[item].dataSize);
+        representations[item].pData = storage[item].data();
+      }
+      RequireVk(name, "isa",
+                device.getPipelineExecutableInternalRepresentationsKHR(
+                    &executable, &count, representations.data()),
+                "vkGetPipelineExecutableInternalRepresentationsKHR");
+      const auto base = std::filesystem::path(isa_dir) /
+                        std::filesystem::path(label.substr(label.find(':') + 1)).stem();
+      for (uint32_t item = 0; item < count; item++) {
+        auto path = base;
+        path += fmt::format(".{}.{}.txt", index, item);
+        std::ofstream out(path, std::ios::binary);
+        out << representations[item].name.data() << "\n";
+        out.write(storage[item].data(),
+                  static_cast<std::streamsize>(representations[item].dataSize));
+      }
+    }
+    device.destroyPipeline(pipeline, nullptr);
+    device.destroyShaderModule(module, nullptr);
+  };
+
   for (size_t i = 0; i < inputs.size(); i++) {
     auto &words = inputs[i].second;
     const auto repeat_ms = compile_ms(inputs[i].first, words, false);
@@ -525,6 +659,9 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
                 name, words.size(), MedianOf(times[i]),
                 *std::min_element(times[i].begin(), times[i].end()), repeat_ms,
                 inputs[i].first.c_str());
+    if (vulkan.ExecutableInfoSupported()) {
+      capture(inputs[i].first, words);
+    }
   }
   device.destroyPipelineLayout(pipeline_layout, nullptr);
   device.destroyDescriptorSetLayout(descriptor_layout, nullptr);

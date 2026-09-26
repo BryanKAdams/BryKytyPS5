@@ -1869,6 +1869,10 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  // VK_KHR_pipeline_executable_properties: driver statistics and ISA per pipeline.
+  [[nodiscard]] bool ExecutableInfoSupported() const {
+    return m_executable_info_supported;
+  }
   [[nodiscard]] vk::Format D16StencilBacking(uint32_t samples = 1) const {
     for (const auto format :
          {vk::Format::eD24UnormS8Uint, vk::Format::eD32SfloatS8Uint}) {
@@ -16519,6 +16523,15 @@ private:
     if (m_conditional_rendering_supported) {
       device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
     }
+    vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_info{};
+    m_executable_info_supported =
+        has_extension(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    if (m_executable_info_supported) {
+      executable_info.pipelineExecutableInfo = true;
+      executable_info.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &executable_info;
+      device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
@@ -16853,6 +16866,7 @@ private:
   bool m_feedback_dynamic_supported = false;
   bool m_provoking_vertex_supported = false;
   bool m_conditional_rendering_supported = false;
+  bool m_executable_info_supported = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 
@@ -34415,6 +34429,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 3 && std::strcmp(argv[1], "--journal-specs") == 0) {
     PrintJournalSpecializations(argv[2]);
+    return 0;
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--journal-opcodes") == 0) {
+    ListJournalOpcodes(argv[2], argv[3]);
     return 0;
   }
   if (argc == 3 && std::strcmp(argv[1], "--spirv-digest") == 0) {
