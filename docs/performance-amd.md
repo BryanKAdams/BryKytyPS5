@@ -321,17 +321,71 @@ shader, a new static state and which words differ, or a new specialization and w
 differ), each module's SPIR-V size (`spirv: id= … words=`), and each pipeline's creation time
 (`pipeline: vs= ps= ms=` / `pipeline: cs= ms=`).
 
-Loading the crash-site save with empty caches, the game froze for up to 11 s in one frame. Of
-the 22.5 s of stalls, almost all was the driver (26.6.4 LLPC) creating 124 pipelines at about
+With empty caches, booting to the title and save menu froze the game for up to 11 s in one frame.
+Of the 22.5 s of stalls, almost all was the driver (26.6.4 LLPC) creating 124 pipelines at about
 190 ms each, one after another on Thread_Gpu. Our own translation of the 147 permutations took
-about 2.2 s. `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` made no difference (189 vs 194 ms per
+about 2.2 s. (These runs were meant to load the crash-site save, but with cold caches the save
+menu's key presses fell inside stalled frames and were never seen; see the cold-start scenario
+below.) `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` made no difference (189 vs 194 ms per
 pipeline, same GPU time), so this driver ignores it. Compile time tracks SPIR-V size (median
 module 11k words, p90 61k, largest 184k; the 1.0-1.4 s pipelines hold 90k-184k-word modules), and
 the same stage is compiled again in every pipeline that uses it (compiling each unique stage
-once would compile 64% of the words). Later sessions keep the driver cache and replay the
-shader journal, so known pipelines are cheap. Their stalls come from shaders never seen in any
-earlier session: the same idle 45 s at the crash site met 147, 57 and 24 new permutations in
-three sessions, and none of the later ones had appeared before.
+once would compile 64% of the words).
+
+### Measuring a cold start
+
+AMD's driver keeps its own on-disk pipeline cache (`%LOCALAPPDATA%\AMD\VkCache`, `.parc` files),
+one set per executable location, and it survives deleting the emulator's `_PipelineCache`. A
+"cold" run from a folder that ran before is warm at the driver: the same title-screen boot took
+10.8 s of graphics pipeline creation the first time and 0.65 s the second (compute pipelines:
+1 ms). A cold run therefore copies the build into a new folder, and afterwards deletes the driver
+cache files that run created.
+
+The scenario starts a new game in the ship save's empty slot 2, skips the intro and the
+crash-landing cutscenes (Options, Down, Cross on each; the pause menu is recognized by its blue
+left-edge arc and the dark Skip item), then plays a fixed minute at the crash site: walk to the
+rocks under the "!" marker, turn the camera, hop about. Every key press first waits for three
+steady seconds (at least 55 frames each), since a press that starts and ends inside one stalled
+frame is lost. Held-key movement still covers different ground when frames stall, so the two
+sides of an A/B do not see identical content.
+
+### Pipeline libraries
+
+A new graphics pipeline is built from `VK_EXT_graphics_pipeline_library` parts: vertex input,
+pre-rasterization shaders, fragment shader and fragment output, each cached under the state it
+depends on. Only parts no earlier pipeline built are compiled, and the two shader parts compile in
+parallel. The parts are then fast-linked, which averages 0.45 ms. A background thread relinks
+each such pipeline with link-time optimization, and the draw path swaps that pipeline in on a
+later lookup, retiring the fast-linked one once the GPU is done with it. Mesh and RectList
+pipelines stay monolithic, as do all pipelines on drivers without fast linking. The switch is
+"Pipeline libraries" in the settings panel (`pipeline-libraries` in the settings file), on by
+default.
+
+Pixel shader resources use descriptor set 1 and vertex-side stages set 0. Layouts with
+independent sets would let each shader part ignore the other stage's set, but on this driver any
+pipeline whose layout has independent sets, even a monolithic one, lost the device within the
+first frames. Binding empty sets, dropping push descriptors, and linking with link-time
+optimization up front did not help. So every part uses the pipeline's full layout, and a shader
+part is shared only by pipelines whose two set layouts match. Library pipelines use one push
+constant range for all stages.
+
+Cold start, same build with the setting off and on, three alternating rounds (means, with the
+range):
+
+| | Off | On |
+| --- | --- | --- |
+| Gameplay minute: stalls (frames of 50 ms or more) | 11.0 s (9.6-13.5) | 4.8 s (4.5-5.2) |
+| Gameplay minute: stalled frames | 30 (23-44) | 14 (13-15) |
+| Gameplay minute: worst frame | 2.4-2.8 s | 1.0-1.2 s |
+| Whole run (boot, menus, cutscenes, gameplay): stalls | 51.8 s (50.2-55.0) | 36.8 s (36.4-37.0) |
+| Pipeline creation in stalled frames, whole run | 44.9 s | 30.7 s |
+
+With the setting off, the gameplay minute spent about 12 s between 25 and 45 fps while Astro
+reached the rocks; with it on, the minute held 60 apart from one second at the start of play.
+
+Most of what remains is driver compile time in loading frames that create 20-30 pipelines one
+after another (one took 6.2 s), and compute pipelines (6 s over the run), which have no library
+form.
 
 ## Settings file
 
@@ -340,6 +394,7 @@ command-line flags without `--`; `#` starts a comment, and a switch needs no val
 
 ```text
 gpu-timestamp-scale = 115   # dynamic-resolution headroom
+pipeline-libraries = false  # build every graphics pipeline in one piece
 fullscreen
 ```
 
