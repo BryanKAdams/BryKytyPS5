@@ -419,11 +419,16 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
   std::printf("[host]    %s: recompiler median %.2f ms (%zu SPIR-V words)\n", name,
               MedianOf(recompile_times), compiled->spirv.size());
 
+  // A "noopt:" prefix times that file with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT.
+  constexpr std::string_view no_optimization = "noopt:";
   std::vector<std::pair<std::string, std::vector<uint32_t>>> inputs;
   if (spv_paths.empty()) {
     inputs.emplace_back("this build", compiled->spirv);
   }
-  for (const char *path : spv_paths) {
+  for (const char *label : spv_paths) {
+    const auto path = std::string_view(label).starts_with(no_optimization)
+                          ? label + no_optimization.size()
+                          : label;
     std::ifstream in(path, std::ios::binary);
     const std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
                                   std::istreambuf_iterator<char>());
@@ -431,7 +436,7 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
             std::string("unreadable SPIR-V ") + path);
     std::vector<uint32_t> words(bytes.size() / 4);
     std::memcpy(words.data(), bytes.data(), bytes.size());
-    inputs.emplace_back(path, std::move(words));
+    inputs.emplace_back(label, std::move(words));
   }
 
   const auto device = vulkan.Device();
@@ -467,7 +472,8 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
   // Distinct per run, so a later run cannot hit this run's cache entries.
   auto generator = static_cast<uint32_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
-  const auto compile_ms = [&](std::vector<uint32_t> &words, bool fresh) {
+  const auto compile_ms = [&](const std::string &label, std::vector<uint32_t> &words,
+                              bool fresh) {
     if (fresh) {
       words[2] = ++generator;
     }
@@ -482,9 +488,11 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
     pipeline_info.stage.module = module;
     pipeline_info.stage.pName = "main";
     pipeline_info.layout = pipeline_layout;
-    // KYTY_TEST_DISABLE_OPT=1 times the driver's unoptimized compile instead.
-    if (const char *value = std::getenv("KYTY_TEST_DISABLE_OPT");
-        value != nullptr && value[0] == '1') {
+    // A "noopt:" input, or KYTY_TEST_DISABLE_OPT=1 for every input, times the driver's
+    // unoptimized compile instead.
+    const char *disable_opt = std::getenv("KYTY_TEST_DISABLE_OPT");
+    if (label.starts_with(no_optimization) ||
+        (disable_opt != nullptr && disable_opt[0] == '1')) {
       pipeline_info.flags = vk::PipelineCreateFlagBits::eDisableOptimization;
     }
     vk::Pipeline pipeline = nullptr;
@@ -503,7 +511,7 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
     for (size_t i = 0; i < inputs.size(); i++) {
       // Alternate the order so drift and warm-up do not favour one input.
       const auto index = (round % 2 == 0) ? i : inputs.size() - 1 - i;
-      const auto ms = compile_ms(inputs[index].second, true);
+      const auto ms = compile_ms(inputs[index].first, inputs[index].second, true);
       if (round != 0) {
         times[index].push_back(ms);
       }
@@ -511,7 +519,7 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
   }
   for (size_t i = 0; i < inputs.size(); i++) {
     auto &words = inputs[i].second;
-    const auto repeat_ms = compile_ms(words, false);
+    const auto repeat_ms = compile_ms(inputs[i].first, words, false);
     std::printf("[host]    %s: %6zu words  median %8.2f ms  min %8.2f ms  "
                 "unchanged repeat %7.2f ms  %s\n",
                 name, words.size(), MedianOf(times[i]),
