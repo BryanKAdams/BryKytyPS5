@@ -22,6 +22,9 @@ validated by this patch set.
 - **Shader replay (PR #718):** a versioned, checksummed journal records shader code and compile
   metadata, without runtime pointers or buffer addresses. Warm startup replays the journal before
   the first shader lookup. Runtime resources are rematerialized from the current guest state.
+  The replay translates and compiles the records on up to seven threads without the cache lock
+  and adds them in order: a warm Astro Bot boot's first draw waited 17 ms for its 298 records
+  instead of 1.35 s, and the longest boot frame fell from 2.2 s to 0.75 s.
 - **Readback and pressure handling (PR #638):** downloads exceeding the 64 MiB staging ring use
   dedicated staging allocations retained through publication. Pressure collection retries image
   lookup after reclaiming eligible textures. Dirty victims remain protected until their writebacks
