@@ -87,11 +87,11 @@ Ways to move work off that thread, cheapest first:
 - **Faster first-use shader compiles.** Done in part on `perf/draw-cpu`: the structurizer's
   post-dominator order (a full journal recompile 3471 to 2363 ms, byte-identical SPIR-V) and the
   EXEC-masked select-chain collapse (AMD driver compute compiles 8-15% faster on the two largest
-  shaders). Next: `TranslateProgram`, `RewriteToSsa` and `EmitProgram` are now the largest passes
-  (about 616, 427 and 416 ms per journal). Buffer loads still carry a software bounds check and an
-  EXEC branch each. The device enables `robustBufferAccess2`, so the bounds check could go, but
-  that changes the SPIR-V and needs a GPU A/B. Use `--spirv-digest` and `--pipeline-compile-time`
-  (performance-amd.md).
+  shaders), and branch-free bounds-checked loads (the driver's cost follows branches, not words:
+  `900aba` 1397 to 1182 ms). Next: branch-free storage stores under `robustBufferAccess2` (the
+  mesh shaders' remaining branches); `TranslateProgram`, `RewriteToSsa` and `EmitProgram` are the
+  largest recompiler passes (about 616, 427 and 416 ms per journal). Use `--spirv-digest` and
+  `--pipeline-compile-time` (performance-amd.md).
 - **Instrument the drains.** Done: `--drain-stats`.
 - **Make the shader journal and driver cache survive commits.** Done: both are keyed on a hash of
   the recompiler and pipeline sources.

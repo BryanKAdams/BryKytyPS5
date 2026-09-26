@@ -126,6 +126,19 @@ validated by this patch set.
   (`01d6f21611218e74`) now recompiles in 141 ms instead of 386 ms. This is paid on every first
   encounter and again by the boot-time journal replay.
 
+- **Branch-free bounds-checked loads:** every buffer, LDS and constant-buffer dword load sat in a
+  branch on its bounds check, itself inside the EXEC branch. An out-of-bounds lane now reads
+  element 0 and selects zero (or the format's out-of-bounds value), which is what the branch
+  gave; stores and atomics keep their branches. The AMD compiler's cost follows control flow far
+  more than SPIR-V size: `vkCreateComputePipelines` for `900aba8df9448d3d` fell from 1397 to
+  1182 ms with 541 instead of 1129 conditional branches but only 3% fewer words. Merging
+  duplicate pure instructions (6% fewer words) saved only 1-2% and was dropped. The big gameplay
+  pixel shaders lose 80-85% of their branches (`4a6940ae373ad4e6` 339 to 68). All 591
+  permutations of two Astro Bot journals pass `spirv-val`. The remaining branches in compute and
+  mesh shaders mostly guard storage stores (181 in `01d6f21611218e74`, 249-307 in the big mesh
+  shaders). Making those branch-free needs `robustBufferAccess2` to be known when compiling, so
+  that an out-of-range store is discarded.
+
 The dense evaluator, retained resource snapshots, and replacement of the old SRT readability path
 were already present at the base revision. Their historical PR improvements are not additional gains
 from this branch.

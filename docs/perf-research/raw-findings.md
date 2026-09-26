@@ -1011,6 +1011,23 @@ encounter. The recompile also repeats at boot for every journal record. Measured
 - **SSA construction** seals every block only after the whole program is visited, so each read
   without a local definition creates an incomplete phi. Sealing earlier would change phi order
   and therefore the SPIR-V bytes. It is only worth doing with a GPU and correctness A/B.
+- **What the driver pays for** (`--pipeline-compile-time`, compute shaders, 4-5 interleaved
+  rounds). Control flow dominates:
+  - Merging block-local and dominated duplicate pure instructions cut `900aba` by 6% in words
+    but its compile by only 1.2% (`01d6f2` 4% and 1.8%). Dropped. It also has to rewrite branch
+    conditions, descriptor sources and SRT reads, which hold IR values outside the use lists; a
+    first version left a dangling branch condition.
+  - Replacing the bounds branch with an index clamp cut 7% of words and 22% of compile time
+    (1397 to 1096 ms; `01d6f2` 964 to 798 ms).
+  - Also dropping the EXEC branch around loads gave a further 13% on `900aba` but was 10% worse
+    on `01d6f2`, and it changes what inactive lanes read. Not pursued.
+  - The committed form (6820afbd) is the exact select version: 1397 to 1182 ms. `min(index,
+    length)` alone is not exact, because a range that is not a multiple of 4 is rounded up by
+    `robustBufferAccess2`, so dword `length` can be partly in range.
+- **Storage stores** keep their bounds branches: 181 in `01d6f2` and 249-307 in the big mesh
+  shaders. A branch-free store needs an index that is guaranteed out of range (for example
+  0x3FFFFFFF) and a discard guarantee, which only `robustBufferAccess2` gives. That means passing
+  the device feature into the recompiler.
 
 ### Texture-cache lookups
 
