@@ -358,8 +358,8 @@ parallel. The parts are then fast-linked, which averages 0.45 ms. A background t
 each such pipeline with link-time optimization, and the draw path swaps that pipeline in on a
 later lookup, retiring the fast-linked one once the GPU is done with it. A mesh pipeline has no
 vertex input part: its mesh shader is the pre-rasterization part, and its push constant range
-covers the mesh and fragment stages (currently disabled; see below). RectList pipelines stay
-monolithic (their tessellation
+covers the mesh and fragment stages (with a known intermittent defect; see below). RectList
+pipelines stay monolithic (their tessellation
 shaders are generated per vertex and pixel shader pair, and Astro Bot draws none to test a
 library form with), as do all pipelines on drivers without fast linking. The switch is
 "Pipeline libraries" in the settings panel (`pipeline-libraries` in the settings file), on by
@@ -371,10 +371,12 @@ cold run took 7.0 s (up to 1.24 s each), recompiling the same mesh shader every 
 pipelines they took 3.75 s, and the cold run's stalls dropped from about 37 s to 33 s (worst
 frame 7.8 s to 6.5 s), two rounds each. But 2 of about 14 runs with mesh library pipelines
 rendered the whole desert blown out to saturated yellow from the first gameplay frame (sand
-255,251,62 against a normal 242,191,102), and none of the 18 runs before did, so mesh pipelines
-are monolithic again until that is understood. A likely cause is a separately compiled fragment
-part reading a mesh output that a monolithic compile would zero, with the garbage poisoning the
-game's temporal auto-exposure.
+255,251,62 against a normal 242,191,102), and none of the 18 runs before did. A likely cause is
+a separately compiled fragment part reading a mesh output that a monolithic compile would zero,
+with the garbage poisoning the game's temporal auto-exposure. Mesh library pipelines stay on by
+the user's choice, with this as a known issue (see `UsesLibraries` in shaders.cpp to turn them
+off). With the look-ahead below, mesh libraries on and off measured 27.1-28.6 s and 30.9-32.7 s
+of cold-start stalls.
 
 Also tried: `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` on the library parts (the background
 link still optimizes fully) cut graphics pipeline creation only 6-8% (stalls 36.4 s to 34.7 s,
