@@ -7,6 +7,7 @@
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -1039,6 +1040,103 @@ void CollapseSelectChains(const BlockList& blocks) {
 	}
 }
 
+// V_MOVRELS reads become select(m == c1, a1, select(m == c2, a2, ... default)) over the
+// index values that FoldImpossibleEquality left. Neighbouring index values often read the same
+// value (registers holding one constant), so over the sorted possible values of m the chain is a
+// few runs. Rebuild it with one m >= start test per run above the first, when that is shorter.
+struct IndexedSelectLink {
+	uint32_t index = 0;
+	Value    value;
+};
+
+bool IndexedSelectLinkOf(const Inst& inst, Value& index, IndexedSelectLink& link) {
+	if (inst.GetOpcode() != ValueOpcode::SelectU32) {
+		return false;
+	}
+	const auto* compare = Arg(inst, 0).TryInstruction();
+	if (compare == nullptr || compare->GetOpcode() != ValueOpcode::IEqual32) {
+		return false;
+	}
+	auto lhs = Arg(*compare, 0);
+	auto rhs = Arg(*compare, 1);
+	if (lhs.IsImmediate()) {
+		std::swap(lhs, rhs);
+	}
+	if (lhs.IsImmediate() || !IsImmediate(rhs, Type::U32) || (!index.IsEmpty() && lhs != index)) {
+		return false;
+	}
+	index = lhs;
+	link  = {.index = rhs.U32(), .value = Arg(inst, 1)};
+	return true;
+}
+
+void CollapseIndexedSelects(const BlockList& blocks, PossibleValues& possible) {
+	std::vector<IndexedSelectLink> links;
+	std::vector<uint32_t>          candidates;
+	for (auto* block: blocks) {
+		for (auto root = block->begin(); root != block->end(); ++root) {
+			Value             index;
+			IndexedSelectLink link;
+			if (!IndexedSelectLinkOf(*root, index, link)) {
+				continue;
+			}
+			// Start at the outermost link: skip a select that is the next link of another.
+			const bool inner = std::ranges::any_of(root->Uses(), [&](const Use& use) {
+				Value             outer_index = index;
+				IndexedSelectLink outer;
+				return use.operand == 2u &&
+				       IndexedSelectLinkOf(*use.user, outer_index, outer);
+			});
+			if (inner) {
+				continue;
+			}
+			links.clear();
+			Value fallback = Value(&*root);
+			for (const Inst* link_inst = &*root;;) {
+				Value             link_index = index;
+				IndexedSelectLink next;
+				if (!IndexedSelectLinkOf(*link_inst, link_index, next)) {
+					break;
+				}
+				links.push_back(next);
+				fallback  = Arg(*link_inst, 2);
+				link_inst = fallback.TryInstruction();
+				if (link_inst == nullptr) {
+					break;
+				}
+			}
+			if (links.size() < 2u || !possible.Find(index, candidates)) {
+				continue;
+			}
+			// The value read for each possible index; the outermost link wins a repeated index.
+			const auto value_of = [&](uint32_t candidate) {
+				const auto found = std::ranges::find(links, candidate, &IndexedSelectLink::index);
+				return found != links.end() ? found->value : fallback;
+			};
+			std::vector<std::pair<uint32_t, Value>> runs;
+			for (const auto candidate: candidates) {
+				const auto value = value_of(candidate);
+				if (runs.empty() || runs.back().second != value) {
+					runs.emplace_back(candidate, value);
+				}
+			}
+			if (runs.size() - 1u >= links.size()) {
+				continue;
+			}
+			// m is always one of the candidates, so m >= start picks the run that starts there
+			// or a later one.
+			Value result = runs.front().second;
+			for (size_t run = 1; run < runs.size(); run++) {
+				const auto at_least = Value(&*block->PrependNewInst(
+				    root, ValueOpcode::UGreaterThanEqual32, {index, Value(runs[run].first)}));
+				result = Value(&*block->PrependNewInst(root, ValueOpcode::SelectU32,
+				                                       {at_least, runs[run].second, result}));
+			}
+			root->ReplaceUsesWith(result);
+		}
+	}
+}
+
 } // namespace
 
 void ConstantPropagationPass(const BlockList& blocks) {
@@ -1050,6 +1148,7 @@ void ConstantPropagationPass(const BlockList& blocks) {
 		}
 	}
 	CollapseSelectChains(blocks);
+	CollapseIndexedSelects(blocks, possible);
 	// Normalize retained PHI/select values only after every supported field read has
 	// been lowered; direct raw consumers remain unsupported.
 	for (auto* source: lowered_ancillary) {

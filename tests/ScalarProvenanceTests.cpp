@@ -626,6 +626,56 @@ void TestMaskedWriteChainsCollapse() {
         "a cross-lane read lost its select, or the false arm was not skipped");
 }
 
+void TestIndexedSelectRunsCollapse() {
+  // A V_MOVRELS read with M0 = field * 5: index 0 reads `first`, 5 reads `five`, 10 reads
+  // `ten`, and 15..35 all read the constant 1.0f.
+  Fixture fixture;
+  const auto user = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto first = fixture.Emit(ValueOpcode::GetUserData,
+                                  {Value(static_cast<ScalarReg>(3))});
+  const auto five = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(4))});
+  const auto ten = fixture.Emit(ValueOpcode::GetUserData,
+                                {Value(static_cast<ScalarReg>(5))});
+  const auto field =
+      fixture.Emit(ValueOpcode::BitFieldUExtract, {user, Value(12u), Value(3u)});
+  const auto index = fixture.Emit(ValueOpcode::IMul32, {field, Value(5u)});
+  auto selected = first;
+  for (uint32_t offset = 1; offset <= 40; offset++) {
+    const auto value = offset == 5u    ? five
+                       : offset == 10u ? ten
+                       : offset >= 15u ? Value(0x3f800000u)
+                                       : Value(offset); // never read
+    const auto match = fixture.Emit(ValueOpcode::IEqual32, {index, Value(offset)});
+    selected = fixture.Emit(ValueOpcode::SelectU32, {match, value, selected});
+  }
+  const auto keep = fixture.Emit(ValueOpcode::ReferenceU32, {selected});
+
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+
+  // Expect select(m >= 15, 1.0, select(m >= 10, ten, select(m >= 5, five, first))).
+  const std::array<std::pair<uint32_t, Value>, 3> runs{
+      {{15u, Value(0x3f800000u)}, {10u, ten}, {5u, five}}};
+  auto value = keep.ResolveInstruction()->Arg(0).Resolve();
+  for (const auto &[start, expected] : runs) {
+    const auto *select = value.ResolveInstruction();
+    Check(select != nullptr && select->GetOpcode() == ValueOpcode::SelectU32,
+          "indexed read was not rebuilt as a run chain");
+    const auto *test = select->Arg(0).ResolveInstruction();
+    Check(test != nullptr && test->GetOpcode() == ValueOpcode::UGreaterThanEqual32 &&
+              test->Arg(0).Resolve() == index.Resolve() && test->Arg(1).Resolve() == Value(start),
+          "indexed read run does not start where expected");
+    Check(select->Arg(1).Resolve() == expected.Resolve(),
+          "indexed read run reads the wrong value");
+    value = select->Arg(2).Resolve();
+  }
+  Check(value == first.Resolve(), "indexed read lost its index-0 value");
+}
+
 void TestControlFlowValueSurvivesReadLaneFolding() {
   Fixture fixture(3);
   auto *entry = fixture.program.blocks[0];
@@ -712,6 +762,7 @@ int main() {
     TestOptimizationPipeline();
     TestImpossibleEqualitiesFold();
     TestMaskedWriteChainsCollapse();
+    TestIndexedSelectRunsCollapse();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestUndefinedRuntimeValueFails();
     std::cout << "TypedValuePlanningTests: all cases passed\n";
