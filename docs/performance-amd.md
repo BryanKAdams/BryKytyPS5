@@ -434,23 +434,8 @@ EXECZ or VCCZ loop exit (the waterfall loops over shadow cascades and light-list
 them unprocessed. The fragment stage now requests the guest's wave size. At a pinned resolution
 (`--gpu-timestamp-scale 200`) GPU busy and per-shader times were unchanged within noise.
 
-**Dead end: per-lane branches for EXEC-masked regions** (the SRT session's
-`exec-region-branching`, reverted). At the same DRS level neither converting every region nor only
-those with memory reads saved GPU time: sand stand-still busy 8.8-9.0 ms off vs 8.9-9.2 ms on,
-overworld +1.5% (`ef31694ed8d87754`) to +5% (`92b1436c8042e396`) with every region converted. An
-earlier "2x resolution" result was the game picking a different DRS level between runs; compare
-GPU-cost changes at `--gpu-timestamp-scale 200` (the DRS floor) and on per-frame milliseconds,
-never microseconds per megapixel across different render areas.
-
-**Where the sand dip is:** even at the DRS floor, walking onto the open sand drops to 28-46 fps.
-In that window `6996d4e234bd5b8e` draws about 1.8 times a frame at about 6.7 ms per draw (2.07
-Mpx), against 0.16 ms per draw at the same area when standing still in the sand. Its loops are
-waterfalls over cascade and tile keys and a walk over each tile's light list, so the likely cause
-is long per-tile lists (built by the light-assignment compute `6216dac0cc17c2d4`), which the SRT
-session is measuring with a list-length heat map.
-
 **Dead end: per-lane branches for EXEC-masked regions.** The IR skips an EXEC-masked region only
-when no lane is enabled, and masks each write with a select. A pass (a953539d, reverted) turned
+when no lane is enabled, and masks each write with a select. A pass (6edd3cac, reverted) turned
 provably safe regions in pixel shaders into branches on each lane's own EXEC bit: 44-52 of about
 300 permutations changed, spirv-val clean, and on the RX 9070 XT the hot lighting shaders lost up
 to 9 VGPRs and 1-4% of their instructions. At a pinned resolution (`--gpu-timestamp-scale 200`
