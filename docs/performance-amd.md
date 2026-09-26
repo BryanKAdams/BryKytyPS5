@@ -129,18 +129,23 @@ validated by this patch set.
   (`01d6f21611218e74`) now recompiles in 141 ms instead of 386 ms. This is paid on every first
   encounter and again by the boot-time journal replay.
 
-- **Branch-free bounds-checked loads:** every buffer, LDS and constant-buffer dword load sat in a
-  branch on its bounds check, itself inside the EXEC branch. An out-of-bounds lane now reads
-  element 0 and selects zero (or the format's out-of-bounds value), which is what the branch
-  gave; stores and atomics keep their branches. The AMD compiler's cost follows control flow far
-  more than SPIR-V size: `vkCreateComputePipelines` for `900aba8df9448d3d` fell from 1397 to
-  1182 ms with 541 instead of 1129 conditional branches but only 3% fewer words. Merging
-  duplicate pure instructions (6% fewer words) saved only 1-2% and was dropped. The big gameplay
-  pixel shaders lose 80-85% of their branches (`4a6940ae373ad4e6` 339 to 68). All 591
-  permutations of two Astro Bot journals pass `spirv-val`. The remaining branches in compute and
-  mesh shaders mostly guard storage stores (181 in `01d6f21611218e74`, 249-307 in the big mesh
-  shaders). Making those branch-free needs `robustBufferAccess2` to be known when compiling, so
-  that an out-of-range store is discarded.
+- **Branch-free storage-buffer loads:** every buffer and constant-buffer dword load sat in a
+  branch on its bounds check, itself inside the EXEC branch. The load is now issued at its own
+  index and only its value is replaced (zero, or the format's out-of-bounds value), which is what
+  the branch gave. The device always enables `robustBufferAccess`, so an out-of-bounds load is
+  harmless. LDS, scratch, stores, atomics and buffer-device-address loads keep their branches.
+  The AMD compiler's cost follows control flow far more than SPIR-V size: merging duplicate pure
+  instructions cut 6% of the words but only 1-2% of `vkCreateComputePipelines` and was dropped,
+  while removing the bounds branches cut `900aba8df9448d3d` from 1397 to about 1180 ms. A first
+  version clamped the index instead (`load(in ? index : 0)`). That blocked constant-offset
+  folding into `s_buffer_load`/`buffer_load`, and warm GPU zones measured `ef31694ed8d87754`
+  17.8% slower per pixel. Keeping the address fixed it. The adopted form (b3ffaa5f), measured in
+  cold new-game runs with matched pipelines: graphics pipeline creation 15.2 to 13.0 s (-14%),
+  compute 5.87 to 5.40 s (-8%), worst frame 3.8 to 3.3 s. Warm, standing still at the Crash Site
+  start: GPU busy unchanged (10.54 vs 10.55 ms), and every zoned shader was 3.8-16% cheaper per
+  pixel (`5a10a907c8a64fc4` -9.5%, `969c5ed15d14c8fe` -10.1%). The remaining branches in compute
+  and mesh shaders mostly guard stores: 181 storage stores in `01d6f21611218e74`, and 249-307
+  LDS stores in the big mesh shaders.
 
 The dense evaluator, retained resource snapshots, and replacement of the old SRT readability path
 were already present at the base revision. Their historical PR improvements are not additional gains

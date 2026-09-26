@@ -1021,13 +1021,25 @@ encounter. The recompile also repeats at boot for every journal record. Measured
     (1397 to 1096 ms; `01d6f2` 964 to 798 ms).
   - Also dropping the EXEC branch around loads gave a further 13% on `900aba` but was 10% worse
     on `01d6f2`, and it changes what inactive lanes read. Not pursued.
-  - The committed form (6820afbd) is the exact select version: 1397 to 1182 ms. `min(index,
-    length)` alone is not exact, because a range that is not a multiple of 4 is rounded up by
-    `robustBufferAccess2`, so dword `length` can be partly in range.
-- **Storage stores** keep their bounds branches: 181 in `01d6f2` and 249-307 in the big mesh
-  shaders. A branch-free store needs an index that is guaranteed out of range (for example
-  0x3FFFFFFF) and a discard guarantee, which only `robustBufferAccess2` gives. That means passing
-  the device feature into the recompiler.
+  - `min(index, length)` alone is not exact, because a range that is not a multiple of 4 is
+    rounded up by `robustBufferAccess2`, so dword `length` can be partly in range.
+  - 6820afbd used `v = load(in ? index : 0); in ? v : 0`. The cold A/B improved (graphics
+    pipelines -9%), but warm GPU zones regressed: `ef31694e` +17.8% µs/Mpx, `5a10a907` +6.2%,
+    `969c5ed1` +4.3%. `ef31694e`'s only bounds-checked loads are 94 scalar constant-buffer reads.
+    The selected address blocks AMD's constant-offset folding (`offset:imm`) and neighbour
+    merging.
+  - b3ffaa5f loads at the untouched index (`in ? load(index) : 0`, safe because
+    `robustBufferAccess` is always on) and keeps the branch for LDS and scratch. Warm: every
+    zoned shader was 3.8-16% cheaper and GPU busy was unchanged. Cold: graphics 15.2 to 13.0 s,
+    compute 5.87 to 5.40 s. Adopted.
+  - A "yellow sand" run during this A/B came from the perf session's mesh pipeline libraries:
+    a baseline run showed it too. Compare screenshots across all runs before blaming a change.
+- **Stores** keep their bounds branches: 181 storage stores in `01d6f2`, and 249-307 LDS stores in
+  the big mesh shaders. A branch-free storage store needs an index that is guaranteed out of
+  range (for example 0x3FFFFFFF) and a discard guarantee, which only `robustBufferAccess2`
+  gives, so the device feature would have to reach the recompiler. LDS stores could go to one
+  extra "discard" dword past the guest's LDS size when the host limit allows. Both change GPU
+  code, so both need the same warm-zone gate.
 
 ### Texture-cache lookups
 
