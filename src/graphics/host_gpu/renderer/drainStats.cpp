@@ -41,6 +41,8 @@ struct Snapshot {
 };
 
 Cell                  g_cells[CellCount];
+// Everything recorded since the last new game frame, by kind, for the hitch report.
+Cell                  g_frame_cells[KindCount];
 std::atomic<uint64_t> g_frames {0};
 std::atomic<uint64_t> g_presents {0};
 // Time between new game frames: one bucket per millisecond, the last collects the rest.
@@ -119,6 +121,8 @@ const char* KindName(Kind kind) {
 		case Kind::OcclusionQuery: return "occlusion-query";
 		case Kind::OcclusionPredicate: return "occlusion-pred";
 		case Kind::GpuTimestamp: return "gpu-timestamp";
+		case Kind::ShaderCompile: return "shader-compile";
+		case Kind::PipelineCreate: return "pipeline-create";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -335,7 +339,9 @@ bool IsTimeKind(Kind kind) {
 		case Kind::Submit:
 		case Kind::GpuBusy:
 		case Kind::GpuGap:
-		case Kind::QueueLockWait: return true;
+		case Kind::QueueLockWait:
+		case Kind::ShaderCompile:
+		case Kind::PipelineCreate: return true;
 		default: return false;
 	}
 }
@@ -507,6 +513,9 @@ void Record(Kind kind, Reason reason, uint32_t pm4_op, uint64_t value) noexcept 
 	auto& cell = g_cells[Index(kind, reason, pm4_op)];
 	cell.count.fetch_add(1, std::memory_order_relaxed);
 	cell.value.fetch_add(value, std::memory_order_relaxed);
+	auto& frame = g_frame_cells[static_cast<size_t>(kind)];
+	frame.count.fetch_add(1, std::memory_order_relaxed);
+	frame.value.fetch_add(value, std::memory_order_relaxed);
 }
 
 void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noexcept {
@@ -572,6 +581,44 @@ void RecordZones(const ZoneSample* samples, size_t count) noexcept {
 	}
 }
 
+namespace {
+
+// A new game frame took `ms`. Frames of 50 ms or more (a hitch of three or more refreshes) print
+// what was recorded during them; every frame then starts a new accumulation.
+void ReportHitch(int64_t ms) noexcept {
+	constexpr int64_t HitchMs       = 50;
+	constexpr size_t  MaxHitchLines = 400;
+	static size_t     printed       = 0;
+	std::array<uint64_t, KindCount> counts {};
+	std::array<uint64_t, KindCount> values {};
+	for (size_t kind = 0; kind < KindCount; kind++) {
+		counts[kind] = g_frame_cells[kind].count.exchange(0, std::memory_order_relaxed);
+		values[kind] = g_frame_cells[kind].value.exchange(0, std::memory_order_relaxed);
+	}
+	if (ms < HitchMs || printed >= MaxHitchLines) {
+		return;
+	}
+	printed++;
+	std::string text = fmt::format("hitch: frame {} took {} ms:", g_frames.load(), ms);
+	for (size_t kind = 0; kind < KindCount; kind++) {
+		if (counts[kind] == 0) {
+			continue;
+		}
+		const auto k = static_cast<Kind>(kind);
+		if (IsTimeKind(k)) {
+			text += fmt::format(" {} n={} {:.1f}ms", KindName(k), counts[kind],
+			                    static_cast<double>(values[kind]) / 1e6);
+		} else if (k == Kind::Readback) {
+			text += fmt::format(" {} n={} {:.1f}MiB", KindName(k), counts[kind],
+			                    static_cast<double>(values[kind]) / (1024.0 * 1024.0));
+		}
+	}
+	text += '\n';
+	Log::WriteToConsoleAndLog(text);
+}
+
+} // namespace
+
 void CountFrame(bool new_frame) noexcept {
 	if (!Enabled()) {
 		return;
@@ -586,6 +633,7 @@ void CountFrame(bool new_frame) noexcept {
 			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
 			g_frame_ms[static_cast<size_t>(std::clamp<int64_t>(ms, 0, FrameBuckets - 1))]
 			    .fetch_add(1, std::memory_order_relaxed);
+			ReportHitch(ms);
 		}
 		last = now;
 	}

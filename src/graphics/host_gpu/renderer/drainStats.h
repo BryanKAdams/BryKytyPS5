@@ -54,6 +54,8 @@ enum class Kind : uint8_t {
 	OcclusionQuery,     // A ZPASS_DONE occlusion-counter dump.
 	OcclusionPredicate, // SET_PREDICATION on occlusion results.
 	GpuTimestamp,       // A GPU timestamp write (RELEASE_MEM/EOP or COPY_DATA of the clock).
+	ShaderCompile,      // Shader lookup that took at least 1 ms (a new permutation), in ns.
+	PipelineCreate,     // Pipeline lookup that took at least 1 ms (a new pipeline), in ns.
 	Count,
 };
 
@@ -150,6 +152,34 @@ public:
 
 private:
 	uint32_t m_previous;
+};
+
+// Times a lookup that is usually a cache hit and records it only when it took at least 1 ms,
+// i.e. it compiled something. Costs one relaxed load when drain stats are off.
+class SlowLookupTimer final {
+public:
+	explicit SlowLookupTimer(Kind kind) noexcept: m_kind(kind), m_enabled(Enabled()) {
+		if (m_enabled) {
+			m_start = std::chrono::steady_clock::now();
+		}
+	}
+	~SlowLookupTimer() {
+		if (m_enabled) {
+			const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                    std::chrono::steady_clock::now() - m_start)
+			                    .count();
+			if (ns >= 1000000) {
+				Record(m_kind, t_reason, t_pm4_op, static_cast<uint64_t>(ns));
+			}
+		}
+	}
+	SlowLookupTimer(const SlowLookupTimer&)            = delete;
+	SlowLookupTimer& operator=(const SlowLookupTimer&) = delete;
+
+private:
+	std::chrono::steady_clock::time_point m_start {};
+	Kind                                  m_kind;
+	bool                                  m_enabled;
 };
 
 // Times one blocking wait. Construct it only on the path that actually blocks.

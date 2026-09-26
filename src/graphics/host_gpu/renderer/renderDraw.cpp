@@ -878,6 +878,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
@@ -1095,10 +1096,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
 	// Target acquisition resolves the actual overlapping read/write aspects for this draw.
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs, feedback_aspects);
+	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
+		DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
+		return m_context.GetPipelineCache().GetGraphicsPipeline(
+		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
+		    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+		    state.programs, feedback_aspects);
+	}();
 
 	// Mesh shaders load their draw parameters from a record by address (see
 	// EmitMeshDrawParameter). Write each slice's record now: the ring can wait and restart the

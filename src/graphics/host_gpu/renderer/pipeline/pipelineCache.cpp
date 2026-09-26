@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -188,6 +189,59 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 } // namespace
 
+// KYTY_PERMUTATION_LOG=1 (diagnostic): describe why each runtime-compiled permutation is new.
+[[nodiscard]] static bool PermutationLogEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERMUTATION_LOG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// The first few fields in which two specializations differ, e.g. "img[2].mip_count 1->12".
+[[nodiscard]] static std::string
+SpecializationDiff(const ShaderRecompiler::IR::ResourceSpecialization& a,
+                   const ShaderRecompiler::IR::ResourceSpecialization& b) {
+	std::string text;
+	size_t      shown = 0;
+	const auto  add   = [&](const char* kind, size_t index, const char* field, uint64_t from,
+                         uint64_t to) {
+        if (from != to && shown++ < 6) {
+            text += fmt::format(" {}[{}].{} {}->{}", kind, index, field, from, to);
+        }
+	};
+	if (a.buffers.size() != b.buffers.size() || a.images.size() != b.images.size()) {
+		return fmt::format(" counts buffers {}->{} images {}->{}", a.buffers.size(),
+		                   b.buffers.size(), a.images.size(), b.images.size());
+	}
+	for (size_t i = 0; i < a.buffers.size(); i++) {
+		const auto& x = a.buffers[i];
+		const auto& y = b.buffers[i];
+		add("buf", i, "stride", x.packed_stride, y.packed_stride);
+		add("buf", i, "format", static_cast<uint64_t>(x.descriptor_format),
+		    static_cast<uint64_t>(y.descriptor_format));
+		add("buf", i, "swizzle", x.descriptor_swizzle, y.descriptor_swizzle);
+	}
+	for (size_t i = 0; i < a.images.size(); i++) {
+		const auto& x = a.images[i];
+		const auto& y = b.images[i];
+		add("img", i, "class", static_cast<uint64_t>(x.numeric_class),
+		    static_cast<uint64_t>(y.numeric_class));
+		add("img", i, "dim", static_cast<uint64_t>(x.dimension), static_cast<uint64_t>(y.dimension));
+		add("img", i, "mip_count", x.mip_count, y.mip_count);
+		add("img", i, "conversion", static_cast<uint64_t>(x.conversion_format),
+		    static_cast<uint64_t>(y.conversion_format));
+		add("img", i, "swizzle", x.shader_swizzle, y.shader_swizzle);
+		add("img", i, "indirect_root", x.indirect_root, y.indirect_root);
+		add("img", i, "indirect_offset", x.indirect_mapping_offset, y.indirect_mapping_offset);
+		add("img", i, "indirect_iterations", x.indirect_search_iterations,
+		    y.indirect_search_iterations);
+		add("img", i, "cube", x.cube ? 1u : 0u, y.cube ? 1u : 0u);
+		add("img", i, "fmask", x.fmask ? 1u : 0u, y.fmask ? 1u : 0u);
+	}
+	return text.empty() ? " (same specialization)" : text;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -269,6 +323,11 @@ struct PipelineCache::ProgramCache {
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
+		if (PermutationLogEnabled()) [[unlikely]] {
+			std::printf("spirv: id=%llu %s hash=%016llx words=%zu\n",
+			            static_cast<unsigned long long>(next_shader_id + 1), stage_name,
+			            static_cast<unsigned long long>(options.shader_hash), result.spirv.size());
+		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -342,6 +401,10 @@ struct PipelineCache::ProgramCache {
 				permutation.program.bindings.AdvancePushData(push_data_cursor);
 				return permutation.handle;
 			}
+		}
+
+		if (PermutationLogEnabled()) [[unlikely]] {
+			LogNewPermutation(stage, params.hash, entry, push_data_cursor);
 		}
 
 		ShaderStageInputInfo stage_input {};
@@ -423,6 +486,58 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
+	}
+
+	// KYTY_PERMUTATION_LOG: why this lookup compiles: a new shader, a new static state of a
+	// known one (and which static words differ), or a new specialization of a known source.
+	template <typename Iterator>
+	void LogNewPermutation(ShaderType stage, uint64_t hash, Iterator entry,
+	                       uint32_t push_data_cursor) {
+		std::string reason;
+		if (entry != programs.end() && !entry->second.permutations.empty()) {
+			const auto& source = entry->second;
+			const auto& last   = source.permutations.back();
+			reason = fmt::format(" new specialization ({} existing):", source.permutations.size()) +
+			         SpecializationDiff(last.specialization, source.specialization);
+			const auto start = ShaderRecompiler::IR::PushData::StartFor(
+			    push_data_cursor, last.program.bindings.ShaderDataDwords());
+			if (last.program.bindings.push_data_start_dword != start) {
+				reason += fmt::format(" push_start {}->{}", last.program.bindings.push_data_start_dword,
+				                      start);
+			}
+		} else {
+			const ProgramKey* other = nullptr;
+			size_t            same  = 0;
+			for (const auto& [key, source]: programs) {
+				if (key.hash == hash && key.stage == stage && !(key == lookup_key)) {
+					other = &key;
+					same++;
+				}
+			}
+			if (other == nullptr) {
+				reason = " new shader";
+			} else {
+				reason = fmt::format(" new static state ({} other keys):", same);
+				const auto& a = other->static_state;
+				const auto& b = lookup_key.static_state;
+				if (a.size() != b.size()) {
+					reason += fmt::format(" words {}->{}", a.size(), b.size());
+				}
+				size_t shown = 0;
+				for (size_t i = 0; i < std::min(a.size(), b.size()) && shown < 6; i++) {
+					if (a[i] != b[i]) {
+						reason += fmt::format(" w[{}] {:#x}->{:#x}", i, a[i], b[i]);
+						shown++;
+					}
+				}
+				if (other->user_data_count != lookup_key.user_data_count) {
+					reason += fmt::format(" user_data {}->{}", other->user_data_count,
+					                      lookup_key.user_data_count);
+				}
+			}
+		}
+		std::printf("permutation: stage=%u hash=%016llx%s\n", static_cast<uint32_t>(stage),
+		            static_cast<unsigned long long>(hash), reason.c_str());
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
@@ -995,8 +1110,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto create_start = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
+	if (PermutationLogEnabled()) [[unlikely]] {
+		std::printf("pipeline: vs=%llu ps=%llu ms=%.1f\n", static_cast<unsigned long long>(vs_id),
+		            static_cast<unsigned long long>(ps_id),
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+		                                                      create_start)
+		                .count());
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1026,8 +1149,16 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto cached = std::make_unique<Pipeline>();
+	auto       cached       = std::make_unique<Pipeline>();
+	const auto create_start = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	if (PermutationLogEnabled()) [[unlikely]] {
+		std::printf("pipeline: cs=%llu ms=%.1f\n",
+		            static_cast<unsigned long long>(compute_program.id),
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+		                                                      create_start)
+		                .count());
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

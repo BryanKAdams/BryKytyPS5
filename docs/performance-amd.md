@@ -311,6 +311,28 @@ d-pad. It applies immediately and is saved to `kyty_settings.ini`. Esc, F2, circ
 the panel, and the game gets no input while it is open. After a live change, Astro Bot took about
 20-25 s to step its resolution down and settle at a flat 60.
 
+## First-use stutter (pipeline compiles)
+
+`--drain-stats` prints a `hitch:` line for every game frame of 50 ms or more, listing what was
+recorded during it: waits, submits, readbacks, `shader-compile` (a shader lookup of 1 ms or more,
+i.e. a new permutation translated) and `pipeline-create` (a pipeline lookup of 1 ms or more).
+`KYTY_PERMUTATION_LOG=1` also prints why each runtime-translated permutation is new (a new
+shader, a new static state and which words differ, or a new specialization and which fields
+differ), each module's SPIR-V size (`spirv: id= … words=`), and each pipeline's creation time
+(`pipeline: vs= ps= ms=` / `pipeline: cs= ms=`).
+
+Loading the crash-site save with empty caches, the game froze for up to 11 s in one frame. Of
+the 22.5 s of stalls, almost all was the driver (26.6.4 LLPC) creating 124 pipelines at about
+190 ms each, one after another on Thread_Gpu. Our own translation of the 147 permutations took
+about 2.2 s. `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` made no difference (189 vs 194 ms per
+pipeline, same GPU time), so this driver ignores it. Compile time tracks SPIR-V size (median
+module 11k words, p90 61k, largest 184k; the 1.0-1.4 s pipelines hold 90k-184k-word modules), and
+the same stage is compiled again in every pipeline that uses it (compiling each unique stage
+once would compile 64% of the words). Later sessions keep the driver cache and replay the
+shader journal, so known pipelines are cheap. Their stalls come from shaders never seen in any
+earlier session: the same idle 45 s at the crash site met 147, 57 and 24 new permutations in
+three sessions, and none of the later ones had appeared before.
+
 ## Settings file
 
 `kyty_settings.ini` in the working directory holds default options, one per line, named like the

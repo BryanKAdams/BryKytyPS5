@@ -255,8 +255,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	const auto compute_program = [&] {
+		DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
+		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	}();
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
@@ -365,8 +367,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
+		DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
+		return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	}();
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
@@ -418,14 +422,20 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	const auto compute_program = [&] {
+		DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
+		return m_context.GetPipelineCache().GetComputeProgram(
+		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	}();
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
 	}
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
+		DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
+		return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	}();
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
