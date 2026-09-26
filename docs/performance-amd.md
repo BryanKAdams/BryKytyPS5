@@ -212,6 +212,16 @@ Strips (which could need a primitive restart scan) and 8-bit indices keep the CP
 on the sand, frames went from GPU and CPU in series to GPU-bound (35-48 fps, busy up to 19 ms,
 gaps 6-10 ms).
 
+**Uniform V_READFIRSTLANE (the SRT session's 7c38c759):** the lighting pixel shaders' light-list
+waterfall read its key with a subgroup shuffle, which the AMD compiler lowers to ds_bpermute and
+treats as divergent, so per-light loads, the key math and the list walk ran per lane. Taking the
+first lane of the shuffled value makes it uniform (v_readfirstlane into an SGPR): 96 vector
+buffer loads became 1, and VGPRs fell 134 to 128 (969c5ed1), 177 to 139 (5a10a907) and 140 to 120
+(9d7e6bca). Warm, standing still at the start of play (two alternating rounds): 9d7e6bca 177.6 to
+147.0 us/Mpx (-17%), 5a10a907 -4%, GPU busy flat (10.97 to 10.94 ms). Shaders whose SPIR-V did
+not change moved by up to 6% between the sides, the noise band for this view; 6996d4e2, the sand
+shader, showed no change beyond it.
+
 The planet in the overworld shows blotchy dark patches and the background a fine dot pattern.
 Upstream `main` (5a705dd) renders the same artifacts, so they predate this branch.
 
