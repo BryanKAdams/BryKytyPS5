@@ -26,6 +26,7 @@ struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
+class PipelineLibraryCache;
 
 namespace ShaderPrecompile {
 struct PermutationRecord;
@@ -139,8 +140,17 @@ public:
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
+		// Set 0: a compute shader's descriptors, or a graphics pipeline's vertex-side stages.
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Set 1 of graphics pipelines: the pixel shader's descriptors. Each set depends on its own
+		// stages only, so a stage's descriptor layout is the same in every pipeline that uses it.
+		vk::DescriptorSetLayout pixel_set_layout      = nullptr;
+		bool                    pixel_uses_push       = false;
+		// The push constant range's stages; empty means the stages of the bound shaders.
+		vk::ShaderStageFlags    push_constant_stages {};
+		// Fast-linked from pipeline libraries, with a link-time-optimized link still to swap in.
+		bool                    optimize_pending      = false;
 	};
 
 	struct GraphicsPrograms {
@@ -239,6 +249,7 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	std::unique_ptr<PipelineLibraryCache> m_libraries;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -249,19 +260,23 @@ private:
 
 	void InitializeDriverCache();
 	void InitializeShaderPrecompile();
+	void InstallOptimizedPipeline(Pipeline& pipeline, CommandBuffer& command);
 	void WaitForPrecompile();
 	void ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationRecord> records);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const PipelineRenderingState&          rendering,
-                            const PipelineVertexInputState&        vertex_input,
-                            std::span<const ShaderVertexInputInfo> vertex_info,
-                            const ShaderPixelInputInfo*            ps_input_info,
-                            const PipelineCache::GraphicsPrograms& programs,
-                            const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
+// Creates a graphics pipeline, from pipeline-library parts when `libraries` is given and the
+// pipeline qualifies. Returns -1 for a monolithic pipeline, otherwise a bit per library part it
+// compiled (vertex input, pre-rasterization, fragment shader, fragment output).
+int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                           const PipelineRenderingState&          rendering,
+                           const PipelineVertexInputState&        vertex_input,
+                           std::span<const ShaderVertexInputInfo> vertex_info,
+                           const ShaderPixelInputInfo*            ps_input_info,
+                           const PipelineCache::GraphicsPrograms& programs,
+                           const PipelineStaticParameters&        static_params,
+                           PipelineLibraryCache* libraries, vk::PipelineCache driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

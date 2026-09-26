@@ -961,10 +961,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_buffers.reserve(descriptor_count);
 	m_descriptor_images.reserve(descriptor_count);
 	m_descriptor_writes.reserve(write_count);
+	size_t pixel_write_start = write_count;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
 		auto&       descriptors   = *prepared;
+		// The pixel stage comes last, so its writes form the tail committed to set 1.
+		EXIT_IF(pixel_write_start != write_count);
+		if (ShaderRecompiler::IR::NativeDescriptorSet(program.stage) != 0) {
+			pixel_write_start = m_descriptor_writes.size();
+		}
 		const auto  shader_stage  = NativeShaderStage(program.stage);
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);
 		if (descriptors.gds.buffer != nullptr) {
@@ -1108,28 +1114,40 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (has_push_data) {
+		// The stages must match the layout's push constant range exactly.
+		if (pipeline.push_constant_stages) {
+			push_stages = pipeline.push_constant_stages;
+		}
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
 	}
 
-	if (!m_descriptor_writes.empty()) {
-		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
-		if (pipeline.uses_push_descriptors) {
-			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
-		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
-			for (auto& write: m_descriptor_writes) {
-				write.dstSet = set;
-			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
-			                             0, nullptr);
+	const auto commit_set = [&](uint32_t set_index, vk::DescriptorSetLayout layout, bool push,
+	                            std::span<vk::WriteDescriptorSet> writes) {
+		if (writes.empty()) {
+			return;
 		}
-	}
+		EXIT_IF(layout == nullptr);
+		if (push) {
+			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, set_index,
+			                               static_cast<uint32_t>(writes.size()), writes.data());
+			return;
+		}
+		const auto set = m_context.GetDescriptorHeap().Commit(layout);
+		for (auto& write: writes) {
+			write.dstSet = set;
+		}
+		m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
+		                                                    writes.data(), 0, nullptr);
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, set_index, 1,
+		                             &set, 0, nullptr);
+	};
+	// Set 0 holds compute or vertex-side descriptors; the pixel shader's tail goes to set 1.
+	std::span<vk::WriteDescriptorSet> writes(m_descriptor_writes);
+	commit_set(0, pipeline.descriptor_set_layout, pipeline.uses_push_descriptors,
+	           writes.first(pixel_write_start));
+	commit_set(1, pipeline.pixel_set_layout, pipeline.pixel_uses_push,
+	           writes.subspan(pixel_write_start));
 }
 
 } // namespace Libs::Graphics

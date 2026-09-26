@@ -310,6 +310,12 @@ struct PushData {
 static_assert(sizeof(PushData) == 128);
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 
+// Pixel shaders use descriptor set 1 and every other stage set 0, so a graphics pipeline's
+// vertex-side and pixel descriptor layouts are independent of each other.
+[[nodiscard]] constexpr uint32_t NativeDescriptorSet(ShaderType stage) {
+	return stage == ShaderType::Pixel ? 1u : 0u;
+}
+
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
 	const uint32_t group = stage == ShaderType::Pixel                    ? 1u
 	                       : stage == ShaderType::TessellationControl    ? 2u

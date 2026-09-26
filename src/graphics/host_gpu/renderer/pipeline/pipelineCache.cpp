@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -593,9 +594,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	InitializeShaderPrecompile();
+	// Linking libraries without fast linking costs about as much as a full compile.
+	if (m_graphics.pipeline_library_enabled && m_graphics.pipeline_library_fast_linking) {
+		m_libraries = std::make_unique<PipelineLibraryCache>(m_graphics, m_driver_cache);
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	// Save also stops the pipeline-library link thread. Pipelines linked from the libraries are
+	// destroyed below, and the libraries after them.
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -603,10 +610,14 @@ PipelineCache::~PipelineCache() {
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
+			if (pipeline->pixel_set_layout != nullptr) {
+				m_graphics.device.destroyDescriptorSetLayout(pipeline->pixel_set_layout, nullptr);
+			}
 		}
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	m_libraries.reset();
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -798,6 +809,10 @@ void PipelineCache::Save() {
 	// Join before acquiring the cache mutex or destroying the driver cache. This also covers
 	// the WindowRun shutdown path, which calls Save before the PipelineCache destructor.
 	WaitForPrecompile();
+	if (m_libraries != nullptr) {
+		// The link thread writes to the driver cache, which is saved and destroyed below.
+		m_libraries->Stop();
+	}
 	Common::LockGuard lock(m_mutex);
 	m_program_cache->recording.Close();
 	if (m_driver_cache == nullptr) {
@@ -1095,7 +1110,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		auto& found = *iter->second;
+		if (found.optimize_pending) [[unlikely]] {
+			InstallOptimizedPipeline(found, command);
+		}
+		return found;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1111,14 +1130,29 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	const auto create_start = std::chrono::steady_clock::now();
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	const int library_parts =
+	    CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+	                           ps_input_info, programs, static_params, m_libraries.get(),
+	                           m_driver_cache);
 	if (PermutationLogEnabled()) [[unlikely]] {
-		std::printf("pipeline: vs=%llu ps=%llu ms=%.1f\n", static_cast<unsigned long long>(vs_id),
-		            static_cast<unsigned long long>(ps_id),
+		// "libs=" lists the library parts compiled: vertex input, pre-rasterization, fragment
+		// shader, fragment output ("-" when all were cached); "mono" is a monolithic pipeline.
+		char parts[5] = "-";
+		if (library_parts > 0) {
+			uint32_t length = 0;
+			for (uint32_t bit = 0; bit < 4; bit++) {
+				if ((library_parts & (1 << bit)) != 0) {
+					parts[length++] = "VPFO"[bit];
+				}
+			}
+			parts[length] = '\0';
+		}
+		std::printf("pipeline: vs=%llu ps=%llu ms=%.1f libs=%s\n",
+		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id),
 		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
 		                                                      create_start)
-		                .count());
+		                .count(),
+		            library_parts < 0 ? "mono" : parts);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -1129,6 +1163,22 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(!inserted);
 
 	return *iter->second;
+}
+
+void PipelineCache::InstallOptimizedPipeline(Pipeline& pipeline, CommandBuffer& command) {
+	const auto optimized = m_libraries->TakeOptimized(&pipeline);
+	if (!optimized) {
+		return;
+	}
+	pipeline.optimize_pending = false;
+	if (*optimized == nullptr) {
+		return;
+	}
+	// Commands recorded before this draw may still use the fast-linked pipeline.
+	const auto fast_linked = pipeline.pipeline;
+	pipeline.pipeline      = *optimized;
+	command.GetContext().GetCommandScheduler().DeferOperation(
+	    [device = m_graphics.device, fast_linked] { device.destroyPipeline(fast_linked, nullptr); });
 }
 
 PipelineCache::Pipeline&

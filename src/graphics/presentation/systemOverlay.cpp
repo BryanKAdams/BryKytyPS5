@@ -1075,6 +1075,20 @@ struct SystemOverlay::Impl {
 		    "resolution. Astro Bot holds a steady 60 from 115%%.");
 		ImGui::PopTextWrapPos();
 		ImGui::Separator();
+
+		bool libraries = Config::PipelineLibrariesEnabled();
+		if (ImGui::Checkbox("Pipeline libraries", &libraries)) {
+			Config::SetPipelineLibrariesEnabled(libraries);
+			settings_save_failed = !Common::SettingsFile::Save("pipeline-libraries",
+			                                                   libraries ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "Builds new graphics pipelines from separately compiled parts that later pipelines "
+		    "reuse, so effects seen for the first time stall the game for less time. Applies to "
+		    "pipelines built from now on, on GPU drivers with fast pipeline-library linking.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
 		if (settings_save_failed) {
 			ImGui::TextColored({1.0f, 0.5f, 0.4f, 1.0f}, "Could not save %s",
 			                   Common::SettingsFile::FileName);

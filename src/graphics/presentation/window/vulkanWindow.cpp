@@ -569,6 +569,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		conditional_rendering.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &conditional_rendering;
 	}
+	const bool pipeline_library_extension =
+	    HasExtension(device_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT pipeline_library {};
+	if (pipeline_library_extension) {
+		pipeline_library.pNext    = supported_features2.pNext;
+		supported_features2.pNext = &pipeline_library;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 
@@ -603,6 +611,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
+	graphics.pipeline_library_enabled =
+	    pipeline_library_extension && pipeline_library.graphicsPipelineLibrary;
+	if (graphics.pipeline_library_enabled) {
+		vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT library_properties {};
+		vk::PhysicalDeviceProperties2                          library_properties2 {};
+		library_properties2.pNext = &library_properties;
+		physical_device.getProperties2(&library_properties2);
+		graphics.pipeline_library_fast_linking =
+		    library_properties.graphicsPipelineLibraryFastLinking == VK_TRUE;
+	}
+	LOGF("Vulkan graphics pipeline library: %s fast_linking=%s\n",
+	     graphics.pipeline_library_enabled ? "true" : "false",
+	     graphics.pipeline_library_fast_linking ? "true" : "false");
 	LOGF("Vulkan conditional rendering: %s\n",
 	     graphics.conditional_rendering_enabled ? "true" : "false");
 	graphics.attachment_feedback_loop_enabled =
@@ -703,6 +724,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		conditional_rendering.pNext                         = const_cast<void*>(create_info.pNext);
 		conditional_rendering.inheritedConditionalRendering = VK_FALSE;
 		create_info.pNext                                   = &conditional_rendering;
+	}
+	if (graphics.pipeline_library_enabled) {
+		pipeline_library.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext      = &pipeline_library;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1069,7 +1094,9 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
-		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+		                             VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
+		                             VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

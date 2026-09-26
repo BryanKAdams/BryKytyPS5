@@ -190,6 +190,18 @@ void SetGpuTimestampScalePercent(uint32_t percent) {
 	                                     std::memory_order_relaxed);
 }
 
+// A runtime change from the settings panel: -1 means the configured value.
+static std::atomic<int> g_pipeline_libraries_override {-1};
+
+bool PipelineLibrariesEnabled() {
+	const auto enabled = g_pipeline_libraries_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->pipeline_libraries_enabled;
+}
+
+void SetPipelineLibrariesEnabled(bool enabled) {
+	g_pipeline_libraries_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {

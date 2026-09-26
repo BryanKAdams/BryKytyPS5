@@ -79,6 +79,7 @@ struct ConfigOptions {
 	uint32_t               gpu_frames_ahead            = 0;
 	uint32_t               label_flush_interval_us     = 2000;
 	uint32_t               gpu_timestamp_scale_percent = 100;
+	bool                   pipeline_libraries_enabled  = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -143,6 +144,11 @@ uint32_t GetLabelFlushIntervalUs();
 uint32_t GetGpuTimestampScalePercent();
 // Changes it while running (the settings panel); takes effect at the next timestamp.
 void     SetGpuTimestampScalePercent(uint32_t percent);
+// Build new graphics pipelines from separately compiled, cached parts (pipeline libraries) where
+// the GPU driver supports it, so a new pipeline stalls for less time.
+bool PipelineLibrariesEnabled();
+// Changes it while running (the settings panel); applies to pipelines created afterwards.
+void SetPipelineLibrariesEnabled(bool enabled);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

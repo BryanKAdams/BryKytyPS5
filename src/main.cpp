@@ -99,6 +99,8 @@ static void PrintUsage() {
 	         "Default: 2000.\n");
 	::printf("  --gpu-timestamp-scale <100-200>      Stretch GPU time the game measures, in "
 	         "percent, so dynamic resolution keeps headroom. Default: 100 (off).\n");
+	::printf("  --pipeline-libraries <true|false>    Build new graphics pipelines from cached, "
+	         "separately compiled parts where the driver supports it. Default: true.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -436,6 +438,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.gpu_timestamp_scale_percent = percent;
+		} else if (arg == "--pipeline-libraries") {
+			if (!ParseBool(value, options.config.pipeline_libraries_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--async-submit") {
 			if (!ParseBool(value, options.config.async_submit_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
