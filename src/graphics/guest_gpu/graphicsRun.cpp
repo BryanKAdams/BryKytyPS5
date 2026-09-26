@@ -940,7 +940,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			execution.m_next_buffer = {};
 		}
 		if (draw) {
-			if (m_lookahead_draws_left > 0) {
+			if (m_lookahead_rewalk && LookaheadWorkFinished()) {
+				RunPipelineLookahead(execution);
+			} else if (m_lookahead_draws_left > 0) {
 				m_lookahead_draws_left--;
 			} else if (pipelines.GraphicsPipelinesCreated() + pipelines.ComputePipelinesCreated() !=
 			           pipelines_before) {
@@ -964,11 +966,27 @@ void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
 	uint32_t draws     = 0;
 	uint32_t parts     = 0;
 	bool     pending   = false;
-	LookaheadPass(execution,
-	              Config::AsyncPipelinesEnabled() ? ProgramWait::Prefetch : ProgramWait::Wait, draws,
-	              parts, pending);
+	const bool async = Config::AsyncPipelinesEnabled();
+	LookaheadPass(execution, async ? ProgramWait::Prefetch : ProgramWait::Wait, draws, parts,
+	              pending);
 	m_lookahead_draws_left = draws;
+	// A prediction in Prefetch mode takes one step per walk (translate, then compile the module,
+	// then queue the pipeline), so it walks again as that work finishes.
+	m_lookahead_rewalk        = async && pending;
+	m_lookahead_jobs_finished = pipelines.BackgroundShaderJobsFinished();
+	m_lookahead_time          = std::chrono::steady_clock::now();
 	pipelines.LogLookahead(draws, parts);
+}
+
+bool CommandProcessor::LookaheadWorkFinished() const {
+	// All of it finished, or some of it and a walk costs little next to the time since the last.
+	constexpr auto MinInterval = std::chrono::milliseconds(16);
+	const auto&    pipelines   = m_renderer.GetPipelineCache();
+	if (pipelines.BackgroundShaderJobs() == 0) {
+		return true;
+	}
+	return pipelines.BackgroundShaderJobsFinished() != m_lookahead_jobs_finished &&
+	       std::chrono::steady_clock::now() - m_lookahead_time >= MinInterval;
 }
 
 void CommandProcessor::LookaheadPass(const Pm4Execution& execution, ProgramWait wait,

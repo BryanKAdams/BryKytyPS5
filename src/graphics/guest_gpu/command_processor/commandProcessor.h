@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -170,6 +171,9 @@ private:
 	// the pipeline cache to prefetch the shader library parts of the draws it finds, so a loading
 	// burst's pipelines compile in parallel instead of one after another.
 	void RunPipelineLookahead(const Pm4Execution& execution);
+	// Whether the background work a Prefetch-mode look-ahead left pending has progressed enough
+	// to walk again (see m_lookahead_rewalk).
+	[[nodiscard]] bool LookaheadWorkFinished() const;
 	// One walk of the look-ahead; `pending` is set when a shader it met is still translating.
 	void LookaheadPass(const Pm4Execution& execution, ProgramWait wait, uint32_t& draws,
 	                   uint32_t& parts, bool& pending);
@@ -208,6 +212,11 @@ private:
 	bool      m_predicate_skip              = false;
 	// Draws the last look-ahead already covered; no new look-ahead runs until they are processed.
 	uint32_t  m_lookahead_draws_left        = 0;
+	// With asynchronous pipelines, the last look-ahead left shaders translating or compiling on
+	// worker threads; the walk repeats as they finish, to take each prediction a step further.
+	bool      m_lookahead_rewalk            = false;
+	uint64_t  m_lookahead_jobs_finished     = 0;
+	std::chrono::steady_clock::time_point m_lookahead_time {};
 	// Pipelines created while processing the current and the previous submission.
 	uint64_t  m_submission_created_start    = 0;
 	uint64_t  m_last_submission_created     = 0;

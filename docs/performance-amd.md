@@ -597,6 +597,28 @@ cold round with everything on: gameplay-minute stalls 0.064 s (one frame of 64 m
 7.1 s, worst frame 2.1 s (boot, compute pipelines); the minute held 60 after its first 10 s
 (47-56 fps while the burst compiled). 179 pipelines were deferred, 14236 draws skipped.
 
+In this mode a look-ahead prediction advances one step per walk: the first walk queues the
+translation, the next compiles the module, and only a third can queue the pipeline. The walk
+covers the next draws, though, so none ran again until those were processed, and draws that
+cannot be skipped (compute dispatches, draws that store data) then compiled on Thread_Gpu. The
+walk now repeats while its background work finishes: at the next draw once all of it is done, or
+once some of it is and 16 ms have passed. Cold loads of the ship save's slot 1 into the overworld
+(`scratchpad\cold-area.ps1`), three rounds a side:
+
+| | Before | After |
+| --- | --- | --- |
+| Load: stalled time | 1334, 733, 704 ms | 703, 636, 683 ms |
+| Load: worst frame | 650, 383, 368 ms | 300, 250, 285 ms |
+| Load: pipeline creation in stalled frames | 337-358 ms | 253-271 ms |
+| Boot and title: stalled time | 5.46-5.65 s | 5.17-5.46 s |
+| Look-ahead walks (time) | 116-120 (68-70 ms) | 146-154 (102-105 ms) |
+
+The load's two compute pipelines, 58-61 ms each before, now come prefetched (3-25 ms). The rest
+is a draw that stores data and whose pixel shader first appears about 30 ms before it is needed
+(145 ms), and compute shaders that appear only as they are dispatched. (The first "before" run's
+650 ms was Thread_Gpu waiting for the game, not pipeline work.) The overworld held 60 after every
+load. Without asynchronous pipelines nothing changes: those walks translate and prefetch at once.
+
 Also tried, without asynchronous pipelines: translating the look-ahead's shaders on the worker
 threads (in up to four passes, or in one pass followed by an in-order pass that waits for each
 draw's own shaders) instead of one after another on Thread_Gpu. Look-ahead time fell from about

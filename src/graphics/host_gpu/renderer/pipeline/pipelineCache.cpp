@@ -485,6 +485,23 @@ struct PipelineCache::ProgramCache {
 		return input;
 	}
 
+	// Posts a translation or module compile to the worker threads, counted in `jobs` until its
+	// result is set.
+	template <typename Job>
+	void PostJob(Job&& job, bool urgent) {
+		jobs->in_flight.fetch_add(1, std::memory_order_relaxed);
+		const bool posted = workers->Post(
+		    [counts = jobs, job = std::forward<Job>(job)]() mutable {
+			    job();
+			    counts->finished.fetch_add(1, std::memory_order_relaxed);
+			    counts->in_flight.fetch_sub(1, std::memory_order_release);
+		    },
+		    urgent);
+		if (!posted) {
+			jobs->in_flight.fetch_sub(1, std::memory_order_relaxed);
+		}
+	}
+
 	template <typename T>
 	[[nodiscard]] static bool IsReady(const std::future<T>& future) {
 		return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
@@ -554,7 +571,7 @@ struct PipelineCache::ProgramCache {
 		}
 		std::promise<ShaderRecompiler::TranslateResult> promise;
 		pending_sources.emplace(lookup_key, promise.get_future());
-		(void)workers->Post(
+		PostJob(
 		    [input = CopyTranslationInput(stage, params, input_info),
 		     promise = std::move(promise)]() mutable {
 			    promise.set_value(ShaderRecompiler::TranslateProgram(input->code, input->options));
@@ -661,7 +678,7 @@ struct PipelineCache::ProgramCache {
 				if (background) {
 					std::promise<ShaderRecompiler::TranslateResult> promise;
 					pending_sources.emplace(lookup_key, promise.get_future());
-					(void)workers->Post(
+					PostJob(
 					    [input   = CopyTranslationInput(stage, params, input_info),
 					     promise = std::move(promise)]() mutable {
 						    promise.set_value(
@@ -707,7 +724,7 @@ struct PipelineCache::ProgramCache {
 				source.pending.push_back({.specialization   = source.specialization,
 				                          .push_data_cursor = push_data_cursor,
 				                          .compiled         = promise.get_future()});
-				(void)workers->Post(
+				PostJob(
 				    [device = device, input = CopyTranslationInput(stage, params, input_info),
 				     translated = std::move(translated), specialization = source.specialization,
 				     push_data_cursor, promise = std::move(promise)]() mutable {
@@ -863,6 +880,12 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, bool> stores_data;
 	// Runs background translations; null without pipeline libraries.
 	PipelineLibraryCache*                                       workers = nullptr;
+	// Background translations and module compiles: running or queued, and finished so far.
+	struct JobCounts {
+		std::atomic<uint32_t> in_flight {0};
+		std::atomic<uint64_t> finished {0};
+	};
+	std::shared_ptr<JobCounts> jobs = std::make_shared<JobCounts>();
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
@@ -1749,6 +1772,14 @@ void PipelineCache::LogLookahead(uint32_t draws, uint32_t parts) const {
 		                std::chrono::steady_clock::now().time_since_epoch())
 		                .count());
 	}
+}
+
+uint32_t PipelineCache::BackgroundShaderJobs() const noexcept {
+	return m_program_cache->jobs->in_flight.load(std::memory_order_acquire);
+}
+
+uint64_t PipelineCache::BackgroundShaderJobsFinished() const noexcept {
+	return m_program_cache->jobs->finished.load(std::memory_order_relaxed);
 }
 
 void PipelineCache::InstallOptimizedPipeline(Pipeline& pipeline, CommandBuffer& command) {

@@ -217,6 +217,10 @@ public:
 	                                 uint32_t dispatch_initiator, ProgramWait wait, bool* pending);
 	// Prints a look-ahead's result with KYTY_PERMUTATION_LOG=1.
 	void LogLookahead(uint32_t draws, uint32_t parts) const;
+	// Shader translations and module compiles queued or running on worker threads.
+	[[nodiscard]] uint32_t BackgroundShaderJobs() const noexcept;
+	// How many of those have finished since startup.
+	[[nodiscard]] uint64_t BackgroundShaderJobsFinished() const noexcept;
 
 private:
 	friend struct AttachmentFeedbackTestAccess;
