@@ -250,6 +250,7 @@ struct GraphicsPipelineState {
 	uint32_t                                         stage_count = 0;
 	// The fragment stage, when there is one, comes last.
 	uint32_t fragment_stage_count = 0;
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo fragment_subgroup_size {};
 
 	std::array<vk::VertexInputAttributeDescription, ShaderVertexInputInfo::RES_MAX> input_attr {};
 	std::array<vk::VertexInputBindingDescription, ShaderVertexInputInfo::RES_MAX>   input_desc {};
@@ -358,6 +359,17 @@ void BuildGraphicsPipelineState(GraphicsPipelineState& state, GraphicContext& gr
 		                                .module = pixel_program.module,
 		                                .pName  = "main"};
 		state.fragment_stage_count   = 1;
+		// A pixel shader's EXEC, VCC and ballots cover one guest wave (32 or 64 lanes), but AMD
+		// compiles fragment shaders as wave64 by default: in a wave32 shader, host lanes 32-63
+		// would then read lanes 0-31's masks, so EXECZ loop exits could skip their work. Request
+		// the guest's wave size wherever the driver takes one for fragment shaders.
+		const auto wave_size = ps_input_info->wave_size;
+		if (graphics.compute_subgroup_size_control_enabled &&
+		    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eFragment) &&
+		    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+			state.fragment_subgroup_size.requiredSubgroupSize = wave_size;
+			shader_stages[stage_count - 1].pNext = &state.fragment_subgroup_size;
+		}
 	}
 
 	auto& input_attr = state.input_attr;
