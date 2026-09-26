@@ -881,7 +881,8 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
+	    Config::AsyncPipelinesEnabled() ? ProgramWait::Defer : ProgramWait::Wait);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -889,6 +890,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                                        DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
 	RefreshShaders(buffer, draw, state);
+	if (state.programs.pending) {
+		// Asynchronous pipelines: a shader is still translating; skip the draw until it is ready.
+		return false;
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {

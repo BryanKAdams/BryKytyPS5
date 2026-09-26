@@ -58,6 +58,9 @@ public:
 	              bool urgent = false);
 	// Moves the queued job of `key`, if any, ahead of the other queued jobs.
 	void Promote(const std::string& key);
+	// Runs `job` on a worker thread, such as a shader translation. A job still queued when the
+	// cache stops is destroyed without running. Returns false (and drops the job) once stopped.
+	bool Post(Common::UniqueFunction<void>&& job, bool urgent);
 	// Removes `key` and hands its pipeline to the caller, waiting while it compiles; null when the
 	// key is absent or its compile failed.
 	[[nodiscard]] vk::Pipeline Take(const std::string& key);
@@ -92,12 +95,15 @@ private:
 
 	struct CompileJob {
 		std::string                          key;
+		bool                                 urgent = false;
 		std::promise<vk::Pipeline>           result;
 		Common::UniqueFunction<vk::Pipeline> compile;
 	};
 
 	void LinkThread(const std::stop_token& stop);
 	void CompileThread(const std::stop_token& stop);
+	// Queues a compile job; m_compile_mutex must be held.
+	void EnqueueLocked(CompileJob&& job, bool urgent);
 
 	GraphicContext&                        m_graphics;
 	vk::PipelineCache                      m_driver_cache = nullptr;

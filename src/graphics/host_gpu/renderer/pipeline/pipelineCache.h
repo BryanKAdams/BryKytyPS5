@@ -124,6 +124,11 @@ struct PipelineVertexInputState {
 	bool operator==(const PipelineVertexInputState&) const = default;
 };
 
+// How a shader lookup treats a permutation not compiled yet: compile it now (Wait), or queue
+// it on worker threads and return nothing yet, for a draw that may be skipped (Defer, ahead of
+// other jobs) or a look-ahead prediction (Prefetch).
+enum class ProgramWait { Wait, Defer, Prefetch };
+
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
@@ -157,6 +162,9 @@ public:
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
 		ShaderProgram pixel;
+		// A stage is still compiling in the background (ProgramWait::Defer or Prefetch); the
+		// other programs may be missing too.
+		bool          pending = false;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
@@ -167,10 +175,11 @@ public:
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	                    ShaderPixelInputInfo& pixel_info, ProgramWait wait = ProgramWait::Wait);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo&      input_info,
+	                                ProgramWait wait = ProgramWait::Wait, bool* pending = nullptr);
 
 	// With `may_defer` (asynchronous pipelines), a new pipeline whose shader library parts are not
 	// compiled yet is not created: its parts are queued on worker threads and the result is null,
@@ -191,19 +200,21 @@ public:
 		return m_graphics_pipelines_created;
 	}
 	// Predicts the graphics pipeline a draw with these registers will need, translating its
-	// shaders, and queues its missing shader library parts on worker threads. Nothing is recorded
+	// shaders (in the background with ProgramWait::Prefetch, which sets `*pending` while they
+	// translate), and queues its missing shader library parts on worker threads. Nothing is recorded
 	// or bound; a wrong prediction only costs the compile. Returns the number of parts queued.
 	uint32_t PrefetchGraphicsPipeline(const HW::Context& ctx, const HW::Shader& sh,
-	                                  const HW::UserConfig& user_config);
+	                                  const HW::UserConfig& user_config, ProgramWait wait,
+	                                  bool* pending);
 	// Compute pipelines created so far, for the same purpose.
 	[[nodiscard]] uint64_t ComputePipelinesCreated() const noexcept {
 		return m_compute_pipelines_created;
 	}
 	// Predicts the compute pipeline a dispatch with these registers and dispatch initiator will
-	// need, translating its shader, and compiles it on a worker thread; GetComputePipeline takes
-	// it over. Returns 1 when a compile was queued.
+	// need, translating its shader (like PrefetchGraphicsPipeline), and compiles it on a worker
+	// thread; GetComputePipeline takes it over. Returns 1 when a compile was queued.
 	uint32_t PrefetchComputePipeline(const HW::Context& ctx, const HW::Shader& sh,
-	                                 uint32_t dispatch_initiator);
+	                                 uint32_t dispatch_initiator, ProgramWait wait, bool* pending);
 	// Prints a look-ahead's result with KYTY_PERMUTATION_LOG=1.
 	void LogLookahead(uint32_t draws, uint32_t parts) const;
 

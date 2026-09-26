@@ -24,7 +24,9 @@ namespace {
 constexpr uint32_t CompileThreadCount = 6;
 
 // Background compiles run below the game's priority: while the game runs (with asynchronous
-// pipelines, or during play), they use spare cores instead of slowing its frames.
+// pipelines, or during play), they use spare cores instead of slowing its frames. The link thread
+// keeps normal priority: until it relinks a pipeline with link-time optimization, draws run the
+// slower fast-linked one.
 void LowerThreadPriority() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -123,25 +125,49 @@ bool PipelineLibraryCache::Prefetch(std::string key, Common::UniqueFunction<vk::
 		if (m_compile_stopped) {
 			return false;
 		}
-		if (urgent) {
-			m_compile_jobs.push_front(std::move(job));
-		} else {
-			m_compile_jobs.push_back(std::move(job));
-		}
+		EnqueueLocked(std::move(job), urgent);
 	}
 	m_libraries.emplace(std::move(key), std::move(entry));
 	m_compile_available.notify_one();
 	return true;
 }
 
+void PipelineLibraryCache::EnqueueLocked(CompileJob&& job, bool urgent) {
+	// Urgent jobs run first, in the order they came, then the others in theirs.
+	job.urgent = urgent;
+	if (urgent) {
+		const auto first_normal = std::ranges::find(m_compile_jobs, false, &CompileJob::urgent);
+		m_compile_jobs.insert(first_normal, std::move(job));
+	} else {
+		m_compile_jobs.push_back(std::move(job));
+	}
+}
+
 void PipelineLibraryCache::Promote(const std::string& key) {
 	std::lock_guard lock(m_compile_mutex);
 	const auto      queued = std::ranges::find(m_compile_jobs, key, &CompileJob::key);
-	if (queued != m_compile_jobs.end() && queued != m_compile_jobs.begin()) {
+	if (queued != m_compile_jobs.end() && !queued->urgent) {
 		auto job = std::move(*queued);
 		m_compile_jobs.erase(queued);
-		m_compile_jobs.push_front(std::move(job));
+		EnqueueLocked(std::move(job), true);
 	}
+}
+
+bool PipelineLibraryCache::Post(Common::UniqueFunction<void>&& job, bool urgent) {
+	CompileJob compile_job;
+	compile_job.compile = [job = std::move(job)]() mutable {
+		job();
+		return vk::Pipeline {};
+	};
+	{
+		std::lock_guard lock(m_compile_mutex);
+		if (m_compile_stopped) {
+			return false;
+		}
+		EnqueueLocked(std::move(compile_job), urgent);
+	}
+	m_compile_available.notify_one();
+	return true;
 }
 
 void PipelineLibraryCache::KeepLayout(vk::PipelineLayout                       layout,
@@ -215,7 +241,6 @@ void PipelineLibraryCache::Stop() {
 
 void PipelineLibraryCache::LinkThread(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("PipelineLink");
-	LowerThreadPriority();
 	for (;;) {
 		LinkJob job;
 		{

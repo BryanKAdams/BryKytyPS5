@@ -955,6 +955,24 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
 	KYTY_PROFILER_FUNCTION();
 	DrainStats::WaitTimer walk_timer(DrainStats::Kind::Lookahead);
+	// With asynchronous pipelines the walk translates shaders on worker threads and does not wait
+	// for them: the draws pick the work up later. Otherwise it translates them itself, so it can
+	// queue each draw's pipeline parts right away. (Translating in parallel first and queuing the
+	// parts in a second walk measured no better: the pipeline compiles are the critical path, and
+	// the translations only compete with them for the worker threads.)
+	auto&    pipelines = m_renderer.GetPipelineCache();
+	uint32_t draws     = 0;
+	uint32_t parts     = 0;
+	bool     pending   = false;
+	LookaheadPass(execution,
+	              Config::AsyncPipelinesEnabled() ? ProgramWait::Prefetch : ProgramWait::Wait, draws,
+	              parts, pending);
+	m_lookahead_draws_left = draws;
+	pipelines.LogLookahead(draws, parts);
+}
+
+void CommandProcessor::LookaheadPass(const Pm4Execution& execution, ProgramWait wait,
+                                     uint32_t& draws, uint32_t& parts, bool& pending) {
 	// Enough for a loading frame's draws; the walk costs a few microseconds per known draw.
 	constexpr uint32_t MaxDraws   = 256;
 	constexpr uint32_t MaxPackets = 1u << 16u;
@@ -972,8 +990,8 @@ void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
 
 	auto&    pipelines = m_renderer.GetPipelineCache();
 	auto     stack     = execution.m_buffer_stack;
-	uint32_t draws     = 0;
-	uint32_t parts     = 0;
+	draws = 0;
+	parts = 0;
 	for (uint32_t packets = 0; !stack.empty() && draws < MaxDraws && packets < MaxPackets;
 	     packets++) {
 		auto& cursor = stack.back();
@@ -1071,7 +1089,8 @@ void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
 				// CpOpDispatchDirect for the layout: groups x, y, z, then the initiator).
 				if (packet_dw == 5u && packet[1] != 0 && packet[2] != 0 && packet[3] != 0) {
 					parts += pipelines.PrefetchComputePipeline(shadow->m_ctx, shadow->m_sh_ctx,
-					                                           packet[4]);
+					                                           packet[4], wait,
+					                                           &pending);
 				}
 				break;
 			case Pm4::IT_DISPATCH_INDIRECT:
@@ -1079,17 +1098,19 @@ void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
 				// See CpOpDispatchIndirect: the initiator follows the argument address or offset.
 				if ((header & ~1u) == 0xc0021600u) {
 					parts += pipelines.PrefetchComputePipeline(shadow->m_ctx, shadow->m_sh_ctx,
-					                                           packet[3]);
+					                                           packet[3], wait,
+					                                           &pending);
 				} else if ((header & ~1u) == 0xc0011600u) {
 					parts += pipelines.PrefetchComputePipeline(shadow->m_ctx, shadow->m_sh_ctx,
-					                                           packet[2]);
+					                                           packet[2], wait,
+					                                           &pending);
 				}
 				break;
 			default:
 				if (IsDrawOpcode(opcode)) {
 					draws++;
 					parts += pipelines.PrefetchGraphicsPipeline(shadow->m_ctx, shadow->m_sh_ctx,
-					                                            shadow->m_ucfg);
+					                                            shadow->m_ucfg, wait, &pending);
 				}
 				// Everything else (waits, events, memory writes, dispatches) leaves the
 				// register state alone and is skipped.
@@ -1097,8 +1118,6 @@ void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 	}
-	m_lookahead_draws_left = draws;
-	pipelines.LogLookahead(draws, parts);
 }
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {

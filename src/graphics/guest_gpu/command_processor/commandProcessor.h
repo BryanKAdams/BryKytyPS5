@@ -170,6 +170,9 @@ private:
 	// the pipeline cache to prefetch the shader library parts of the draws it finds, so a loading
 	// burst's pipelines compile in parallel instead of one after another.
 	void RunPipelineLookahead(const Pm4Execution& execution);
+	// One walk of the look-ahead; `pending` is set when a shader it met is still translating.
+	void LookaheadPass(const Pm4Execution& execution, ProgramWait wait, uint32_t& draws,
+	                   uint32_t& parts, bool& pending);
 	void SuspendPm4();
 	void SynchronizePredicate(uint64_t address, uint64_t size);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }

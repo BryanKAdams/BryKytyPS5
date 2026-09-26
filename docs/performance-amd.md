@@ -523,6 +523,34 @@ its shaders (`AgcCreateShader`) 7 to 128 s before their first pipeline, but a pi
 depends on the resource descriptors bound at the draw or dispatch, so compiling at registration
 could only guess.
 
+With the setting on, shader translation also moves off Thread_Gpu: a draw whose shaders are not
+translated yet queues the translation on the worker threads (ahead of look-ahead jobs) and is
+skipped, and look-ahead walks queue translations instead of running them. Whether a draw's
+shaders store data is decided before translating, by decoding them (buffer, flat and image
+stores, image atomics, GDS); such draws translate and wait as before. The link thread keeps
+normal priority, since draws run the slower fast-linked pipeline until it relinks one: with it
+below normal and the workers full of translations, GPU time per frame doubled for a while. One
+cold round with everything on: gameplay-minute stalls 0.064 s (one frame of 64 ms), whole run
+7.1 s, worst frame 2.1 s (boot, compute pipelines); the minute held 60 after its first 10 s
+(47-56 fps while the burst compiled). 179 pipelines were deferred, 14236 draws skipped.
+
+Also tried, without asynchronous pipelines: translating the look-ahead's shaders on the worker
+threads (in up to four passes, or in one pass followed by an in-order pass that waits for each
+draw's own shaders) instead of one after another on Thread_Gpu. Look-ahead time fell from about
+2.9 s to 1.8 s a run, but pipeline creation grew by the same amount, since the translations
+compete with the pipeline compiles for the workers and the first draws' parts start later.
+Whole-run stalls stayed at 22.6-23.0 s. The walk still translates serially in that mode.
+
+Compiling at registration (`AgcCreateShader`) would need a pipeline's specialization before any
+descriptor is bound. Over a cold run's 293 permutations (`--spec-guess`), guessing every image
+as a float 2D image with one mip level gives byte-identical SPIR-V for 244, including all the
+largest shaders; also guessing the buffers' strides, which the SPIR-V bakes in, leaves 97, and
+none of the large ones.
+
+Hitch counts at the default GPU timestamp scale also catch the game's dynamic resolution: some
+runs spend 10-15 s of play with GPU time per frame up to 19 ms (frames of 28 ms) and no pipeline
+work at all. Comparisons should use `--gpu-timestamp-scale 115`, at which Astro Bot holds 60.
+
 To see where a stalled frame's time goes, hitch lines also report `lookahead` (look-ahead walks,
 mostly the shader translation they run) and `gpu-thread-idle` (Thread_Gpu waiting for the game).
 
