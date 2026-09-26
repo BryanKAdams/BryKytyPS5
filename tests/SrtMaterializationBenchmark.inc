@@ -901,5 +901,84 @@ void RunJournalDisasm(const char *journal_path, std::span<char *const> hashes) {
   }
 }
 
+
+// --journal-specs <journal copy>: one line per recorded permutation with its
+// resource specialization (buffer stride/format/swizzle, image class, dimension
+// and mip count), to see how much of a permutation the bound descriptors decide.
+void PrintJournalSpecializations(const char *journal_path) {
+  constexpr const char *name = "JournalSpecs";
+  auto records = ReadShaderJournalCopy(journal_path);
+  Require(name, "journal", !records.empty(),
+          std::string("no records read from ") + journal_path);
+  for (const auto &record : records) {
+    std::string text = fmt::format("spec {:016x} stage={} words={} push={} buffers={} images={}",
+                                   record.hash, static_cast<int>(record.stage),
+                                   record.code.size(), record.push_data_start_dword,
+                                   record.specialization.buffers.size(),
+                                   record.specialization.images.size());
+    for (const auto &buffer : record.specialization.buffers) {
+      text += fmt::format(" b[{:x}/{}/{:x}]", buffer.packed_stride,
+                          static_cast<int>(buffer.descriptor_format),
+                          buffer.descriptor_swizzle);
+    }
+    for (const auto &image : record.specialization.images) {
+      text += fmt::format(" i[{}/{}/{}/{}/{:x}/{}{}{}]", static_cast<int>(image.numeric_class),
+                          static_cast<int>(image.dimension), image.mip_count,
+                          static_cast<int>(image.conversion_format), image.shader_swizzle,
+                          image.indirect_search_iterations, image.cube ? "c" : "",
+                          image.fmask ? "f" : "");
+    }
+    std::printf("%s\n", text.c_str());
+  }
+}
+
+// --spec-guess <journal copy>: compiles every recorded permutation with its real
+// specialization and with a guess made without descriptors (float 2D images with
+// one mip level; buffers as recorded, or with their strides dropped too), and
+// prints whether each guess gives byte-identical SPIR-V.
+void PrintSpecializationGuesses(const char *journal_path) {
+  constexpr const char *name = "SpecGuess";
+  auto records = ReadShaderJournalCopy(journal_path);
+  Require(name, "journal", !records.empty(),
+          std::string("no records read from ") + journal_path);
+  const auto digest = [](const std::vector<uint32_t> &spirv) {
+    return XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t));
+  };
+  size_t images_match = 0;
+  size_t all_match = 0;
+  size_t compiled_count = 0;
+  for (auto &record : records) {
+    const auto real = CompileJournalRecord(record, name, false);
+    if (!real) {
+      continue;
+    }
+    compiled_count++;
+    const auto real_digest = digest(real->spirv);
+    const auto saved = record.specialization;
+    for (auto &image : record.specialization.images) {
+      image = {};
+      image.numeric_class = static_cast<decltype(image.numeric_class)>(1);
+      image.dimension = static_cast<decltype(image.dimension)>(3);
+      image.mip_count = 1;
+    }
+    const auto images_guess = CompileJournalRecord(record, name, false);
+    const bool images_ok = images_guess && digest(images_guess->spirv) == real_digest;
+    for (auto &buffer : record.specialization.buffers) {
+      buffer = {};
+    }
+    const auto all_guess = CompileJournalRecord(record, name, false);
+    const bool all_ok = all_guess && digest(all_guess->spirv) == real_digest;
+    record.specialization = saved;
+    images_match += images_ok ? 1u : 0u;
+    all_match += all_ok ? 1u : 0u;
+    std::printf("guess %016llx stage=%d words=%zu images=%s buffers=%s\n",
+                static_cast<unsigned long long>(record.hash),
+                static_cast<int>(record.stage), real->spirv.size(),
+                images_ok ? "same" : "differs", all_ok ? "same" : "differs");
+  }
+  std::printf("guess summary: %zu permutations, image guess identical %zu, image and "
+              "buffer guess identical %zu\n",
+              compiled_count, images_match, all_match);
+}
 } // namespace
 } // namespace Libs::Graphics

@@ -14000,7 +14000,7 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      return context.GetPipelineCache().GetGraphicsPipeline(
+      return *context.GetPipelineCache().GetGraphicsPipeline(
           std::span{&color, 1u}, depth, std::span{&vertex, 1u},
           scheduler.Current(), &pixel, topology, false,
           PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader},
@@ -34307,6 +34307,14 @@ int main(int argc, char **argv) {
   }
   if (argc == 5 && std::strcmp(argv[1], "--dump-shader") == 0) {
     DumpJournalShader(argv[2], argv[3], argv[4]);
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--spec-guess") == 0) {
+    PrintSpecializationGuesses(argv[2]);
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--journal-specs") == 0) {
+    PrintJournalSpecializations(argv[2]);
     return 0;
   }
   if (argc == 3 && std::strcmp(argv[1], "--spirv-digest") == 0) {
