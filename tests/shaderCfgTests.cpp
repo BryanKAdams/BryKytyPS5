@@ -9392,24 +9392,39 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
+  const auto line_at = [&source](size_t offset) {
+    const auto begin = source.rfind('\n', offset) + 1;
+    return source.substr(begin, source.find('\n', offset) - begin);
+  };
+  const auto result_id = [](const std::string &line) {
+    const auto start = line.find('%');
+    return line.substr(start, line.find(' ', start) - start);
+  };
   const auto exec_branch =
       source.find("OpBranchConditional", 0);
   const auto array_length =
       source.find("OpArrayLength", 0);
-  const auto bounds_branch = source.find("OpBranchConditional", array_length);
+  const auto bounds = source.find("OpULessThan", array_length);
   const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
   Check(exec_branch != std::string::npos,
         "buffer load SPIR-V lacks EXEC guard branch");
-  Check(array_length != std::string::npos,
+  Check(array_length != std::string::npos && bounds != std::string::npos,
         "buffer load SPIR-V lacks storage buffer array-length bounds check");
-  Check(bounds_branch != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer bounds branch");
   Check(element_access != std::string::npos,
         "buffer load SPIR-V lacks storage element access");
   Check(exec_branch < array_length,
         "buffer load bounds check was emitted outside EXEC guard");
-  Check(bounds_branch < element_access,
-        "buffer load storage element pointer was formed before bounds guard");
+  // Out-of-bounds lanes read element 0 and select zero, without a branch.
+  const auto in_bounds = result_id(line_at(bounds));
+  const auto index_select = source.find("OpSelect %uint " + in_bounds + " ", bounds);
+  const auto value_select =
+      source.find("OpSelect %uint " + in_bounds + " ", element_access);
+  Check(index_select != std::string::npos && index_select < element_access &&
+            line_at(element_access).ends_with(" " + result_id(line_at(index_select))),
+        "buffer load storage element index was not clamped by its bounds check");
+  Check(value_select != std::string::npos &&
+            source.find("OpBranchConditional", array_length) > value_select,
+        "buffer load out-of-bounds value is not selected without a branch");
 }
 
 void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
