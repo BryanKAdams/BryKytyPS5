@@ -84,6 +84,14 @@ Ways to move work off that thread, cheapest first:
 - **Fix millisecond-granularity waits on Windows.** `Common::CondVar::WaitFor` rounds sub-ms waits
   up to 1 ms. The blocked-queue poll in `ThreadRun` sleeps 100 ms.
 - **Parallel journal replay.** Uses all cores at startup.
+- **Faster first-use shader compiles.** Done in part on `perf/draw-cpu`: the structurizer's
+  post-dominator order (a full journal recompile 3471 to 2363 ms, byte-identical SPIR-V) and the
+  EXEC-masked select-chain collapse (AMD driver compute compiles 8-15% faster on the two largest
+  shaders). Next: `TranslateProgram`, `RewriteToSsa` and `EmitProgram` are now the largest passes
+  (about 616, 427 and 416 ms per journal). Buffer loads still carry a software bounds check and an
+  EXEC branch each. The device enables `robustBufferAccess2`, so the bounds check could go, but
+  that changes the SPIR-V and needs a GPU A/B. Use `--spirv-digest` and `--pipeline-compile-time`
+  (performance-amd.md).
 - **Instrument the drains.** Done: `--drain-stats`.
 - **Make the shader journal and driver cache survive commits.** Done: both are keyed on a hash of
   the recompiler and pipeline sources.

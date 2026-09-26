@@ -982,6 +982,36 @@ Separately, 305 of the 308 shaders have no declared hash, so `GetShaderParams` c
 about 4.4 KB of code for every stage of every draw. That is the ~5% `GetShaderParams` share above,
 and it becomes the larger per-draw cost once materialization is cheaper.
 
+### First-use shader compile cost (September 25)
+
+A new shader costs our recompile plus the AMD driver's pipeline compile, and both happen on first
+encounter. The recompile also repeats at boot for every journal record. Measured on the
+7800X3D with a copy of the 308-record Astro Bot journal:
+- **Driver:** `vkCreateComputePipelines` takes 1.27 s for `900aba8df9448d3d` (169k SPIR-V words)
+  and 0.85 s for `01d6f21611218e74` (133k). A cache hit costs about 0.1 ms, so these only hurt
+  when the driver cache is cold.
+- **SPIR-V composition** of the big shaders: `OpBitcast` about 19% of words, `OpSelect` 15-19%
+  (before the select-chain collapse), `OpPhi` about 10%. 28% of IR bit casts repeat an earlier
+  one with the same source, and `900aba` has about 3,200 duplicate pure instructions, which a
+  CSE pass could remove. Every buffer dword load is two nested selection constructs: an EXEC
+  branch, then a software bounds check (`OpArrayLength`, `OpULessThan`, branch, phi). In
+  `900aba`, 657 of 799 `OpULessThan` are these checks. The device enables `robustBufferAccess2`
+  when supported, and that already returns zero for out-of-bounds loads.
+- **Recompiler, by pass:** in the base build, `CFG::Structurize` took 1318 of 3471 ms and 63-77%
+  of each big shader. Almost all of it was `ComputePostDominators`, rerun after each of 27-62
+  merge splits and iterated in forward block order over block-sized sets. Reverse order fixed
+  it (commit 3af11427, byte-identical). The rest is now `TranslateProgram` about 616 ms,
+  `RewriteToSsa` 427, `EmitProgram` 416, constant propagation 186, `BuildSrtPlan` 107 and
+  `RemoveIdentities` 106.
+- **Use lists:** `Inst::AddUse` scans the used value's whole use list for a duplicate before
+  every append (always on; `KYTY_FINAL` is not defined), and `ReplaceUsesWith` erases one use at
+  a time. Removing both kept the SPIR-V identical and made `RewriteToSsa` about 16% faster, but
+  that run overlapped emulator boots and other passes moved too. `RemoveIdentities` did not
+  change. Re-measure on an idle machine before committing it.
+- **SSA construction** seals every block only after the whole program is visited, so each read
+  without a local definition creates an incomplete phi. Sealing earlier would change phi order
+  and therefore the SPIR-V bytes. It is only worth doing with a GPU and correctness A/B.
+
 ### Texture-cache lookups
 
 Per draw: `PrepareDrawRenderState` (renderDraw.cpp:898-935) resolves every MRT slot and the depth

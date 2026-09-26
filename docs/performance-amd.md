@@ -108,6 +108,24 @@ validated by this patch set.
   smaller than the SPIR-V suggests; the smaller modules also compile faster. The overworld fps is
   unchanged because dynamic resolution spends GPU headroom on render size.
 
+- **EXEC-masked select chains:** a masked write becomes `select(exec, new, old)`, so a masked
+  region that writes one register several times nests selects on the same predicate. Constant
+  propagation now points a false-arm use on that predicate at the old value, and a lane-local use
+  whose result only matters where the predicate holds at the new value; the intermediate selects
+  and their bit casts die. Astro Bot's big shaders shrank 3-8% in SPIR-V words
+  (`900aba8df9448d3d` 183,562 to 169,310; `01d6f21611218e74` 143,677 to 132,774). AMD driver
+  compute pipeline creation fell from 1385 to 1268 ms and from 1006 to 852 ms. These are
+  first-use costs (shader cache stutter), not per-frame ones.
+
+- **Structurizer post-dominators:** the structurizer recomputes dominators and post-dominators
+  after every merge split (27-62 times for a big shader). The post-dominator dataflow visited
+  blocks in program order, the slow direction for a backward problem, and took 63-77% of a big
+  shader's recompile. Visiting them in reverse reaches the same fixpoint in a few passes. Over all
+  308 recorded Astro Bot permutations, the SPIR-V is byte-identical, `CFG::Structurize` fell from
+  1318 to 249 ms, and a full recompile from 3471 to 2363 ms. The slowest shader
+  (`01d6f21611218e74`) now recompiles in 141 ms instead of 386 ms. This is paid on every first
+  encounter and again by the boot-time journal replay.
+
 The dense evaluator, retained resource snapshots, and replacement of the old SRT readability path
 were already present at the base revision. Their historical PR improvements are not additional gains
 from this branch.
@@ -626,6 +644,29 @@ pays off once more than about 12% of refreshes reuse descriptors; `KYTY_SRT_STAT
 game's actual rate. The benchmark also reports that 305 of 308 records have no declared hash, so
 `GetShaderParams` hashes their code (4.4 KB average, about 120-210 ns with XXH3) on every lookup.
 It does not measure permutation search, key building, GPU execution, frame time, or Astro Bot FPS.
+
+### Shader compile cost
+
+```powershell
+.\_Build\windows\shader_recompiler_compute_tests.exe --spirv-digest $env:TEMP\astro.shaders
+.\_Build\windows\shader_recompiler_compute_tests.exe --pipeline-compile-time $env:TEMP\astro.shaders 900aba8df9448d3d 5 before.spv after.spv
+.\_Build\windows\shader_recompiler_compute_tests.exe --dump-shader $env:TEMP\astro.shaders 900aba8df9448d3d dump
+```
+
+`--spirv-digest` recompiles every permutation in a journal copy, as the boot-time replay does, and
+prints one line per permutation (SPIR-V XXH3 digest, words, milliseconds) and the totals. Diff the
+digest columns of two builds to prove that a recompiler change leaves the SPIR-V byte-identical.
+`--pipeline-compile-time` times `vkCreateComputePipelines` for one recorded compute shader. With
+SPIR-V files (for example `--dump-shader` output from two builds) it times each file, interleaved
+round by round. It patches the SPIR-V generator word before every compile so the driver's shader
+cache cannot serve it; the "unchanged repeat" column shows what a cache hit costs (about 0.1 ms).
+It creates pipelines without a required subgroup size, unlike the runtime.
+
+Recompiler time for the 308 Astro Bot permutations, by pass, on the 7800X3D (September 25,
+after the structurizer change): `TranslateProgram` about 616 ms, `RewriteToSsa` 427,
+`EmitProgram` 416, `Structurize` 249, constant propagation 186, `BuildSrtPlan` 107,
+`RemoveIdentities` 106; 2363 ms in all. The two largest compute shaders also spend 0.85-1.27 s
+each in the AMD driver.
 
 ## Remaining rendering work
 
