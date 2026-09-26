@@ -34113,6 +34113,13 @@ int main(int argc, char **argv) {
     DumpJournalShader(argv[2], argv[3], argv[4]);
     return 0;
   }
+  if (argc >= 5 && std::strcmp(argv[1], "--pipeline-compile-time") == 0) {
+    VulkanHarness vulkan;
+    TimePipelineCompile(vulkan, argv[2], argv[3],
+                        static_cast<uint32_t>(std::atoi(argv[4])),
+                        std::span(argv + 5, argv + argc));
+    return 0;
+  }
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--srt-benchmark") == 0) {
     RunSrtBenchmark(argv[2],
                     argc == 4 ? static_cast<uint32_t>(std::atoi(argv[3])) : 0u);

@@ -582,6 +582,50 @@ void TestImpossibleEqualitiesFold() {
         "compares against a value a select cannot produce were not folded");
 }
 
+void TestMaskedWriteChainsCollapse() {
+  // Two EXEC-masked writes to one register: s1 = select(e, f, old) and
+  // s2 = select(e, g(s1), s1). s2 only needs f where e holds and old elsewhere.
+  Fixture fixture;
+  const auto user = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto old = fixture.Emit(ValueOpcode::GetUserData,
+                                {Value(static_cast<ScalarReg>(3))});
+  const auto exec = fixture.Emit(ValueOpcode::IEqual32, {user, Value(3u)});
+  const auto f = fixture.Emit(ValueOpcode::IAdd32, {user, Value(1u)});
+  const auto s1 = fixture.Emit(ValueOpcode::SelectU32, {exec, f, old});
+  const auto g = fixture.Emit(ValueOpcode::IMul32, {s1, Value(2u)});
+  const auto s2 = fixture.Emit(ValueOpcode::SelectU32, {exec, g, s1});
+  const auto chain = fixture.Emit(ValueOpcode::ReferenceU32, {s2});
+  // Observed in every lane, so it must keep reading s1.
+  const auto leaked = fixture.Emit(ValueOpcode::IAdd32, {s1, Value(5u)});
+  const auto leak = fixture.Emit(ValueOpcode::ReferenceU32, {leaked});
+  // A cross-lane read sees disabled lanes, so it must keep reading the select.
+  const auto t1 = fixture.Emit(ValueOpcode::SelectU32, {exec, f, Value(9u)});
+  const auto lane =
+      fixture.Emit(ValueOpcode::ReadLane, {t1, Value(0u)});
+  const auto t2 = fixture.Emit(ValueOpcode::SelectU32, {exec, lane, t1});
+  const auto cross = fixture.Emit(ValueOpcode::ReferenceU32, {t2});
+
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+
+  const auto *outer = chain.ResolveInstruction()->Arg(0).ResolveInstruction();
+  Check(outer == s2.ResolveInstruction() && outer->Arg(2).Resolve() == old.Resolve(),
+        "a masked write did not skip to the value before the region");
+  const auto *doubled = outer->Arg(1).ResolveInstruction();
+  Check(doubled->GetOpcode() == ValueOpcode::IMul32 &&
+            doubled->Arg(0).Resolve() == f.Resolve(),
+        "true-arm arithmetic still reads the intermediate select");
+  Check(leak.ResolveInstruction()->Arg(0).ResolveInstruction()->Arg(0).Resolve() ==
+            s1.Resolve(),
+        "a value observed in every lane lost its select");
+  Check(lane.ResolveInstruction()->Arg(0).Resolve() == t1.Resolve() &&
+            cross.ResolveInstruction()->Arg(0).ResolveInstruction()->Arg(2).Resolve() ==
+                Value(9u),
+        "a cross-lane read lost its select, or the false arm was not skipped");
+}
+
 void TestControlFlowValueSurvivesReadLaneFolding() {
   Fixture fixture(3);
   auto *entry = fixture.program.blocks[0];
@@ -667,6 +711,7 @@ int main() {
     TestReadLaneElimination();
     TestOptimizationPipeline();
     TestImpossibleEqualitiesFold();
+    TestMaskedWriteChainsCollapse();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestUndefinedRuntimeValueFails();
     std::cout << "TypedValuePlanningTests: all cases passed\n";

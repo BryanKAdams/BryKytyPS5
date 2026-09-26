@@ -240,10 +240,44 @@ struct SrtFakeMemory {
 // --dump-shader <journal copy> <hash> <out dir>: writes the guest RDNA disassembly, native IR,
 // SPIR-V and SPIR-V disassembly of every recorded permutation of one shader, as compiled at
 // runtime (the record's own specialization and push data start).
+std::optional<ShaderRecompiler::CompileResult>
+CompileJournalRecord(ShaderPrecompile::PermutationRecord &record,
+                     const char *label, bool dump_ir = true) {
+  using namespace ShaderRecompiler;
+  CompileOptions options;
+  options.stage = record.stage;
+  options.shader_hash = record.hash;
+  std::array<uint32_t, 40> zeros{};
+  options.user_data = std::span(zeros).first(record.user_data_count);
+  options.back_code = record.back_code;
+  options.user_data_base = record.user_data_base;
+  options.wave_size = record.wave_size;
+  options.dump_ir = dump_ir;
+  options.early_dump = false;
+  options.dump_label = label;
+  std::visit(
+      [&](auto &info) {
+        using Info = std::decay_t<decltype(info)>;
+        if constexpr (std::is_same_v<Info, ShaderVertexInputInfo>) {
+          options.input_info.vertex = &info;
+        } else if constexpr (std::is_same_v<Info, ShaderPixelInputInfo>) {
+          options.input_info.pixel = &info;
+        } else {
+          options.input_info.compute = &info;
+        }
+      },
+      record.info);
+  auto translated = TranslateProgram(record.code, options);
+  if (translated.skip_dispatch) {
+    return std::nullopt;
+  }
+  return CompileProgram(std::move(translated), options, record.specialization,
+                        record.push_data_start_dword);
+}
+
 void DumpJournalShader(const char *journal_path, const char *hash_text,
                        const char *out_dir) {
   constexpr const char *name = "DumpShader";
-  using namespace ShaderRecompiler;
   const auto hash = std::strtoull(hash_text, nullptr, 16);
   auto records = ReadShaderJournalCopy(journal_path);
   Require(name, "journal", !records.empty(),
@@ -254,37 +288,12 @@ void DumpJournalShader(const char *journal_path, const char *hash_text,
     if (record.hash != hash) {
       continue;
     }
-    CompileOptions options;
-    options.stage = record.stage;
-    options.shader_hash = record.hash;
-    std::array<uint32_t, 40> zeros{};
-    options.user_data = std::span(zeros).first(record.user_data_count);
-    options.back_code = record.back_code;
-    options.user_data_base = record.user_data_base;
-    options.wave_size = record.wave_size;
-    options.dump_ir = true;
-    options.early_dump = false;
-    options.dump_label = name;
-    std::visit(
-        [&](auto &info) {
-          using Info = std::decay_t<decltype(info)>;
-          if constexpr (std::is_same_v<Info, ShaderVertexInputInfo>) {
-            options.input_info.vertex = &info;
-          } else if constexpr (std::is_same_v<Info, ShaderPixelInputInfo>) {
-            options.input_info.pixel = &info;
-          } else {
-            options.input_info.compute = &info;
-          }
-        },
-        record.info);
-    auto translated = TranslateProgram(record.code, options);
-    if (translated.skip_dispatch) {
+    auto compiled = CompileJournalRecord(record, name);
+    if (!compiled) {
       std::printf("[host]    %s: permutation %u skips dispatch\n", name, written);
       continue;
     }
-    auto result = CompileProgram(std::move(translated), options,
-                                 record.specialization,
-                                 record.push_data_start_dword);
+    const auto &result = *compiled;
     std::string disassembly;
     spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
     (void)tools.Disassemble(result.spirv, &disassembly,
@@ -316,6 +325,135 @@ void DumpJournalShader(const char *journal_path, const char *hash_text,
 double MedianOf(std::vector<double> values) {
   std::sort(values.begin(), values.end());
   return values.empty() ? 0.0 : values[values.size() / 2];
+}
+
+// --pipeline-compile-time <journal copy> <hash> <rounds> [spv files...]: times
+// vkCreateComputePipelines for one recorded compute shader. Without files it
+// times the SPIR-V this build produces; with files (for example --dump-shader
+// output from two builds) it times each, interleaved round by round, against
+// the layout this build derives. Each compile patches the SPIR-V generator
+// word with a fresh value, so neither the driver's own shader cache nor an
+// earlier round can serve it.
+void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
+                         const char *hash_text, uint32_t rounds,
+                         std::span<char *const> spv_paths) {
+  constexpr const char *name = "PipelineCompileTime";
+  const auto hash = std::strtoull(hash_text, nullptr, 16);
+  auto records = ReadShaderJournalCopy(journal_path);
+  auto record = std::find_if(records.begin(), records.end(),
+                             [&](const auto &item) { return item.hash == hash; });
+  Require(name, "journal", record != records.end(), "no record has that hash");
+  Require(name, "stage", record->stage == ShaderType::Compute,
+          "only compute shaders are timed");
+  std::vector<double> recompile_times;
+  std::optional<ShaderRecompiler::CompileResult> compiled;
+  for (uint32_t pass = 0; pass < 5; pass++) {
+    const auto start = std::chrono::steady_clock::now();
+    compiled = CompileJournalRecord(*record, name, false);
+    recompile_times.push_back(std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count());
+  }
+  Require(name, "compile", compiled.has_value(), "permutation skips dispatch");
+  std::printf("[host]    %s: recompiler median %.2f ms (%zu SPIR-V words)\n", name,
+              MedianOf(recompile_times), compiled->spirv.size());
+
+  std::vector<std::pair<std::string, std::vector<uint32_t>>> inputs;
+  if (spv_paths.empty()) {
+    inputs.emplace_back("this build", compiled->spirv);
+  }
+  for (const char *path : spv_paths) {
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+    Require(name, "input", !bytes.empty() && bytes.size() % 4 == 0,
+            std::string("unreadable SPIR-V ") + path);
+    std::vector<uint32_t> words(bytes.size() / 4);
+    std::memcpy(words.data(), bytes.data(), bytes.size());
+    inputs.emplace_back(path, std::move(words));
+  }
+
+  const auto device = vulkan.Device();
+  std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
+  for (const auto &binding : compiled->program.bindings.descriptors) {
+    const auto count = NativeDescriptorCount(binding);
+    if (count != 0) {
+      layout_bindings.push_back(
+          {ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, binding.kind),
+           NativeDescriptorType(binding.kind), count,
+           vk::ShaderStageFlagBits::eCompute});
+    }
+  }
+  vk::DescriptorSetLayoutCreateInfo layout_info{};
+  layout_info.bindingCount = static_cast<uint32_t>(layout_bindings.size());
+  layout_info.pBindings = layout_bindings.empty() ? nullptr : layout_bindings.data();
+  vk::DescriptorSetLayout descriptor_layout = nullptr;
+  RequireVk(name, "layout",
+            device.createDescriptorSetLayout(&layout_info, nullptr, &descriptor_layout),
+            "vkCreateDescriptorSetLayout");
+  const vk::PushConstantRange push_range{vk::ShaderStageFlagBits::eCompute, 0,
+                                         ShaderRecompiler::IR::NativePushConstantSize};
+  vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &descriptor_layout;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_range;
+  vk::PipelineLayout pipeline_layout = nullptr;
+  RequireVk(name, "layout",
+            device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
+            "vkCreatePipelineLayout");
+
+  // Distinct per run, so a later run cannot hit this run's cache entries.
+  auto generator = static_cast<uint32_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto compile_ms = [&](std::vector<uint32_t> &words, bool fresh) {
+    if (fresh) {
+      words[2] = ++generator;
+    }
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = words.size() * sizeof(uint32_t);
+    module_info.pCode = words.data();
+    vk::ShaderModule module = nullptr;
+    RequireVk(name, "module", device.createShaderModule(&module_info, nullptr, &module),
+              "vkCreateShaderModule");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline_layout;
+    vk::Pipeline pipeline = nullptr;
+    const auto start = std::chrono::steady_clock::now();
+    RequireVk(name, "pipeline",
+              device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateComputePipelines");
+    const auto end = std::chrono::steady_clock::now();
+    device.destroyPipeline(pipeline, nullptr);
+    device.destroyShaderModule(module, nullptr);
+    return std::chrono::duration<double, std::milli>(end - start).count();
+  };
+
+  std::vector<std::vector<double>> times(inputs.size());
+  for (uint32_t round = 0; round <= rounds; round++) {
+    for (size_t i = 0; i < inputs.size(); i++) {
+      // Alternate the order so drift and warm-up do not favour one input.
+      const auto index = (round % 2 == 0) ? i : inputs.size() - 1 - i;
+      const auto ms = compile_ms(inputs[index].second, true);
+      if (round != 0) {
+        times[index].push_back(ms);
+      }
+    }
+  }
+  for (size_t i = 0; i < inputs.size(); i++) {
+    auto &words = inputs[i].second;
+    const auto repeat_ms = compile_ms(words, false);
+    std::printf("[host]    %s: %6zu words  median %8.2f ms  min %8.2f ms  "
+                "unchanged repeat %7.2f ms  %s\n",
+                name, words.size(), MedianOf(times[i]),
+                *std::min_element(times[i].begin(), times[i].end()), repeat_ms,
+                inputs[i].first.c_str());
+  }
+  device.destroyPipelineLayout(pipeline_layout, nullptr);
+  device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
 }
 
 void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {

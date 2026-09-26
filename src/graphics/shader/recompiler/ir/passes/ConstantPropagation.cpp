@@ -828,6 +828,217 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 	}
 }
 
+bool IsSelect(ValueOpcode op) {
+	return op == ValueOpcode::SelectU1 || op == ValueOpcode::SelectU32 ||
+	       op == ValueOpcode::SelectF32;
+}
+
+// Pure per-lane operations: no memory, no side effects, no view of other lanes (so no
+// derivatives, DPP, ballots or lane reads). Their value in a lane depends only on their operands'
+// values in that lane.
+bool IsLaneLocal(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::BitCastU16F16:
+		case ValueOpcode::BitCastF16U16:
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32:
+		case ValueOpcode::ConvertU16U32:
+		case ValueOpcode::ConvertU32U16:
+		case ValueOpcode::ConvertU8U32:
+		case ValueOpcode::ConvertU32U8:
+		case ValueOpcode::ConvertF32F16:
+		case ValueOpcode::ConvertF16F32:
+		case ValueOpcode::ConvertS32F32:
+		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertF32S32:
+		case ValueOpcode::ConvertF32U32:
+		case ValueOpcode::CompositeConstructU64:
+		case ValueOpcode::CompositeConstructU32x2:
+		case ValueOpcode::CompositeConstructU32x3:
+		case ValueOpcode::CompositeConstructF32x2:
+		case ValueOpcode::CompositeConstructU32x4:
+		case ValueOpcode::CompositeExtractU64:
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x3:
+		case ValueOpcode::CompositeExtractU32x4:
+		case ValueOpcode::PackHalf2x16:
+		case ValueOpcode::PackSnorm2x16:
+		case ValueOpcode::PackUnorm2x16:
+		case ValueOpcode::PackFloat2x16Rtz:
+		case ValueOpcode::FPAbs32:
+		case ValueOpcode::FPNeg32:
+		case ValueOpcode::FPSaturate32:
+		case ValueOpcode::BitFieldInsert:
+		case ValueOpcode::BitFieldUExtract:
+		case ValueOpcode::BitFieldSExtract:
+		case ValueOpcode::SelectU1:
+		case ValueOpcode::SelectU32:
+		case ValueOpcode::SelectF32:
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::IAdd64:
+		case ValueOpcode::IAddCarry32:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::ISub64:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::IMul64:
+		case ValueOpcode::UDiv32:
+		case ValueOpcode::SMulHi:
+		case ValueOpcode::UMulHi:
+		case ValueOpcode::IAbs32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftLeftLogical64:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::ShiftRightLogical64:
+		case ValueOpcode::ShiftRightArithmetic32:
+		case ValueOpcode::ShiftRightArithmetic64:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseAnd64:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32:
+		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::BitReverse32:
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::BitCount64:
+		case ValueOpcode::FindUMsb32:
+		case ValueOpcode::FindUMsb64:
+		case ValueOpcode::FindILsb32:
+		case ValueOpcode::SMin32:
+		case ValueOpcode::UMin32:
+		case ValueOpcode::SMax32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::SMinTri32:
+		case ValueOpcode::UMinTri32:
+		case ValueOpcode::SMaxTri32:
+		case ValueOpcode::UMaxTri32:
+		case ValueOpcode::SMedTri32:
+		case ValueOpcode::UMedTri32:
+		case ValueOpcode::SLessThan32:
+		case ValueOpcode::SLessThan64:
+		case ValueOpcode::ULessThan32:
+		case ValueOpcode::ULessThan64:
+		case ValueOpcode::IEqual32:
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::SLessThanEqual32:
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::SGreaterThan32:
+		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::UGreaterThan64:
+		case ValueOpcode::INotEqual32:
+		case ValueOpcode::INotEqual64:
+		case ValueOpcode::SGreaterThanEqual32:
+		case ValueOpcode::UGreaterThanEqual32:
+		case ValueOpcode::LogicalOr:
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::LogicalXor:
+		case ValueOpcode::LogicalNot:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPUnordLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32:
+		case ValueOpcode::FPIsNan32:
+		case ValueOpcode::FPCmpClass32:
+		case ValueOpcode::FPAdd32:
+		case ValueOpcode::FPSub32:
+		case ValueOpcode::FPFma32:
+		case ValueOpcode::FPMul32:
+		case ValueOpcode::FPMin32:
+		case ValueOpcode::FPMax32:
+		case ValueOpcode::FPMinTri32:
+		case ValueOpcode::FPMaxTri32:
+		case ValueOpcode::FPMedTri32:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipSqrt32:
+		case ValueOpcode::FPSqrt:
+		case ValueOpcode::FPSin:
+		case ValueOpcode::FPCos:
+		case ValueOpcode::FPExp2:
+		case ValueOpcode::FPLog2:
+		case ValueOpcode::FPLdexp:
+		case ValueOpcode::FPRoundEven32:
+		case ValueOpcode::FPFloor32:
+		case ValueOpcode::FPCeil32:
+		case ValueOpcode::FPTrunc32:
+		case ValueOpcode::FPFract32: return !HasSideEffects(op);
+		default: return false;
+	}
+}
+
+// Whether a lane-local value only matters in lanes where the predicate holds: every use is the
+// true arm of a select on that predicate, or a lane-local operation that itself only matters there.
+// Computed on the current graph for each query, within a node budget.
+bool ObservedOnlyWhere(const Inst& inst, Value predicate, std::vector<const Inst*>& seen,
+                       uint32_t& budget) {
+	if (std::ranges::find(seen, &inst) != seen.end()) {
+		return true;
+	}
+	if (budget == 0u) {
+		return false;
+	}
+	budget--;
+	seen.push_back(&inst);
+	for (const auto& use: inst.Uses()) {
+		const auto& user = *use.user;
+		const auto  op   = user.GetOpcode();
+		if (op == ValueOpcode::Identity) {
+			if (!ObservedOnlyWhere(user, predicate, seen, budget)) {
+				return false;
+			}
+			continue;
+		}
+		if (IsSelect(op) && use.operand == 1u && Arg(user, 0) == predicate) {
+			continue;
+		}
+		if (!IsLaneLocal(op) || !ObservedOnlyWhere(user, predicate, seen, budget)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// EXEC-masked writes become select(exec, new, old), so repeated writes in one masked region nest
+// selects on the same predicate. For s = select(p, a, b): a false-arm use by another select on p
+// only sees b, and a use whose value only matters where p holds only sees a. Rewriting those uses
+// leaves the intermediate selects (and their bit casts) dead.
+void CollapseSelectChains(const BlockList& blocks) {
+	std::vector<Use>         uses;
+	std::vector<const Inst*> seen;
+	for (auto* block: blocks) {
+		for (auto& inst: *block) {
+			if (!IsSelect(inst.GetOpcode())) {
+				continue;
+			}
+			const auto predicate = Arg(inst, 0);
+			if (predicate.IsImmediate()) {
+				continue;
+			}
+			const auto if_true  = Arg(inst, 1);
+			const auto if_false = Arg(inst, 2);
+			uses                = inst.Uses();
+			for (const auto& use: uses) {
+				auto&      user = *use.user;
+				const auto op   = user.GetOpcode();
+				if (IsSelect(op) && use.operand != 0u && Arg(user, 0) == predicate) {
+					user.SetArg(use.operand, use.operand == 1u ? if_true : if_false);
+					continue;
+				}
+				uint32_t budget = 64;
+				seen.clear();
+				if (IsLaneLocal(op) && ObservedOnlyWhere(user, predicate, seen, budget)) {
+					user.SetArg(use.operand, if_true);
+				}
+			}
+		}
+	}
+}
+
 } // namespace
 
 void ConstantPropagationPass(const BlockList& blocks) {
@@ -838,6 +1049,7 @@ void ConstantPropagationPass(const BlockList& blocks) {
 			FoldInstruction(*block, inst, lowered_ancillary, possible);
 		}
 	}
+	CollapseSelectChains(blocks);
 	// Normalize retained PHI/select values only after every supported field read has
 	// been lowered; direct raw consumers remain unsupported.
 	for (auto* source: lowered_ancillary) {
