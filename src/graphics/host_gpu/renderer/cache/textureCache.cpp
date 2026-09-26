@@ -1331,9 +1331,14 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 	if (DccSlicesChecked(slices_address, slice_size, count, code_mask)) {
 		return true;
 	}
-	// Render targets only: their keys are always consumed, so each GPU write is checked once.
+	// Render targets and sampled textures: both consume the keys (as the CPU path does), so each
+	// GPU write is checked once. A texture qualifies when its image can already be a color
+	// attachment, as a render target the game fast-clears and then samples without drawing to it
+	// first: on the CPU path each such lookup drained the GPU (once a frame near Astro Bot's
+	// crashed ship, waiting about 25 ms behind the frame's heaviest draw).
 	const auto& view = desc.view_info;
-	if (desc.type != BindingType::RenderTarget || desc.info.IsVolume() ||
+	if ((desc.type != BindingType::RenderTarget && desc.type != BindingType::Texture) ||
+	    desc.info.IsVolume() ||
 	    count > DccClearResolver::MaxSlices || view.base_level != 0 ||
 	    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
 	      vk::FormatFeatureFlagBits::eColorAttachment)) {

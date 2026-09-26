@@ -182,12 +182,22 @@ a real clear.
 GPU-written metadata slices, writes one predicate per clear code, and consumes cleared slices.
 The candidate clears run under conditional rendering, so the CPU never waits for the keys. A
 slice is checked again only after a new GPU write to it, and any later lookup of a checked
-slice (for example sampling the target) skips the readback. Textures, video-out surfaces,
-volumes and drivers without conditional rendering keep the CPU path, and `--dcc-gpu-clear false`
-forces it. On the overworld (ship save, same spot, same build and warm caches), the new path ran
-at about 24.5 fps with 13 ms of drains per frame (3 drains), against about 21 fps and 19 ms
-(9 drains) on the CPU path. The fixed-clear GPU test runs Astro Bot's own key-fill shader
-through both paths and requires identical results.
+slice (for example sampling the target) skips the readback. Video-out surfaces, volumes,
+textures whose image cannot be a color attachment, and drivers without conditional rendering
+keep the CPU path, and `--dcc-gpu-clear false` forces it. On the overworld (ship save, same
+spot, same build and warm caches), the new path ran at about 24.5 fps with 13 ms of drains per
+frame (3 drains), against about 21 fps and 19 ms (9 drains) on the CPU path. The fixed-clear
+GPU test runs Astro Bot's own key-fill shader through both paths and requires identical
+results.
+
+Sampled textures first took the CPU path too. At the crash site, walking onto open sand makes the
+game fast-clear a target and sample it without drawing to it, once a frame; that readback drained
+the GPU behind the frame's heaviest draw (pixel shader 6996d4e234bd5b8e, up to 18.7 ms), about
+25 ms a frame. A texture whose image can be a color attachment now takes the GPU path. Warm, same
+route: the stretch after reaching the sand went from 16-25 fps for about 18 s to 27-39 fps for
+about 11 s. What remains there is that shader and a GPU-thread read of a GPU-written indirect
+draw's arguments, once a frame, which drains too (8.5-9.6 ms a frame on the sand, 2.6 ms
+elsewhere).
 
 The planet in the overworld shows blotchy dark patches and the background a fine dot pattern.
 Upstream `main` (5a705dd) renders the same artifacts, so they predate this branch.
