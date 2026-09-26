@@ -129,6 +129,28 @@ validated by this patch set.
   (`01d6f21611218e74`) now recompiles in 141 ms instead of 386 ms. This is paid on every first
   encounter and again by the boot-time journal replay.
 
+- **Uniform `V_READFIRSTLANE` / `V_READLANE`:** these were emitted as
+  `OpGroupNonUniformShuffle` by `FindLSB(ballot(exec))` or by the SGPR lane. In pixel shaders,
+  AMD compiles such a shuffle (and `OpGroupNonUniformBroadcast` with a non-constant lane) to
+  `ds_bpermute` and treats the result as per-lane, even when the lane is in an SGPR. The
+  waterfall key of Astro Bot's lighting loops then made everything downstream vector code:
+  per-light `S_BUFFER_LOAD`s became vector buffer loads, the address math VALU, and the list walks
+  EXEC-masked `v_cmpx` loops. Applying `OpGroupNonUniformBroadcastFirst` to the shuffle result is
+  exact, because every lane already holds the same value, and it compiles to `v_readfirstlane`
+  into an SGPR (7c38c759). AMD ISA, `--pipeline-compile-time` with `KYTY_PIPELINE_ISA`:
+
+  | Shader | VGPRs | Vector buffer loads | `v_cndmask` |
+  | --- | --- | --- | --- |
+  | `5a10a907c8a64fc4` | 177 to 139 | 96 to 1 | 1772 to 1662 |
+  | `969c5ed15d14c8fe` | 134 to 128 | 96 to 1 | 1481 to 1371 |
+  | `9d7e6bca13da68ed` | 140 to 120 | 43 to 1 | 753 to 639 |
+  | `6996d4e234bd5b8e` | 134 to 128 | 96 to 1 | 1444 to 1334 |
+
+  The cost is about 150 more scalar instructions per shader, mostly `s_wait_kmcnt`. In warm GPU
+  zones, `9d7e6bca` measured 17-20% cheaper per pixel and `5a10a907` 3.8% cheaper; the others
+  stayed within the ±6% band that byte-identical shaders showed. A compute shader with the same
+  pattern (`d97f248195e22298`) had identical ISA either way, so check the hot pixel shader itself.
+
 - **Branch-free storage-buffer loads:** every buffer and constant-buffer dword load sat in a
   branch on its bounds check, itself inside the EXEC branch. The load is now issued at its own
   index and only its value is replaced (zero, or the format's out-of-bounds value), which is what
@@ -862,11 +884,18 @@ It does not measure permutation search, key building, GPU execution, frame time,
 `--spirv-digest` recompiles every permutation in a journal copy, as the boot-time replay does, and
 prints one line per permutation (SPIR-V XXH3 digest, words, milliseconds) and the totals. Diff the
 digest columns of two builds to prove that a recompiler change leaves the SPIR-V byte-identical.
-`--pipeline-compile-time` times `vkCreateComputePipelines` for one recorded compute shader. With
-SPIR-V files (for example `--dump-shader` output from two builds) it times each file, interleaved
-round by round. It patches the SPIR-V generator word before every compile so the driver's shader
-cache cannot serve it; the "unchanged repeat" column shows what a cache hit costs (about 0.1 ms).
-It creates pipelines without a required subgroup size, unlike the runtime.
+`--pipeline-compile-time` times pipeline creation for one recorded compute or pixel shader. A pixel
+shader gets a generated pass-through vertex shader and 16-bit float targets. With SPIR-V files
+(for example `--dump-shader` output from two builds) it times each file, interleaved round by
+round; a `noopt:` prefix adds `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT`, which the AMD
+Windows driver ignores. It patches the SPIR-V generator word before every compile so the
+driver's shader cache cannot serve it; the "unchanged repeat" column shows what a cache hit
+costs (about 0.1 ms). Compute pipelines pin the guest wave size as the runtime does. With
+`VK_KHR_pipeline_executable_properties` it also prints the driver's statistics per stage (on
+AMD: used VGPRs and SGPRs, LDS, scratch). With `KYTY_PIPELINE_ISA=<dir>` it writes the driver's
+LLVM IR and ISA there. `--journal-opcodes <journal> <OPCODE>` lists the recorded shaders that use
+a guest opcode. Together they answer codegen questions (scalar vs vector loads, register
+pressure) without a game run.
 
 Recompiler time for the 308 Astro Bot permutations, by pass, on the 7800X3D (September 25,
 after the structurizer change): `TranslateProgram` about 616 ms, `RewriteToSsa` 427,
