@@ -602,9 +602,19 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
                                    vk::ShaderStageFlagBits::eFragment}
             : vk::ShaderStageFlags{vk::ShaderStageFlagBits::eCompute},
       0, ShaderRecompiler::IR::NativePushConstantSize};
+  // The shader's resources live in its stage's set (pixel shaders use set 1); lower sets are
+  // empty.
+  vk::DescriptorSetLayoutCreateInfo empty_layout_info{};
+  vk::DescriptorSetLayout empty_layout = nullptr;
+  RequireVk(name, "layout",
+            device.createDescriptorSetLayout(&empty_layout_info, nullptr, &empty_layout),
+            "vkCreateDescriptorSetLayout");
+  const auto set = ShaderRecompiler::IR::NativeDescriptorSet(record->stage);
+  std::vector<vk::DescriptorSetLayout> set_layouts(set, empty_layout);
+  set_layouts.push_back(descriptor_layout);
   vk::PipelineLayoutCreateInfo pipeline_layout_info{};
-  pipeline_layout_info.setLayoutCount = 1;
-  pipeline_layout_info.pSetLayouts = &descriptor_layout;
+  pipeline_layout_info.setLayoutCount = static_cast<uint32_t>(set_layouts.size());
+  pipeline_layout_info.pSetLayouts = set_layouts.data();
   pipeline_layout_info.pushConstantRangeCount = 1;
   pipeline_layout_info.pPushConstantRanges = &push_range;
   vk::PipelineLayout pipeline_layout = nullptr;
@@ -876,6 +886,7 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
   }
   device.destroyPipelineLayout(pipeline_layout, nullptr);
   device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
+  device.destroyDescriptorSetLayout(empty_layout, nullptr);
 }
 
 void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
