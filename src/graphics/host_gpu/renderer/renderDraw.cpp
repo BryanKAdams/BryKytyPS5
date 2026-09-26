@@ -968,6 +968,15 @@ static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBu
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 }
 
+// Whether a stage stores to buffers or writes storage images: data later work may read. Buffer
+// atomics alone do not count. They are counters and feedback, such as the per-object maximum
+// Astro Bot's geometry shaders record, which a skipped draw only leaves out for a few frames.
+static bool StoresData(const ShaderStageRuntime& runtime) {
+	const auto& info = runtime.program->info;
+	return std::ranges::any_of(info.buffers, [](const auto& buffer) { return buffer.stored; }) ||
+	       std::ranges::any_of(info.images, [](const auto& image) { return image.written; });
+}
+
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
 	                             const DrawRenderState& state, uint32_t index_type_and_size,
                                  const void* index_addr) {
@@ -1095,14 +1104,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	// With asynchronous pipelines, a draw whose pipeline is still compiling is skipped, unless
+	// its shaders store data that later work may read.
+	bool may_defer = Config::AsyncPipelinesEnabled();
+	for (const auto& stage: vertex_stages) {
+		may_defer = may_defer && !StoresData(stage.stage);
+	}
+	may_defer = may_defer && !(state.ps_active && StoresData(state.ps_input_info.stage));
 	// Target acquisition resolves the actual overlapping read/write aspects for this draw.
-	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
+	auto* const found_pipeline = [&]() -> PipelineCache::Pipeline* {
 		DrainStats::SlowLookupTimer create_timer(DrainStats::Kind::PipelineCreate);
 		return m_context.GetPipelineCache().GetGraphicsPipeline(
 		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 		    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-		    state.programs, feedback_aspects);
+		    state.programs, feedback_aspects, may_defer);
 	}();
+	if (found_pipeline == nullptr) {
+		return;
+	}
+	auto& pipeline = *found_pipeline;
 
 	// Mesh shaders load their draw parameters from a record by address (see
 	// EmitMeshDrawParameter). Write each slice's record now: the ring can wait and restart the

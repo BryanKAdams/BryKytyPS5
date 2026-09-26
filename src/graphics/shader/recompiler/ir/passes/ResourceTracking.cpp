@@ -1073,6 +1073,7 @@ private:
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
 		resource.read            = resource.read || !write || atomic;
 		resource.written         = resource.written || write;
+		resource.stored          = resource.stored || access == BufferAccess::Write;
 		resource.atomic          = resource.atomic || atomic;
 		resource.formatted       = resource.formatted || memory.formatted;
 		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||

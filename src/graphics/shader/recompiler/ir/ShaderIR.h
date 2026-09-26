@@ -104,7 +104,8 @@ struct BufferResource {
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
 	uint32_t               image_alias        = NoImageAlias;
 	bool                   read               = false;
-	bool                   written            = false;
+	bool                   written            = false; // Stores or atomics.
+	bool                   stored             = false; // Plain (non-atomic) stores.
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;

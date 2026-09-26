@@ -559,8 +559,10 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 		}
-		std::printf("permutation: stage=%u hash=%016llx%s\n", static_cast<uint32_t>(stage),
-		            static_cast<unsigned long long>(hash), reason.c_str());
+		const auto now = std::chrono::steady_clock::now().time_since_epoch();
+		std::printf("permutation: stage=%u hash=%016llx t=%.3f%s\n", static_cast<uint32_t>(stage),
+		            static_cast<unsigned long long>(hash),
+		            std::chrono::duration<double>(now).count(), reason.c_str());
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
@@ -992,12 +994,12 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs,
-    vk::ImageAspectFlags feedback_aspects) {
+    vk::ImageAspectFlags feedback_aspects, bool may_defer) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1141,7 +1143,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		if (found.optimize_pending) [[unlikely]] {
 			InstallOptimizedPipeline(found, command);
 		}
-		return found;
+		return &found;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1152,6 +1154,23 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
 		     vs_id, static_cast<void*>(vertex_program.module), ps_id,
 		     static_cast<void*>(pixel_program.module));
+	}
+
+	if (may_defer && m_libraries != nullptr && Config::PipelineLibrariesEnabled()) {
+		// Queue the shader parts no earlier pipeline built, and skip the draw until they are
+		// compiled; the other two parts and the link take about a millisecond.
+		bool ready = false;
+		PrefetchLibraryParts(m_graphics, rendering, key.vertex_input, vertex_info, ps_input_info,
+		                     programs, static_params, *m_libraries, m_driver_cache, &ready);
+		if (!ready) {
+			m_deferred_draws[key]++;
+			return nullptr;
+		}
+	}
+	uint32_t deferred_draws = 0;
+	if (auto deferred = m_deferred_draws.find(key); deferred != m_deferred_draws.end()) {
+		deferred_draws = deferred->second;
+		m_deferred_draws.erase(deferred);
 	}
 
 	auto cached = std::make_unique<Pipeline>();
@@ -1176,14 +1195,22 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			return text.empty() ? std::string("-") : text;
 		};
 		const auto bits = static_cast<uint32_t>(library_parts);
-		std::printf("pipeline: vs=%llu ps=%llu ms=%.1f libs=%s%s%s\n",
+		const auto now = std::chrono::steady_clock::now();
+		// "deferred=" counts the draws skipped while its parts compiled; "sync" marks a pipeline
+		// created synchronously although asynchronous pipelines are on.
+		std::string deferral;
+		if (deferred_draws != 0) {
+			deferral = fmt::format(" deferred={}", deferred_draws);
+		} else if (!may_defer && Config::AsyncPipelinesEnabled()) {
+			deferral = " sync";
+		}
+		std::printf("pipeline: vs=%llu ps=%llu ms=%.1f libs=%s%s%s%s t=%.3f\n",
 		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id),
-		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-		                                                      create_start)
-		                .count(),
+		            std::chrono::duration<double, std::milli>(now - create_start).count(),
 		            library_parts < 0 ? "mono" : letters(bits & 0xfu, "VPFO").c_str(),
 		            library_parts > 0 && (bits >> 5u) != 0 ? " pre=" : "",
-		            library_parts > 0 && (bits >> 5u) != 0 ? letters(bits >> 5u, "PF").c_str() : "");
+		            library_parts > 0 && (bits >> 5u) != 0 ? letters(bits >> 5u, "PF").c_str() : "",
+		            deferral.c_str(), std::chrono::duration<double>(now.time_since_epoch()).count());
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -1193,7 +1220,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
-	return *iter->second;
+	return iter->second.get();
 }
 
 uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const HW::Shader& sh,
@@ -1377,7 +1404,10 @@ uint32_t PipelineCache::PrefetchComputePipeline(const HW::Context& ctx, const HW
 
 void PipelineCache::LogLookahead(uint32_t draws, uint32_t parts) const {
 	if (PermutationLogEnabled()) [[unlikely]] {
-		std::printf("lookahead: draws=%u prefetched parts=%u\n", draws, parts);
+		std::printf("lookahead: draws=%u prefetched parts=%u t=%.3f\n", draws, parts,
+		            std::chrono::duration<double>(
+		                std::chrono::steady_clock::now().time_since_epoch())
+		                .count());
 	}
 }
 
@@ -1436,12 +1466,12 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 	m_compute_pipelines_created++;
 	if (PermutationLogEnabled()) [[unlikely]] {
-		std::printf("pipeline: cs=%llu ms=%.1f%s\n",
+		const auto now = std::chrono::steady_clock::now();
+		std::printf("pipeline: cs=%llu ms=%.1f%s t=%.3f\n",
 		            static_cast<unsigned long long>(compute_program.id),
-		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-		                                                      create_start)
-		                .count(),
-		            prefetched ? " pre=C" : "");
+		            std::chrono::duration<double, std::milli>(now - create_start).count(),
+		            prefetched ? " pre=C" : "",
+		            std::chrono::duration<double>(now.time_since_epoch()).count());
 	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

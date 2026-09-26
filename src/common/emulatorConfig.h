@@ -80,6 +80,7 @@ struct ConfigOptions {
 	uint32_t               label_flush_interval_us     = 2000;
 	uint32_t               gpu_timestamp_scale_percent = 100;
 	bool                   pipeline_libraries_enabled  = true;
+	bool                   async_pipelines_enabled     = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -149,6 +150,12 @@ void     SetGpuTimestampScalePercent(uint32_t percent);
 bool PipelineLibrariesEnabled();
 // Changes it while running (the settings panel); applies to pipelines created afterwards.
 void SetPipelineLibrariesEnabled(bool enabled);
+// Draws whose graphics pipeline is still compiling are skipped instead of waiting for it, so a
+// new pipeline never stalls the game; what it draws appears a few frames late. Needs pipeline
+// libraries.
+bool AsyncPipelinesEnabled();
+// Changes it while running (the settings panel).
+void SetAsyncPipelinesEnabled(bool enabled);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

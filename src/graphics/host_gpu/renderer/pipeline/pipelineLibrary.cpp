@@ -6,6 +6,14 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <chrono>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -14,6 +22,14 @@ namespace {
 // Prefetched parts compile while Thread_Gpu is stalled on a loading burst's first pipeline; six
 // threads leave the game two cores of an 8-core CPU during loads, when it needs little.
 constexpr uint32_t CompileThreadCount = 6;
+
+// Background compiles run below the game's priority: while the game runs (with asynchronous
+// pipelines, or during play), they use spare cores instead of slowing its frames.
+void LowerThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
 
 } // namespace
 
@@ -69,6 +85,15 @@ PipelineLibraryCache::Found PipelineLibraryCache::Find(const std::string& key) {
 	return {entry.pipeline, entry.prefetched};
 }
 
+bool PipelineLibraryCache::Ready(const std::string& key) const {
+	const auto iter = m_libraries.find(key);
+	if (iter == m_libraries.end()) {
+		return false;
+	}
+	const auto& pending = iter->second.pending;
+	return !pending.valid() || pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+}
+
 vk::Pipeline PipelineLibraryCache::Take(const std::string& key) {
 	const auto found = Find(key);
 	m_libraries.erase(key);
@@ -82,11 +107,13 @@ vk::Pipeline PipelineLibraryCache::Insert(std::string key, vk::Pipeline library)
 	return iter->second.pipeline;
 }
 
-bool PipelineLibraryCache::Prefetch(std::string key, Common::UniqueFunction<vk::Pipeline>&& compile) {
+bool PipelineLibraryCache::Prefetch(std::string key, Common::UniqueFunction<vk::Pipeline>&& compile,
+                                    bool urgent) {
 	if (m_libraries.contains(key)) {
 		return false;
 	}
 	CompileJob job;
+	job.key     = key;
 	job.compile = std::move(compile);
 	Entry entry;
 	entry.pending    = job.result.get_future().share();
@@ -96,11 +123,25 @@ bool PipelineLibraryCache::Prefetch(std::string key, Common::UniqueFunction<vk::
 		if (m_compile_stopped) {
 			return false;
 		}
-		m_compile_jobs.push_back(std::move(job));
+		if (urgent) {
+			m_compile_jobs.push_front(std::move(job));
+		} else {
+			m_compile_jobs.push_back(std::move(job));
+		}
 	}
 	m_libraries.emplace(std::move(key), std::move(entry));
 	m_compile_available.notify_one();
 	return true;
+}
+
+void PipelineLibraryCache::Promote(const std::string& key) {
+	std::lock_guard lock(m_compile_mutex);
+	const auto      queued = std::ranges::find(m_compile_jobs, key, &CompileJob::key);
+	if (queued != m_compile_jobs.end() && queued != m_compile_jobs.begin()) {
+		auto job = std::move(*queued);
+		m_compile_jobs.erase(queued);
+		m_compile_jobs.push_front(std::move(job));
+	}
 }
 
 void PipelineLibraryCache::KeepLayout(vk::PipelineLayout                       layout,
@@ -174,6 +215,7 @@ void PipelineLibraryCache::Stop() {
 
 void PipelineLibraryCache::LinkThread(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("PipelineLink");
+	LowerThreadPriority();
 	for (;;) {
 		LinkJob job;
 		{
@@ -206,6 +248,7 @@ void PipelineLibraryCache::LinkThread(const std::stop_token& stop) {
 
 void PipelineLibraryCache::CompileThread(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("PipelinePrefetch");
+	LowerThreadPriority();
 	for (;;) {
 		CompileJob job;
 		{

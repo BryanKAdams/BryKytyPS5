@@ -939,17 +939,34 @@ uint32_t PrefetchLibraryParts(GraphicContext& graphics, const PipelineRenderingS
                               const ShaderPixelInputInfo*            ps_input_info,
                               const PipelineCache::GraphicsPrograms& programs,
                               const PipelineStaticParameters&        static_params,
-                              PipelineLibraryCache& libraries, vk::PipelineCache driver_cache) {
+                              PipelineLibraryCache& libraries, vk::PipelineCache driver_cache,
+                              bool* ready) {
 	// Shared by the two compile jobs, which may outlive this call.
 	auto state = std::make_shared<GraphicsPipelineState>(graphics.device);
 	BuildGraphicsPipelineState(*state, graphics, rendering, vertex_input, vertex_info, ps_input_info,
 	                           programs, static_params);
 	if (!UsesLibraries(graphics, *state)) {
+		// Monolithic pipelines are only built by the draw that needs them.
+		if (ready != nullptr) {
+			*ready = true;
+		}
 		return 0;
 	}
 	const auto keys = BuildLibraryPartKeys(*state, programs);
 	const bool need_pre      = !libraries.Contains(keys.pre_raster);
 	const bool need_fragment = !libraries.Contains(keys.fragment);
+	// A skipped draw waits for these parts: its jobs go ahead of look-ahead prefetches.
+	const bool urgent = ready != nullptr;
+	if (urgent) {
+		*ready = !need_pre && !need_fragment && libraries.Ready(keys.pre_raster) &&
+		         libraries.Ready(keys.fragment);
+		if (!need_pre) {
+			libraries.Promote(keys.pre_raster);
+		}
+		if (!need_fragment) {
+			libraries.Promote(keys.fragment);
+		}
+	}
 	if (!need_pre && !need_fragment) {
 		return 0;
 	}
@@ -964,14 +981,14 @@ uint32_t PrefetchLibraryParts(GraphicContext& graphics, const PipelineRenderingS
 	if (need_pre &&
 	    libraries.Prefetch(keys.pre_raster, [&graphics, state, layout, driver_cache] {
 		    return CreatePreRasterPart(graphics, *state, layout, driver_cache, true);
-	    })) {
+	    }, urgent)) {
 		queued++;
 	}
 	if (need_fragment &&
 	    libraries.Prefetch(keys.fragment, [&graphics, state, layout, driver_cache,
 	                                       depth_stencil = keys.depth_stencil] {
 		    return CreateFragmentPart(graphics, *state, depth_stencil, layout, driver_cache, true);
-	    })) {
+	    }, urgent)) {
 		queued++;
 	}
 	return queued;

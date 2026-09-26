@@ -172,13 +172,17 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	// With `may_defer` (asynchronous pipelines), a new pipeline whose shader library parts are not
+	// compiled yet is not created: its parts are queued on worker threads and the result is null,
+	// and the caller skips the draw. Otherwise never null.
+	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs,
-	                              vk::ImageAspectFlags    feedback_aspects = {});
+	                              vk::ImageAspectFlags feedback_aspects = {},
+	                              bool                 may_defer        = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -279,6 +283,8 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_prefetched;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// Asynchronous pipelines: draws skipped so far for each pipeline whose parts are compiling.
+	std::unordered_map<GraphicsPipelineKey, uint32_t, GraphicsPipelineKeyHash> m_deferred_draws;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 	std::jthread                                            m_precompile_thread;
@@ -305,14 +311,16 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
                            const PipelineStaticParameters&        static_params,
                            PipelineLibraryCache* libraries, vk::PipelineCache driver_cache);
 // Compiles the missing shader library parts of a graphics pipeline on the library cache's worker
-// threads. Returns the number of parts queued.
+// threads. Returns the number of parts queued. `ready`, when given, receives whether the
+// pipeline can be created without waiting for a shader part to compile.
 uint32_t PrefetchLibraryParts(GraphicContext& graphics, const PipelineRenderingState& rendering,
                               const PipelineVertexInputState&        vertex_input,
                               std::span<const ShaderVertexInputInfo> vertex_info,
                               const ShaderPixelInputInfo*            ps_input_info,
                               const PipelineCache::GraphicsPrograms& programs,
                               const PipelineStaticParameters&        static_params,
-                              PipelineLibraryCache& libraries, vk::PipelineCache driver_cache);
+                              PipelineLibraryCache& libraries, vk::PipelineCache driver_cache,
+                              bool* ready = nullptr);
 // Creates a compute pipeline's layouts and returns the call that creates the pipeline itself. That
 // call reads only its own copies, so it may run on another thread; it returns null on failure.
 Common::UniqueFunction<vk::Pipeline> PrepareComputePipeline(GraphicContext&               graphics,

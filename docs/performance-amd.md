@@ -493,6 +493,39 @@ Most of what remains is driver compile time in loading frames that create 20-30 
 after another (one took 6.2 s), and compute pipelines (6 s over the run), which have no library
 form.
 
+### Asynchronous pipelines
+
+With "Asynchronous pipelines" in the settings panel (`async-pipelines` in the settings file,
+off by default), a draw whose new graphics pipeline still needs a shader library part does not
+wait: the missing parts are queued ahead of look-ahead prefetches, the draw is skipped, and the
+same draw in a later frame links the pipeline once its parts are compiled. Objects and effects
+seen for the first time appear a few frames late instead of freezing the game. Draws whose
+shaders store to buffers or write storage images are never skipped, since later work may read
+what they write; buffer atomics alone do not count (Astro Bot's geometry shaders record a
+per-object maximum with one). Compute dispatches always wait.
+
+The first try left the gameplay minute at 21-36 fps for half a minute: the six compile threads
+and the link thread, at normal priority, took CPU time from the game while they worked through
+the burst. All background compile threads now run below normal priority. Cold start, one round
+each, same build:
+
+| | Off | On |
+| --- | --- | --- |
+| Gameplay minute: stalls (frames of 50 ms or more) | 4.2 s (13 frames) | 0.87 s (8 frames) |
+| Gameplay minute: worst frame | 1.13 s | 0.20 s |
+| Whole run: stalls | 22.6 s | 10.6 s |
+| Graphics pipeline creation in stalled frames, whole run | 16.4 s | 4.3 s |
+
+154 pipelines were deferred, skipping 5333 draws in all. What remains in play is shader
+translation (50-180 ms frames, in the draw path and in look-ahead walks); in loading screens it
+is compute pipelines (1.2-1.3 s each at boot and scene loads) and translation. The game registers
+its shaders (`AgcCreateShader`) 7 to 128 s before their first pipeline, but a pipeline also
+depends on the resource descriptors bound at the draw or dispatch, so compiling at registration
+could only guess.
+
+To see where a stalled frame's time goes, hitch lines also report `lookahead` (look-ahead walks,
+mostly the shader translation they run) and `gpu-thread-idle` (Thread_Gpu waiting for the game).
+
 ## Settings file
 
 `kyty_settings.ini` in the working directory holds default options, one per line, named like the
@@ -501,6 +534,7 @@ command-line flags without `--`; `#` starts a comment, and a switch needs no val
 ```text
 gpu-timestamp-scale = 115   # dynamic-resolution headroom
 pipeline-libraries = false  # build every graphics pipeline in one piece
+async-pipelines = true      # skip draws whose new pipeline is compiling
 fullscreen
 ```
 

@@ -47,11 +47,17 @@ public:
 	[[nodiscard]] Found Find(const std::string& key);
 	vk::Pipeline        Insert(std::string key, vk::Pipeline library);
 	[[nodiscard]] bool  Contains(const std::string& key) const { return m_libraries.contains(key); }
+	// The part is present and no prefetch is still compiling it (Find would not wait).
+	[[nodiscard]] bool  Ready(const std::string& key) const;
 
 	// Compiles a part on a worker thread under `key`, unless the key is already present. `compile`
 	// owns everything its create info points to. Returns whether a job was queued. The workers
-	// also compile whole compute pipelines, which the compute path then takes out with Take.
-	bool Prefetch(std::string key, Common::UniqueFunction<vk::Pipeline>&& compile);
+	// also compile whole compute pipelines, which the compute path then takes out with Take. An
+	// `urgent` job (a part a skipped draw waits for) goes ahead of queued prefetches.
+	bool Prefetch(std::string key, Common::UniqueFunction<vk::Pipeline>&& compile,
+	              bool urgent = false);
+	// Moves the queued job of `key`, if any, ahead of the other queued jobs.
+	void Promote(const std::string& key);
 	// Removes `key` and hands its pipeline to the caller, waiting while it compiles; null when the
 	// key is absent or its compile failed.
 	[[nodiscard]] vk::Pipeline Take(const std::string& key);
@@ -85,6 +91,7 @@ private:
 	};
 
 	struct CompileJob {
+		std::string                          key;
 		std::promise<vk::Pipeline>           result;
 		Common::UniqueFunction<vk::Pipeline> compile;
 	};

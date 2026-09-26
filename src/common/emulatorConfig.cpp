@@ -202,6 +202,17 @@ void SetPipelineLibrariesEnabled(bool enabled) {
 	g_pipeline_libraries_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
+static std::atomic<int> g_async_pipelines_override {-1};
+
+bool AsyncPipelinesEnabled() {
+	const auto enabled = g_async_pipelines_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->async_pipelines_enabled;
+}
+
+void SetAsyncPipelinesEnabled(bool enabled) {
+	g_async_pipelines_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {

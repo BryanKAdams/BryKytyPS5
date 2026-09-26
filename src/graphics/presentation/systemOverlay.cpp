@@ -1089,6 +1089,20 @@ struct SystemOverlay::Impl {
 		    "pipelines built from now on, on GPU drivers with fast pipeline-library linking.");
 		ImGui::PopTextWrapPos();
 		ImGui::Separator();
+
+		bool async_pipelines = Config::AsyncPipelinesEnabled();
+		if (ImGui::Checkbox("Asynchronous pipelines", &async_pipelines)) {
+			Config::SetAsyncPipelinesEnabled(async_pipelines);
+			settings_save_failed = !Common::SettingsFile::Save("async-pipelines",
+			                                                   async_pipelines ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "Instead of stalling the game while a new graphics pipeline compiles, skips the "
+		    "draws that need it until it is ready, so objects and effects seen for the first time "
+		    "appear a few frames late. Needs pipeline libraries.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
 		if (settings_save_failed) {
 			ImGui::TextColored({1.0f, 0.5f, 0.4f, 1.0f}, "Could not save %s",
 			                   Common::SettingsFile::FileName);
