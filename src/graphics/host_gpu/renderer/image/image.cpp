@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -206,10 +208,23 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		destination_stage |=
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
+	const auto old_state = backing.state;
 	const auto barriers =
 	    GetBarriers(destination_layout, destination_access, destination_stage, range);
 	if (barriers.empty()) {
 		return;
+	}
+	if (g_render_debug_counters.log_barriers.load(std::memory_order_relaxed)) [[unlikely]] {
+		g_render_debug_counters.image_barriers.fetch_add(1, std::memory_order_relaxed);
+		std::printf("draw-log barrier: image=%ux%u format=%d depth=%u layout %d->%d "
+		            "access 0x%llx->0x%llx\n",
+		            info.extent.width, info.extent.height, static_cast<int>(backing.format),
+		            static_cast<uint32_t>(info.IsDepth()), static_cast<int>(old_state.layout),
+		            static_cast<int>(destination_layout),
+		            static_cast<unsigned long long>(
+		                static_cast<vk::AccessFlags2::MaskType>(old_state.access_mask)),
+		            static_cast<unsigned long long>(
+		                static_cast<vk::AccessFlags2::MaskType>(destination_access)));
 	}
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};

@@ -3,10 +3,21 @@
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
 namespace Libs::Graphics {
+
+// Counted for KYTY_DEBUG_DRAW_LOG: dynamic rendering instances begun and ended, and image
+// barriers recorded.
+struct RenderDebugCounters {
+	std::atomic<uint64_t> render_begins {0};
+	std::atomic<uint64_t> render_ends {0};
+	std::atomic<uint64_t> image_barriers {0};
+	std::atomic<bool>     log_barriers {false}; // Set while a logged draw records.
+};
+inline RenderDebugCounters g_render_debug_counters;
 
 class CommandBuffer;
 

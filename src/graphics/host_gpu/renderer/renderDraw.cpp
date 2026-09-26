@@ -38,8 +38,11 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -84,6 +87,57 @@ std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 static std::atomic<uint32_t> g_draw_state_log_count   = 0;
 static std::atomic<uint32_t> g_draw_input_log_count   = 0;
 static std::atomic<uint32_t> g_mrt_state_log_count    = 0;
+
+// Debug: KYTY_DEBUG_DRAW_LOG=<pixel shader hash> prints each draw with that pixel shader: its
+// geometry, and for a draw with GPU-written arguments the counts the conversion pass wrote, read
+// back from the draw-record ring once the GPU is done with them.
+namespace DrawLog {
+
+struct Pending {
+	const uint8_t*                        output = nullptr;
+	uint64_t                              draw   = 0;
+	std::chrono::steady_clock::time_point recorded;
+};
+
+static uint64_t Hash() {
+	static const uint64_t hash = [] {
+		const char* text = std::getenv("KYTY_DEBUG_DRAW_LOG");
+		return text != nullptr ? std::strtoull(text, nullptr, 16) : uint64_t {0};
+	}();
+	return hash;
+}
+
+static double Seconds() {
+	static const auto start = std::chrono::steady_clock::now();
+	return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+static std::vector<Pending>& PendingOutputs() {
+	static std::vector<Pending> pending;
+	return pending;
+}
+
+// Prints the GPU-written counts of draws recorded long enough ago. The ring holds 4 MiB of
+// records, far more than a second of draws, so a slot is still intact then.
+static void Flush() {
+	auto&      pending = PendingOutputs();
+	const auto now     = std::chrono::steady_clock::now();
+	std::erase_if(pending, [&](const Pending& item) {
+		if (now - item.recorded < std::chrono::milliseconds(250)) {
+			return false;
+		}
+		uint32_t record[7] {};
+		uint32_t command[3] {};
+		std::memcpy(record, item.output + MeshIndirectArgs::RecordOffset, sizeof(record));
+		std::memcpy(command, item.output + MeshIndirectArgs::CommandOffset, sizeof(command));
+		std::printf("draw-log gpu: draw=%" PRIu64 " index_count=%u first_instance=%u groups=%u "
+		            "instances=%u z=%u\n",
+		            item.draw, record[0], record[2], command[0], command[1], command[2]);
+		return true;
+	});
+}
+
+} // namespace DrawLog
 
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
 
@@ -1054,6 +1108,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
+	const bool draw_logged = DrawLog::Hash() != 0 && state.ps_active &&
+	                         state.ps_input_info.stage.program != nullptr &&
+	                         state.ps_input_info.stage.program->shader_hash == DrawLog::Hash();
+	std::array<uint64_t, 3> counters_before {};
+	if (draw_logged) [[unlikely]] {
+		counters_before = {g_render_debug_counters.render_begins.load(std::memory_order_relaxed),
+		                   g_render_debug_counters.render_ends.load(std::memory_order_relaxed),
+		                   g_render_debug_counters.image_barriers.load(std::memory_order_relaxed)};
+	}
+	struct BarrierLogScope {
+		bool active = false;
+		~BarrierLogScope() {
+			if (active) {
+				g_render_debug_counters.log_barriers.store(false, std::memory_order_relaxed);
+			}
+		}
+	} barrier_log_scope {draw_logged};
+	if (draw_logged) [[unlikely]] {
+		g_render_debug_counters.log_barriers.store(true, std::memory_order_relaxed);
+	}
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	const bool gpu_args    = draw.indirect_args != 0;
 	uint32_t   mesh_groups = 0;
@@ -1146,13 +1220,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	mesh_slices.clear();
 	auto&                        records       = m_context.GetBufferCache().GetDrawRecordBuffer();
 	uint64_t                     gpu_output    = 0;
+	const uint8_t*               gpu_output_mapped = nullptr;
 	std::pair<Buffer*, uint64_t> gpu_arguments = {nullptr, 0};
 	if (gpu_args) {
 		// The GPU writes this slot; the CPU only reserves it.
 		const auto [mapped, offset] = records.Map(MeshIndirectArgs::OutputSize, 64);
 		EXIT_IF(mapped == nullptr);
 		records.Commit();
-		gpu_output    = offset;
+		gpu_output        = offset;
+		gpu_output_mapped = mapped;
 		gpu_arguments = m_context.GetBufferCache().ObtainBuffer(
 		    draw.indirect_args, MeshIndirectArgs::ArgumentsSize, false);
 	} else if (mesh_active) {
@@ -1174,6 +1250,29 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			    const auto offset = records.Copy(draw_data, sizeof(draw_data), 16);
 			    mesh_slices.emplace_back(slice, records.BufferDeviceAddress() + offset);
 		    });
+	}
+	if (draw_logged) [[unlikely]] {
+		static uint64_t draws = 0;
+		draws++;
+		DrawLog::Flush();
+		const auto* vertex      = state.vertex_info[0].stage.program;
+		const auto  index_limit = index_source.guest_element_size != 0
+		                              ? index_source.size / index_source.guest_element_size
+		                              : 0;
+		std::printf("draw-log: t=%.3f draw=%" PRIu64 " vs=%016" PRIx64
+		            " mesh=%u gpu_args=%u indexed=%u prim=%u index_count=%u instances=%u"
+		            " index_limit=%" PRIu64 " index_bytes=%u per_group=%u groups=%u extent=%ux%u\n",
+		            DrawLog::Seconds(), draws, vertex != nullptr ? vertex->shader_hash : 0,
+		            mesh_active, gpu_args, draw.IsIndexed(),
+		            static_cast<uint32_t>(ucfg.GetPrimType()), draw.index_count, draw.instance_count,
+		            index_limit, index_source.guest_element_size,
+		            mesh_active ? state.vertex_info[0].mesh.primitives_per_group : 0u, mesh_groups,
+		            state.color_count > 0 ? state.color_info[0].Extent().width : 0u,
+		            state.color_count > 0 ? state.color_info[0].Extent().height : 0u);
+		if (gpu_args) {
+			DrawLog::PendingOutputs().push_back(
+			    {gpu_output_mapped, draws, std::chrono::steady_clock::now()});
+		}
 	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
@@ -1300,6 +1399,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
+	}
+	if (draw_logged) [[unlikely]] {
+		std::printf(
+		    "draw-log end: render_begins=%" PRIu64 " render_ends=%" PRIu64
+		    " image_barriers=%" PRIu64 " shader_write_barrier=%u\n",
+		    g_render_debug_counters.render_begins.load(std::memory_order_relaxed) - counters_before[0],
+		    g_render_debug_counters.render_ends.load(std::memory_order_relaxed) - counters_before[1],
+		    g_render_debug_counters.image_barriers.load(std::memory_order_relaxed) -
+		        counters_before[2],
+		    static_cast<uint32_t>(static_cast<bool>(shader_write_stages)));
 	}
 }
 

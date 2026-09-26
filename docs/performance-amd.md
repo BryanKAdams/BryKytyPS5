@@ -919,6 +919,13 @@ LLVM IR and ISA there. `--journal-opcodes <journal> <OPCODE>` lists the recorded
 a guest opcode. Together they answer codegen questions (scalar vs vector loads, register
 pressure) without a game run.
 
+`KYTY_DEBUG_DRAW_LOG=<pixel shader hash>` prints every draw with that pixel shader: its vertex
+shader, path (mesh-emulated, GPU-written arguments), primitive type, index and instance counts
+and mesh groups, the counts a GPU-arguments pre-pass wrote (read back from the draw-record ring
+about 250 ms later), and how many rendering instances began and ended and image barriers were
+recorded during the draw, with each barrier's image, layouts and access. It costs nothing when
+unset.
+
 `KYTY_DEBUG_LOOP_HEAT=<hash>:<pc>[,<pc>[,<pc>]]` (hexadecimal) makes one pixel shader export, in
 place of its colour targets, how many times its wave ran each guest PC (red, green, blue), in
 bands: 0 black, 1-15 0.0625, 16-63 0.25, 64-255 1, 256-1023 4, 1024 or more 32. The shader's own
