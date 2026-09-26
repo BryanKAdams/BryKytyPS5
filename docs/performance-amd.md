@@ -358,7 +358,8 @@ parallel. The parts are then fast-linked, which averages 0.45 ms. A background t
 each such pipeline with link-time optimization, and the draw path swaps that pipeline in on a
 later lookup, retiring the fast-linked one once the GPU is done with it. A mesh pipeline has no
 vertex input part: its mesh shader is the pre-rasterization part, and its push constant range
-covers the mesh and fragment stages. RectList pipelines stay monolithic (their tessellation
+covers the mesh and fragment stages (currently disabled; see below). RectList pipelines stay
+monolithic (their tessellation
 shaders are generated per vertex and pixel shader pair, and Astro Bot draws none to test a
 library form with), as do all pipelines on drivers without fast linking. The switch is
 "Pipeline libraries" in the settings panel (`pipeline-libraries` in the settings file), on by
@@ -367,13 +368,51 @@ default.
 Astro Bot's main geometry uses mesh shaders of 84k-103k SPIR-V words, and each one appears in
 several pipelines with different pixel shaders. Built monolithically, the 13 mesh pipelines of a
 cold run took 7.0 s (up to 1.24 s each), recompiling the same mesh shader every time. As library
-pipelines they take 3.75 s, and the cold run's stalls drop from about 37 s to 33 s (worst frame
-7.8 s to 6.5 s), two rounds each.
+pipelines they took 3.75 s, and the cold run's stalls dropped from about 37 s to 33 s (worst
+frame 7.8 s to 6.5 s), two rounds each. But 2 of about 14 runs with mesh library pipelines
+rendered the whole desert blown out to saturated yellow from the first gameplay frame (sand
+255,251,62 against a normal 242,191,102), and none of the 18 runs before did, so mesh pipelines
+are monolithic again until that is understood. A likely cause is a separately compiled fragment
+part reading a mesh output that a monolithic compile would zero, with the garbage poisoning the
+game's temporal auto-exposure.
 
 Also tried: `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` on the library parts (the background
 link still optimizes fully) cut graphics pipeline creation only 6-8% (stalls 36.4 s to 34.7 s,
 two rounds). It is not adopted: new pipelines would run unoptimized code until the relink swaps
 in, which is a GPU cost not yet measured.
+
+Also tried: loading bounds-checked buffer elements without a branch (the SRT session's
+6820afbd). Matched pipeline creation fell 9% (graphics) and 6-10% (compute), but a warm check
+standing still at the start of play measured GPU busy 10.46 to 10.51 ms per frame, with shader
+5a10a907 6% and ef31694e 18% slower per megapixel: the select on the load address stops the
+compiler folding constant offsets into loads. One of its four runs also rendered the scene
+blown out to saturated yellow for the whole run. It was reverted pending a form that selects only
+the loaded value.
+
+### Look-ahead prefetch
+
+Most cold-start stall time sits in loading frames that create 20-30 pipelines one after another
+(boot, the title screen, scene loads). When a draw creates a pipeline, the command processor
+walks the rest of the command stream without executing it: a second command processor gets a
+copy of the register state, and only register writes (context, shader and user-config
+registers and their indirect forms, context clear/push/pop, user-data markers) and indirect
+buffer calls and chains are replayed, through the same handlers. Branches and non-type-3
+packets end the walk. At each draw packet, the pipeline cache predicts the draw's pipeline from
+the registers alone: it translates the shaders, derives the attachment sample count and whether
+a depth attachment is bound, and takes the rasterizer state; then it queues the shader library
+parts no earlier pipeline built on four worker threads. The draw finds them compiled, or waits
+for them. A wrong prediction only costs a compile. Draws the draw path handles without their
+shaders (metadata color modes, resolves, depth/stencil copies, unknown primitive types) are
+skipped, so no translation runs that the real draw would not run. One walk covers up to 256
+draws and does not run again until those draws are processed. It runs whenever pipeline
+libraries are on.
+
+Cold start, two alternating rounds, mesh pipelines monolithic on both sides: the run's stalls
+fell from 36.9 and 36.3 s to 30.9 and 32.7 s, and the worst frame from 7.6 and 7.8 s to 5.5 and
+5.4 s. The gameplay minute did not change (4.5-5.4 s against 4.3-6.1 s): its stalls are single
+new pipelines, which a look-ahead cannot overlap. In one checked run, 150 of 209 graphics
+pipelines used prefetched parts. With mesh library pipelines still on (three rounds), the same
+comparison was 35.6, 35.1 and 33.7 s against 28.2, 27.1 and 28.6 s.
 
 Pixel shader resources use descriptor set 1 and vertex-side stages set 0. Layouts with
 independent sets would let each shader part ignore the other stage's set, but on this driver any

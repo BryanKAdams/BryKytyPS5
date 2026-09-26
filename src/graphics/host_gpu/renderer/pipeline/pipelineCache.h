@@ -181,6 +181,18 @@ public:
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
+	// Graphics pipelines created so far; a change across a draw means it compiled one.
+	[[nodiscard]] uint64_t GraphicsPipelinesCreated() const noexcept {
+		return m_graphics_pipelines_created;
+	}
+	// Predicts the graphics pipeline a draw with these registers will need, translating its
+	// shaders, and queues its missing shader library parts on worker threads. Nothing is recorded
+	// or bound; a wrong prediction only costs the compile. Returns the number of parts queued.
+	uint32_t PrefetchGraphicsPipeline(const HW::Context& ctx, const HW::Shader& sh,
+	                                  const HW::UserConfig& user_config);
+	// Prints a look-ahead's result with KYTY_PERMUTATION_LOG=1.
+	void LogLookahead(uint32_t draws, uint32_t parts) const;
+
 private:
 	friend struct AttachmentFeedbackTestAccess;
 	struct ProgramCache;
@@ -250,6 +262,7 @@ private:
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::unique_ptr<PipelineLibraryCache> m_libraries;
+	uint64_t                              m_graphics_pipelines_created = 0;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -277,6 +290,15 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
                            const PipelineCache::GraphicsPrograms& programs,
                            const PipelineStaticParameters&        static_params,
                            PipelineLibraryCache* libraries, vk::PipelineCache driver_cache);
+// Compiles the missing shader library parts of a graphics pipeline on the library cache's worker
+// threads. Returns the number of parts queued.
+uint32_t PrefetchLibraryParts(GraphicContext& graphics, const PipelineRenderingState& rendering,
+                              const PipelineVertexInputState&        vertex_input,
+                              std::span<const ShaderVertexInputInfo> vertex_info,
+                              const ShaderPixelInputInfo*            ps_input_info,
+                              const PipelineCache::GraphicsPrograms& programs,
+                              const PipelineStaticParameters&        static_params,
+                              PipelineLibraryCache& libraries, vk::PipelineCache driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

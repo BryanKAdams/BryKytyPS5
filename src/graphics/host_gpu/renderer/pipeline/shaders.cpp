@@ -665,11 +665,12 @@ void AppendBindingsKey(std::string& key, std::span<const vk::DescriptorSetLayout
 	AppendKey(key, push);
 }
 
-// Creates one library part from the parts of `info` that belong to it.
+// Creates one library part from the parts of `info` that belong to it. A prefetch is speculative, so
+// its failure returns null instead of stopping.
 vk::Pipeline CreateLibraryPart(GraphicContext& graphics, vk::GraphicsPipelineLibraryFlagsEXT part,
                                vk::GraphicsPipelineCreateInfo         info,
                                const vk::PipelineRenderingCreateInfo& rendering,
-                               vk::PipelineCache                      driver_cache) {
+                               vk::PipelineCache driver_cache, bool prefetch = false) {
 	vk::GraphicsPipelineLibraryCreateInfoEXT library {};
 	library.pNext = const_cast<vk::PipelineRenderingCreateInfo*>(&rendering);
 	library.flags = part;
@@ -678,44 +679,45 @@ vk::Pipeline CreateLibraryPart(GraphicContext& graphics, vk::GraphicsPipelineLib
 	              vk::PipelineCreateFlagBits::eRetainLinkTimeOptimizationInfoEXT;
 	info.basePipelineIndex = -1;
 	vk::Pipeline pipeline  = nullptr;
-	EXIT_NOT_IMPLEMENTED(graphics.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr,
-	                                                             &pipeline) != vk::Result::eSuccess);
+	const auto   result =
+	    graphics.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, &pipeline);
+	if (result != vk::Result::eSuccess) {
+		EXIT_NOT_IMPLEMENTED(!prefetch);
+		LOGF("PipelineLibrary: prefetch compile failed (%s)\n", vk::to_string(result).c_str());
+		return nullptr;
+	}
 	return pipeline;
 }
 
-// Builds the pipeline from graphics-pipeline-library parts, compiling the parts no earlier pipeline
-// built, and fast-links them. Returns a bit per compiled part.
-//
-// Every part uses the pipeline's full layout. Layouts with independent sets would let a shader
-// part ignore the other stage's descriptor set, but on AMD's 26.6 driver any pipeline with such a
-// layout (even a monolithic one) lost the device within the first frames. So a shader part is
-// shared by pipelines whose two descriptor set layouts match, and all parts use one push constant
-// range for every stage (mesh pipelines: the mesh and fragment stages, which the mesh draw path
-// pushes its parameter record to).
-//
-// A mesh pipeline has no vertex input part: its mesh shader is the pre-rasterization part.
-uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                               const GraphicsPipelineState&           state,
-                               const PipelineCache::GraphicsPrograms& programs,
-                               PipelineLibraryCache& libraries, vk::PipelineCache driver_cache) {
-	using Part                       = vk::GraphicsPipelineLibraryFlagBitsEXT;
-	const uint32_t pre_raster_stages = state.stage_count - state.fragment_stage_count;
-	const vk::PipelineRenderingCreateInfo shader_rendering {};
-	vk::PipelineDynamicStateCreateInfo    shared_dynamic_state {};
-	shared_dynamic_state.dynamicStateCount = state.shared_dynamic_state_count;
-	shared_dynamic_state.pDynamicStates    = state.dynamic_states.data();
+// The push constant range every part of a library pipeline declares: all stages but mesh (mesh
+// pipelines: the mesh and fragment stages, which the mesh draw path pushes its parameter record to).
+vk::ShaderStageFlags LibraryPushStages(const GraphicsPipelineState& state) {
+	return state.mesh ? vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment
+	                  : LibraryPushConstantStages;
+}
 
-	const vk::ShaderStageFlags push_stages =
-	    state.mesh ? vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment
-	               : LibraryPushConstantStages;
-	CreateGraphicsLayouts(graphics, pipeline, state, push_stages);
-	pipeline.push_constant_stages = push_stages;
-	std::string layout_key;
+// The cache keys of a pipeline's four parts: each holds everything its part's create info depends
+// on, so equal keys mean interchangeable parts.
+struct LibraryPartKeys {
+	std::string vertex_input;
+	std::string pre_raster;
+	std::string fragment;
+	std::string output;
+	// The fragment part's depth-stencil state: without a depth attachment the bounds test has
+	// nothing to test, so it is left out.
+	vk::PipelineDepthStencilStateCreateInfo depth_stencil {};
+};
+
+LibraryPartKeys BuildLibraryPartKeys(const GraphicsPipelineState&           state,
+                                     const PipelineCache::GraphicsPrograms& programs) {
+	LibraryPartKeys keys;
+	std::string     layout_key;
 	AppendBindingsKey(layout_key, state.vertex_bindings, state.vertex_uses_push);
 	AppendBindingsKey(layout_key, state.pixel_bindings, state.pixel_uses_push);
-	AppendKey(layout_key, static_cast<uint32_t>(push_stages));
+	AppendKey(layout_key, static_cast<uint32_t>(LibraryPushStages(state)));
 
-	std::string vertex_input_key(1, 'V');
+	auto& vertex_input_key = keys.vertex_input;
+	vertex_input_key       = "V";
 	AppendKey(vertex_input_key, state.vertex_input.vertexBindingDescriptionCount);
 	for (uint32_t i = 0; i < state.vertex_input.vertexBindingDescriptionCount; i++) {
 		AppendKey(vertex_input_key, state.input_desc[i]);
@@ -727,7 +729,9 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 	AppendKey(vertex_input_key, state.input_assembly.topology);
 	AppendKey(vertex_input_key, state.input_assembly.primitiveRestartEnable);
 
-	std::string pre_raster_key(1, 'P');
+	const uint32_t pre_raster_stages = state.stage_count - state.fragment_stage_count;
+	auto&          pre_raster_key    = keys.pre_raster;
+	pre_raster_key                   = "P";
 	AppendKey(pre_raster_key, pre_raster_stages);
 	for (uint32_t i = 0; i < pre_raster_stages; i++) {
 		AppendKey(pre_raster_key, programs.vertex[i].id);
@@ -743,21 +747,21 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 	AppendKey(pre_raster_key, state.rasterizer.polygonMode);
 	pre_raster_key += layout_key;
 
-	// Without a depth attachment the bounds test has nothing to test.
-	vk::PipelineDepthStencilStateCreateInfo depth_stencil {};
 	if (state.with_depth && state.depth_stencil.depthBoundsTestEnable == VK_TRUE) {
-		depth_stencil = state.depth_stencil;
+		keys.depth_stencil = state.depth_stencil;
 	}
-	std::string fragment_key(1, 'F');
+	auto& fragment_key = keys.fragment;
+	fragment_key       = "F";
 	AppendKey(fragment_key, state.fragment_stage_count != 0 ? programs.pixel.id : uint64_t {0});
 	AppendKey(fragment_key, state.multisampling.rasterizationSamples);
 	AppendKey(fragment_key, state.multisampling.sampleShadingEnable);
-	AppendKey(fragment_key, depth_stencil.depthBoundsTestEnable);
-	AppendKey(fragment_key, depth_stencil.minDepthBounds);
-	AppendKey(fragment_key, depth_stencil.maxDepthBounds);
+	AppendKey(fragment_key, keys.depth_stencil.depthBoundsTestEnable);
+	AppendKey(fragment_key, keys.depth_stencil.minDepthBounds);
+	AppendKey(fragment_key, keys.depth_stencil.maxDepthBounds);
 	fragment_key += layout_key;
 
-	std::string output_key(1, 'O');
+	auto& output_key = keys.output;
+	output_key       = "O";
 	AppendKey(output_key, state.rendering.colorAttachmentCount);
 	for (uint32_t i = 0; i < state.rendering.colorAttachmentCount; i++) {
 		AppendKey(output_key, state.rendering.pColorAttachmentFormats[i]);
@@ -768,54 +772,109 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 	AppendKey(output_key, state.multisampling.rasterizationSamples);
 	AppendKey(output_key, state.multisampling.sampleShadingEnable);
 	AppendKey(output_key, state.dynamic_state.dynamicStateCount);
+	return keys;
+}
 
-	uint32_t    built           = 0;
-	auto        vertex_input    = libraries.Find(vertex_input_key);
-	auto        pre_raster      = libraries.Find(pre_raster_key);
-	auto        fragment        = libraries.Find(fragment_key);
-	auto        fragment_output = libraries.Find(output_key);
-	const auto& layout          = pipeline.pipeline_layout;
+vk::Pipeline CreatePreRasterPart(GraphicContext& graphics, const GraphicsPipelineState& state,
+                                 vk::PipelineLayout layout, vk::PipelineCache driver_cache,
+                                 bool prefetch) {
+	const vk::PipelineRenderingCreateInfo shader_rendering {};
+	vk::PipelineDynamicStateCreateInfo    dynamic_state {};
+	dynamic_state.dynamicStateCount = state.shared_dynamic_state_count;
+	dynamic_state.pDynamicStates    = state.dynamic_states.data();
+	vk::GraphicsPipelineCreateInfo info {};
+	info.stageCount          = state.stage_count - state.fragment_stage_count;
+	info.pStages             = state.stages.data();
+	info.pTessellationState  = state.uses_tessellation ? &state.tessellation : nullptr;
+	info.pViewportState      = &state.viewport;
+	info.pRasterizationState = &state.rasterizer;
+	info.pDynamicState       = &dynamic_state;
+	info.layout              = layout;
+	return CreateLibraryPart(graphics, vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders,
+	                         info, shader_rendering, driver_cache, prefetch);
+}
+
+vk::Pipeline CreateFragmentPart(GraphicContext& graphics, const GraphicsPipelineState& state,
+                                const vk::PipelineDepthStencilStateCreateInfo& depth_stencil,
+                                vk::PipelineLayout layout, vk::PipelineCache driver_cache,
+                                bool prefetch) {
+	const vk::PipelineRenderingCreateInfo shader_rendering {};
+	vk::PipelineDynamicStateCreateInfo    dynamic_state {};
+	dynamic_state.dynamicStateCount = state.shared_dynamic_state_count;
+	dynamic_state.pDynamicStates    = state.dynamic_states.data();
+	vk::GraphicsPipelineCreateInfo info {};
+	info.stageCount          = state.fragment_stage_count;
+	info.pStages             = state.fragment_stage_count != 0
+	                               ? state.stages.data() + (state.stage_count - state.fragment_stage_count)
+	                               : nullptr;
+	info.pMultisampleState  = &state.multisampling;
+	info.pDepthStencilState = &depth_stencil;
+	info.pDynamicState      = &dynamic_state;
+	info.layout             = layout;
+	return CreateLibraryPart(graphics, vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader, info,
+	                         shader_rendering, driver_cache, prefetch);
+}
+
+// Builds the pipeline from graphics-pipeline-library parts, compiling the parts no earlier pipeline
+// built or prefetched, and fast-links them. Returns a bit per compiled part in the low nibble and a
+// bit per prefetched part used in the next.
+//
+// Every part uses the pipeline's full layout. Layouts with independent sets would let a shader
+// part ignore the other stage's descriptor set, but on AMD's 26.6 driver any pipeline with such a
+// layout (even a monolithic one) lost the device within the first frames. So a shader part is
+// shared by pipelines whose two descriptor set layouts match, and all parts use one push constant
+// range (see LibraryPushStages).
+//
+// A mesh pipeline has no vertex input part: its mesh shader is the pre-rasterization part.
+uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                               const GraphicsPipelineState&           state,
+                               const PipelineCache::GraphicsPrograms& programs,
+                               PipelineLibraryCache& libraries, vk::PipelineCache driver_cache) {
+	using Part = vk::GraphicsPipelineLibraryFlagBitsEXT;
+	const vk::PipelineRenderingCreateInfo shader_rendering {};
+	vk::PipelineDynamicStateCreateInfo    shared_dynamic_state {};
+	shared_dynamic_state.dynamicStateCount = state.shared_dynamic_state_count;
+	shared_dynamic_state.pDynamicStates    = state.dynamic_states.data();
+
+	const auto push_stages = LibraryPushStages(state);
+	CreateGraphicsLayouts(graphics, pipeline, state, push_stages);
+	pipeline.push_constant_stages = push_stages;
+	auto keys = BuildLibraryPartKeys(state, programs);
+
+	uint32_t   built           = 0;
+	const auto found_input     = libraries.Find(keys.vertex_input);
+	const auto found_pre       = libraries.Find(keys.pre_raster);
+	const auto found_fragment  = libraries.Find(keys.fragment);
+	const auto found_output    = libraries.Find(keys.output);
+	auto       vertex_input    = found_input.pipeline;
+	auto       pre_raster      = found_pre.pipeline;
+	auto       fragment        = found_fragment.pipeline;
+	auto       fragment_output = found_output.pipeline;
+	built |= (found_pre.prefetched ? 1u << 5u : 0u) | (found_fragment.prefetched ? 1u << 6u : 0u);
+	const auto& layout = pipeline.pipeline_layout;
 
 	// The two shader parts hold nearly all of the compile time; when both are new, the fragment
 	// part compiles on another thread while this one compiles the pre-rasterization part.
-	std::future<vk::Pipeline>      fragment_compile;
-	vk::GraphicsPipelineCreateInfo fragment_info {};
+	std::future<vk::Pipeline> fragment_compile;
 	if (fragment == nullptr) {
-		fragment_info.stageCount = state.fragment_stage_count;
-		fragment_info.pStages    = state.fragment_stage_count != 0
-		                               ? state.stages.data() + pre_raster_stages
-		                               : nullptr;
-		fragment_info.pMultisampleState  = &state.multisampling;
-		fragment_info.pDepthStencilState = &depth_stencil;
-		fragment_info.pDynamicState      = &shared_dynamic_state;
-		fragment_info.layout             = layout;
 		const auto compile = [&] {
-			return CreateLibraryPart(graphics, Part::eFragmentShader, fragment_info,
-			                         shader_rendering, driver_cache);
+			return CreateFragmentPart(graphics, state, keys.depth_stencil, layout, driver_cache,
+			                          false);
 		};
 		if (pre_raster == nullptr) {
 			fragment_compile = std::async(std::launch::async, compile);
 		} else {
-			fragment = libraries.Insert(std::move(fragment_key), compile());
+			fragment = libraries.Insert(keys.fragment, compile());
 			built |= 1u << 2u;
 		}
 	}
 	if (pre_raster == nullptr) {
-		vk::GraphicsPipelineCreateInfo info {};
-		info.stageCount          = pre_raster_stages;
-		info.pStages             = state.stages.data();
-		info.pTessellationState  = state.uses_tessellation ? &state.tessellation : nullptr;
-		info.pViewportState      = &state.viewport;
-		info.pRasterizationState = &state.rasterizer;
-		info.pDynamicState       = &shared_dynamic_state;
-		info.layout              = layout;
-		pre_raster = libraries.Insert(std::move(pre_raster_key),
-		                              CreateLibraryPart(graphics, Part::ePreRasterizationShaders,
-		                                                info, shader_rendering, driver_cache));
+		pre_raster = libraries.Insert(
+		    keys.pre_raster, CreatePreRasterPart(graphics, state, layout, driver_cache, false));
 		built |= 1u << 1u;
 	}
 	if (fragment_compile.valid()) {
-		fragment = libraries.Insert(std::move(fragment_key), fragment_compile.get());
+		fragment = libraries.Insert(keys.fragment, fragment_compile.get());
 		built |= 1u << 2u;
 	}
 	if (vertex_input == nullptr && !state.mesh) {
@@ -823,7 +882,7 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 		info.pVertexInputState   = &state.vertex_input;
 		info.pInputAssemblyState = &state.input_assembly;
 		info.pDynamicState       = &shared_dynamic_state;
-		vertex_input = libraries.Insert(std::move(vertex_input_key),
+		vertex_input = libraries.Insert(keys.vertex_input,
 		                                CreateLibraryPart(graphics, Part::eVertexInputInterface,
 		                                                  info, shader_rendering, driver_cache));
 		built |= 1u << 0u;
@@ -833,7 +892,7 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 		info.pMultisampleState = &state.multisampling;
 		info.pColorBlendState  = &state.color_blending;
 		info.pDynamicState     = &state.dynamic_state;
-		fragment_output = libraries.Insert(std::move(output_key),
+		fragment_output = libraries.Insert(keys.output,
 		                                   CreateLibraryPart(graphics, Part::eFragmentOutputInterface,
 		                                                     info, state.rendering, driver_cache));
 		built |= 1u << 3u;
@@ -857,7 +916,65 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 	return built;
 }
 
+bool UsesLibraries(const GraphicContext& graphics, const GraphicsPipelineState& state) {
+	// RectList pipelines stay monolithic: their tessellation shaders are generated per vertex and
+	// pixel shader pair, and Astro Bot draws none to test a library form with. Static feedback
+	// loop flags only appear where the dynamic feedback loop state is unsupported.
+	//
+	// Mesh pipelines stay monolithic too for now. Built from libraries (c422cad7), 2 of about 14
+	// Astro Bot runs rendered the whole desert blown out to saturated yellow from the first
+	// gameplay frame, and none of the 18 runs before did. That fits a separately compiled fragment
+	// part reading a mesh output a monolithic compile would have zeroed, poisoning the game's
+	// auto-exposure. The library form stays available below for when that is understood.
+	return graphics.pipeline_library_enabled && graphics.pipeline_library_fast_linking &&
+	       Config::PipelineLibrariesEnabled() && !state.rect_list && !state.flags && !state.mesh;
+}
+
 } // namespace
+
+uint32_t PrefetchLibraryParts(GraphicContext& graphics, const PipelineRenderingState& rendering,
+                              const PipelineVertexInputState&        vertex_input,
+                              std::span<const ShaderVertexInputInfo> vertex_info,
+                              const ShaderPixelInputInfo*            ps_input_info,
+                              const PipelineCache::GraphicsPrograms& programs,
+                              const PipelineStaticParameters&        static_params,
+                              PipelineLibraryCache& libraries, vk::PipelineCache driver_cache) {
+	// Shared by the two compile jobs, which may outlive this call.
+	auto state = std::make_shared<GraphicsPipelineState>(graphics.device);
+	BuildGraphicsPipelineState(*state, graphics, rendering, vertex_input, vertex_info, ps_input_info,
+	                           programs, static_params);
+	if (!UsesLibraries(graphics, *state)) {
+		return 0;
+	}
+	const auto keys = BuildLibraryPartKeys(*state, programs);
+	const bool need_pre      = !libraries.Contains(keys.pre_raster);
+	const bool need_fragment = !libraries.Contains(keys.fragment);
+	if (!need_pre && !need_fragment) {
+		return 0;
+	}
+	// A layout identically defined to the one the pipeline itself will create.
+	PipelineCache::Pipeline layouts;
+	CreateGraphicsLayouts(graphics, layouts, *state, LibraryPushStages(*state));
+	const std::array set_layouts {layouts.descriptor_set_layout, layouts.pixel_set_layout};
+	libraries.KeepLayout(layouts.pipeline_layout, set_layouts);
+	const auto layout = layouts.pipeline_layout;
+
+	uint32_t queued = 0;
+	if (need_pre &&
+	    libraries.Prefetch(keys.pre_raster, [&graphics, state, layout, driver_cache] {
+		    return CreatePreRasterPart(graphics, *state, layout, driver_cache, true);
+	    })) {
+		queued++;
+	}
+	if (need_fragment &&
+	    libraries.Prefetch(keys.fragment, [&graphics, state, layout, driver_cache,
+	                                       depth_stencil = keys.depth_stencil] {
+		    return CreateFragmentPart(graphics, *state, depth_stencil, layout, driver_cache, true);
+	    })) {
+		queued++;
+	}
+	return queued;
+}
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
@@ -881,12 +998,7 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
 		     (static_params.blend_enable[0] ? "true" : "false"),
 		     state.dynamic_state.dynamicStateCount);
 	}
-	// RectList pipelines stay monolithic: their tessellation shaders are generated per vertex and
-	// pixel shader pair, and Astro Bot draws none to test a library form with. Static feedback loop
-	// flags only appear where the dynamic feedback loop state is unsupported.
-	if (libraries != nullptr && graphics.pipeline_library_enabled &&
-	    graphics.pipeline_library_fast_linking && Config::PipelineLibrariesEnabled() &&
-	    !state.rect_list && !state.flags) {
+	if (libraries != nullptr && UsesLibraries(graphics, state)) {
 		return static_cast<int>(
 		    CreateLibraryPipeline(graphics, pipeline, state, programs, *libraries, driver_cache));
 	}

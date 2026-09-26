@@ -165,6 +165,11 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
+	// After a draw that created a pipeline: walks the rest of the command stream without
+	// executing it, replaying only register writes into a copy of the register state, and asks
+	// the pipeline cache to prefetch the shader library parts of the draws it finds, so a loading
+	// burst's pipelines compile in parallel instead of one after another.
+	void RunPipelineLookahead(const Pm4Execution& execution);
 	void SuspendPm4();
 	void SynchronizePredicate(uint64_t address, uint64_t size);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
@@ -198,6 +203,8 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	// Draws the last look-ahead already covered; no new look-ahead runs until they are processed.
+	uint32_t  m_lookahead_draws_left        = 0;
 };
 
 } // namespace Libs::Graphics

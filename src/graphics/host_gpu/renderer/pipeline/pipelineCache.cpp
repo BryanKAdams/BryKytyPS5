@@ -5,15 +5,18 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -1134,25 +1137,29 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	    CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                           ps_input_info, programs, static_params, m_libraries.get(),
 	                           m_driver_cache);
+	m_graphics_pipelines_created++;
 	if (PermutationLogEnabled()) [[unlikely]] {
 		// "libs=" lists the library parts compiled: vertex input, pre-rasterization, fragment
 		// shader, fragment output ("-" when all were cached); "mono" is a monolithic pipeline.
-		char parts[5] = "-";
-		if (library_parts > 0) {
-			uint32_t length = 0;
-			for (uint32_t bit = 0; bit < 4; bit++) {
-				if ((library_parts & (1 << bit)) != 0) {
-					parts[length++] = "VPFO"[bit];
+		// "pre=" lists the shader parts a prefetch had compiled.
+		const auto letters = [](uint32_t bits, const char* names) {
+			std::string text;
+			for (uint32_t bit = 0; names[bit] != '\0'; bit++) {
+				if ((bits & (1u << bit)) != 0) {
+					text += names[bit];
 				}
 			}
-			parts[length] = '\0';
-		}
-		std::printf("pipeline: vs=%llu ps=%llu ms=%.1f libs=%s\n",
+			return text.empty() ? std::string("-") : text;
+		};
+		const auto bits = static_cast<uint32_t>(library_parts);
+		std::printf("pipeline: vs=%llu ps=%llu ms=%.1f libs=%s%s%s\n",
 		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id),
 		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
 		                                                      create_start)
 		                .count(),
-		            library_parts < 0 ? "mono" : parts);
+		            library_parts < 0 ? "mono" : letters(bits & 0xfu, "VPFO").c_str(),
+		            library_parts > 0 && (bits >> 5u) != 0 ? " pre=" : "",
+		            library_parts > 0 && (bits >> 5u) != 0 ? letters(bits >> 5u, "PF").c_str() : "");
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -1163,6 +1170,158 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(!inserted);
 
 	return *iter->second;
+}
+
+uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const HW::Shader& sh,
+                                                 const HW::UserConfig& user_config) {
+	KYTY_PROFILER_FUNCTION();
+	if (m_libraries == nullptr || !Config::PipelineLibrariesEnabled()) {
+		return 0;
+	}
+	const auto& vs = sh.GetVs();
+	const auto& ps = sh.GetPs();
+	if (vs.es_regs.data_addr == 0) {
+		return 0;
+	}
+	// Only primitive types the draw path accepts; RectList pipelines stay monolithic.
+	const auto prim_type = user_config.GetPrimType();
+	switch (prim_type) {
+		case Prospero::PrimitiveType::kPointList:
+		case Prospero::PrimitiveType::kLineList:
+		case Prospero::PrimitiveType::kLineStrip:
+		case Prospero::PrimitiveType::kTriList:
+		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kTriStrip:
+		case Prospero::PrimitiveType::kQuadListLegacy: break;
+		case Prospero::PrimitiveType::kPatch:
+			if (!Config::TessellationEnabled()) {
+				return 0;
+			}
+			break;
+		default: return 0;
+	}
+	// The draw path turns metadata color modes, resolves and depth/stencil copies into other
+	// operations without translating their shaders, and a translation must not run that the real
+	// draw never would.
+	const auto color_mode = ctx.GetColorControl().mode;
+	if (color_mode > 1) {
+		return 0;
+	}
+	const auto& override    = ctx.GetDepthRenderOverride();
+	const auto& depth_regs  = ctx.GetDepthRenderTarget();
+	const bool  depth_copy  = override.force_z_dirty && override.force_z_valid &&
+	                        depth_regs.z_info.format != Prospero::DepthFormat::kInvalid &&
+	                        depth_regs.z_read_base_addr != 0 && depth_regs.z_write_base_addr != 0 &&
+	                        depth_regs.z_read_base_addr != depth_regs.z_write_base_addr;
+	const bool stencil_copy =
+	    override.force_stencil_dirty && override.force_stencil_valid &&
+	    depth_regs.stencil_info.format != Prospero::StencilFormat::kInvalid &&
+	    depth_regs.stencil_read_base_addr != 0 && depth_regs.stencil_write_base_addr != 0 &&
+	    depth_regs.stencil_read_base_addr != depth_regs.stencil_write_base_addr;
+	if (color_mode == 0 && (depth_copy || stencil_copy)) {
+		return 0;
+	}
+
+	// The draw path's decisions, made from the same registers.
+	const auto& sh_regs     = ctx.GetShaderRegisters();
+	const auto& db          = sh_regs.db_shader_control;
+	const bool  side_effect = db.shader_kill_enable || db.shader_z_export_enable ||
+	                         db.shader_mask_export_enable || db.shader_dual_export_enable ||
+	                         db.shader_execute_on_noop;
+	const auto target_mask = ctx.GetRenderTargetMask();
+	const bool ps_active   = ps.ps_regs.data_addr != 0 &&
+	                       ((target_mask & sh_regs.m_cbShaderMask) != 0 || side_effect);
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> export_mapping {};
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& rt = ctx.GetRenderTarget(slot);
+		if (rt.base.addr != 0 && render_target_mask_slot(target_mask, slot) != 0) {
+			export_mapping[slot] = TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
+			                                                    rt.info.channel_order)
+			                           .export_mapping;
+		}
+	}
+	std::array<ShaderVertexInputInfo, 3> vertex_info;
+	ShaderPixelInputInfo                 pixel_info;
+	const auto programs = GetGraphicsPrograms(vs, ps, sh_regs, ctx, user_config, export_mapping,
+	                                          ps_active, vertex_info, pixel_info);
+	if (!programs.vertex[0] || (ps_active && !programs.pixel)) {
+		return 0;
+	}
+
+	uint32_t samples = 0;
+	if (ps_active) {
+		for (const auto& output: pixel_info.stage.program->info.outputs) {
+			if (output.kind != ShaderRecompiler::IR::StageOutputKind::Mrt ||
+			    output.index >= RENDER_COLOR_ATTACHMENTS_MAX || samples != 0) {
+				continue;
+			}
+			const auto& rt = ctx.GetRenderTarget(output.index);
+			if (rt.base.addr != 0 && render_target_mask_slot(target_mask, output.index) != 0) {
+				samples = render_sample_count(rt.attrib.num_fragments);
+			}
+		}
+	}
+	// As ResolveRenderDepthTarget decides whether the draw has a depth attachment.
+	const auto& z           = ctx.GetDepthRenderTarget();
+	const auto& rc          = ctx.GetRenderControl();
+	const auto& dc          = ctx.GetDepthControl();
+	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const bool  depth_active =
+	    dc.z_enable || dc.depth_bounds_enable || rc.depth_clear_enable || rc.copy_depth_to_color;
+	const bool stencil_active =
+	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
+	const bool with_depth = (depth_active || stencil_active) &&
+	                        (z.z_info.format != Prospero::DepthFormat::kInvalid || has_stencil);
+	if (with_depth && samples == 0) {
+		samples = render_sample_count(z.z_info.num_samples);
+	}
+	if (samples == 0 && !with_depth) {
+		samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
+	}
+	if (samples == 0) {
+		return 0;
+	}
+
+	PipelineStaticParameters static_params {};
+	const auto&              clip_control = ctx.GetClipControl();
+	const auto&              mc           = ctx.GetModeControl();
+	static_params.negative_one_to_one     = !clip_control.dx_clip_space;
+	static_params.depth_clip_enable       = clip_control.IsZClipEnabled();
+	static_params.topology                = prim_type == Prospero::PrimitiveType::kPatch
+	                                            ? vk::PrimitiveTopology::ePatchList
+	                                            : vk::PrimitiveTopology::eTriangleList;
+	static_params.samples                 = samples;
+	static_params.sample_shading_enable   = ps_active && samples > 1 && pixel_info.ps_sample_shading;
+	static_params.depth_bounds_test_enable = with_depth && dc.depth_bounds_enable;
+	static_params.depth_min_bounds         = ctx.GetDepthBoundsMin();
+	static_params.depth_max_bounds         = ctx.GetDepthBoundsMax();
+	static_params.cull_back                = mc.cull_back;
+	static_params.cull_front               = mc.cull_front;
+	static_params.face                     = mc.face;
+	static_params.provoking_vtx_last       = mc.provoking_vtx_last;
+	static_params.polygon_mode = ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
+		return 0;
+	}
+
+	// The shader parts do not depend on attachment formats or vertex input, which the prediction
+	// leaves empty; a depth attachment only matters as present or not.
+	PipelineRenderingState rendering {};
+	if (with_depth) {
+		rendering.depth_format = vk::Format::eD32Sfloat;
+	}
+	const PipelineVertexInputState vertex_input {};
+	Common::LockGuard              lock(m_mutex);
+	return PrefetchLibraryParts(m_graphics, rendering, vertex_input,
+	                            std::span(vertex_info).first(programs.VertexStageCount()),
+	                            ps_active ? &pixel_info : nullptr, programs, static_params,
+	                            *m_libraries, m_driver_cache);
+}
+
+void PipelineCache::LogLookahead(uint32_t draws, uint32_t parts) const {
+	if (PermutationLogEnabled()) [[unlikely]] {
+		std::printf("lookahead: draws=%u prefetched parts=%u\n", draws, parts);
+	}
 }
 
 void PipelineCache::InstallOptimizedPipeline(Pipeline& pipeline, CommandBuffer& command) {

@@ -795,6 +795,20 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+static bool IsDrawOpcode(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return true;
+		default: return false;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
@@ -875,6 +889,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		const bool     draw            = IsDrawOpcode(opcode);
+		const uint64_t pipelines_before =
+		    draw ? m_renderer.GetPipelineCache().GraphicsPipelinesCreated() : 0;
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -892,7 +909,142 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			execution.m_next_buffer = {};
 		}
+		if (draw) {
+			if (m_lookahead_draws_left > 0) {
+				m_lookahead_draws_left--;
+			} else if (m_renderer.GetPipelineCache().GraphicsPipelinesCreated() != pipelines_before &&
+			           !IsAsyncComputeQueue()) {
+				RunPipelineLookahead(execution);
+			}
+		}
 	}
+}
+
+void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
+	KYTY_PROFILER_FUNCTION();
+	// Enough for a loading frame's draws; the walk costs a few microseconds per known draw.
+	constexpr uint32_t MaxDraws   = 256;
+	constexpr uint32_t MaxPackets = 1u << 16u;
+
+	// A second processor holds the copied register state, so the real handlers can replay register
+	// writes into it. Its other state is never used: only register packets reach it.
+	auto shadow                     = std::make_unique<CommandProcessor>(m_renderer, m_interrupt_event_id);
+	shadow->m_ctx                   = m_ctx;
+	shadow->m_saved_ctx             = m_saved_ctx;
+	shadow->m_context_state_pushed  = m_context_state_pushed;
+	shadow->m_ucfg                  = m_ucfg;
+	shadow->m_sh_ctx                = m_sh_ctx;
+	shadow->m_user_data_marker      = m_user_data_marker;
+	shadow->m_index_type_and_size   = m_index_type_and_size;
+
+	auto&    pipelines = m_renderer.GetPipelineCache();
+	auto     stack     = execution.m_buffer_stack;
+	uint32_t draws     = 0;
+	uint32_t parts     = 0;
+	for (uint32_t packets = 0; !stack.empty() && draws < MaxDraws && packets < MaxPackets;
+	     packets++) {
+		auto& cursor = stack.back();
+		if (cursor.offset_dw >= cursor.commands.size()) {
+			stack.pop_back();
+			continue;
+		}
+		const auto* packet    = cursor.commands.data() + cursor.offset_dw;
+		const auto  total_dw  = static_cast<uint32_t>(cursor.commands.size());
+		const auto  remaining = total_dw - cursor.offset_dw;
+		const auto  header    = packet[0];
+		if (header == 0x80000000u) {
+			cursor.offset_dw++;
+			continue;
+		}
+		// Only type-3 packets are followed; anything else ends the walk.
+		const auto packet_dw = KYTY_PM4_LEN(header);
+		if ((header >> 30u) != 3u || remaining < 2 || packet_dw > remaining) {
+			break;
+		}
+		const auto opcode = (header >> 8u) & 0xffu;
+		switch (opcode) {
+			case Pm4::IT_SET_CONTEXT_REG:
+			case Pm4::IT_SET_SH_REG:
+			case Pm4::IT_SET_UCONFIG_REG:
+			case Pm4::IT_SET_UCONFIG_REG_INDEX:
+			case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+			case Pm4::IT_SET_SH_REG_INDIRECT:
+			case Pm4::IT_SET_UCONFIG_REG_INDIRECT: {
+				// The packets the real walk will execute next, through the same handlers.
+				const auto handled =
+				    g_cp_op_func[opcode](*shadow, header & ~1u, packet + 1, remaining, total_dw) + 1;
+				if (handled != packet_dw) {
+					stack.clear();
+					continue;
+				}
+				break;
+			}
+			case Pm4::IT_CLEAR_STATE: shadow->m_ctx.Reset(); break;
+			case Pm4::IT_NOP: {
+				const auto r = KYTY_PM4_R(header);
+				if (r == Pm4::R_ZERO && packet_dw >= 2 && (packet[1] & 0xffff0000u) == 0x68750000u) {
+					// User data markers classify the SGPR writes that follow (see CpOpMarker).
+					const auto id = packet[1] & 0xfffu;
+					if (id == 0x4u) {
+						shadow->SetUserDataMarker(HW::UserSgprType::Vsharp);
+					} else if (id == 0xdu) {
+						shadow->SetUserDataMarker(HW::UserSgprType::Region);
+					}
+				} else if (r == Pm4::R_CONTEXT_STATE && packet_dw >= 3) {
+					const auto operation = packet[1];
+					const bool push      = operation == static_cast<uint32_t>(ContextStateOperation::Push) ||
+					                  operation == static_cast<uint32_t>(ContextStateOperation::PushClear);
+					const bool pop = operation == static_cast<uint32_t>(ContextStateOperation::Pop);
+					if (operation > static_cast<uint32_t>(ContextStateOperation::PushClear) ||
+					    (push && shadow->m_context_state_pushed) ||
+					    (pop && !shadow->m_context_state_pushed)) {
+						stack.clear();
+						continue;
+					}
+					shadow->ApplyContextStateOperation(static_cast<ContextStateOperation>(operation));
+				}
+				break;
+			}
+			case Pm4::IT_INDIRECT_BUFFER: {
+				// Calls and chains are followed; branches (the 14-dword form) end the walk.
+				if (packet_dw != 4u) {
+					stack.clear();
+					continue;
+				}
+				const auto* address =
+				    reinterpret_cast<const uint32_t*>(packet[1] | (static_cast<uint64_t>(packet[2]) << 32u));
+				const auto  size  = packet[3] & 0xfffffu;
+				const bool  chain = (packet[3] & (1u << 20u)) != 0;
+				cursor.offset_dw += packet_dw;
+				if (size == 0) {
+					continue;
+				}
+				if (address == nullptr) {
+					stack.clear();
+					continue;
+				}
+				const std::span<const uint32_t> commands(address, size);
+				if (chain) {
+					stack.back() = {commands};
+				} else {
+					stack.push_back({commands});
+				}
+				continue;
+			}
+			default:
+				if (IsDrawOpcode(opcode)) {
+					draws++;
+					parts += pipelines.PrefetchGraphicsPipeline(shadow->m_ctx, shadow->m_sh_ctx,
+					                                            shadow->m_ucfg);
+				}
+				// Everything else (waits, events, memory writes, dispatches) leaves the
+				// register state alone and is skipped.
+				break;
+		}
+		cursor.offset_dw += packet_dw;
+	}
+	m_lookahead_draws_left = draws;
+	pipelines.LogLookahead(draws, parts);
 }
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {
