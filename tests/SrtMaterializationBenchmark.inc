@@ -482,6 +482,11 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
     pipeline_info.stage.module = module;
     pipeline_info.stage.pName = "main";
     pipeline_info.layout = pipeline_layout;
+    // KYTY_TEST_DISABLE_OPT=1 times the driver's unoptimized compile instead.
+    if (const char *value = std::getenv("KYTY_TEST_DISABLE_OPT");
+        value != nullptr && value[0] == '1') {
+      pipeline_info.flags = vk::PipelineCreateFlagBits::eDisableOptimization;
+    }
     vk::Pipeline pipeline = nullptr;
     const auto start = std::chrono::steady_clock::now();
     RequireVk(name, "pipeline",

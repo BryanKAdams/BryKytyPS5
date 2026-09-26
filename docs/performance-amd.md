@@ -827,6 +827,12 @@ after the structurizer change): `TranslateProgram` about 616 ms, `RewriteToSsa` 
 `RemoveIdentities` 106; 2363 ms in all. The two largest compute shaders also spend 0.85-1.27 s
 each in the AMD driver.
 
+**Dead end: unoptimized first compiles.** A fast unoptimized pipeline, replaced by an optimized
+one in the background, only pays if the driver compiles much faster without optimization. It
+doesn't: with `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` (`KYTY_TEST_DISABLE_OPT=1` with
+`--pipeline-compile-time`) the median compile of `900aba8df9448d3d` went from 1034 to 947 ms,
+`01d6f21611218e74` from 805 to 756 ms and `5bb5e709d757909d` from 228 to 219 ms (-4% to -8%).
+
 ## Remaining rendering work
 
 Formatted FP16 buffer stores still use `PackHalf2x16`, whose rounding mode is implementation-defined
