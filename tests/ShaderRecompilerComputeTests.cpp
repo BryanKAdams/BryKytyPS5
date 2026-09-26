@@ -1709,6 +1709,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
+  // KYTY_EXEC_REGIONS=1 runs the pixel tests with the exec-region-branching setting on.
+  options.exec_region_branching = std::getenv("KYTY_EXEC_REGIONS") != nullptr;
 
   auto translated =
       ShaderRecompiler::TranslateProgram(test.fragment_code, options);

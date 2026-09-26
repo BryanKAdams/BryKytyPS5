@@ -1139,6 +1139,10 @@ void CollapseIndexedSelects(const BlockList& blocks, PossibleValues& possible) {
 
 } // namespace
 
+bool IsLaneLocalOpcode(ValueOpcode opcode) {
+	return IsLaneLocal(opcode);
+}
+
 void ConstantPropagationPass(const BlockList& blocks) {
 	std::unordered_set<Inst*> lowered_ancillary;
 	PossibleValues            possible;

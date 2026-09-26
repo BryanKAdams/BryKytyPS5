@@ -441,6 +441,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.exec_region_branching = Config::ExecRegionBranchingEnabled();
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -1071,6 +1072,7 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 		options.dump_ir        = false;
 		options.early_dump     = false;
 		options.dump_label     = "ShaderPrecompile";
+		options.exec_region_branching = Config::ExecRegionBranchingEnabled();
 		std::visit(
 		    [&](auto& info) {
 			    using Info = std::decay_t<decltype(info)>;

@@ -249,6 +249,22 @@ buffer loads became 1, and VGPRs fell 134 to 128 (969c5ed1), 177 to 139 (5a10a90
 not change moved by up to 6% between the sides, the noise band for this view; 6996d4e2, the sand
 shader, showed no change beyond it.
 
+**Per-lane branches for EXEC-masked regions (optional):** the guest skips a region of code only
+when no lane is enabled (s_cbranch_execz), and every enabled lane's writes are masked by EXEC for
+free. The IR models that with a uniform branch on the whole mask and a select per write, so a
+region that one lane needs runs its arithmetic, loads and samples in every lane and throws most of
+it away: selects are 25-36% of the loop ALU work in 6996d4e2. With "Per-lane shader branches" in
+the settings panel (`exec-region-branching`, off by default), pixel shaders turn such a region into
+a real branch on the lane's own EXEC bit, and the GPU masks the lanes that are off. A region is
+converted only when its results provably do not change: no implicit-LOD samples (quad
+derivatives), lane reads, DPP, exports, barriers or returns inside it, stores and ballots masked
+by its EXEC, and every value leaving it either EXEC-masked or uniform (then read from a lane that
+ran the region). Helper lanes, which ballots exclude, now run a region when only they have its
+EXEC bit, as on hardware. It changes 44-52 of about 300 recorded Astro Bot permutations, all valid
+under spirv-val. RX 9070 XT ISA, off to on: VGPRs 128 to 119 (6996d4e2, 969c5ed1), 139 to 137
+(5a10a907), 120 to 117 (9d7e6bca), 54 to 51 (ef31694e); 1-4% fewer instructions and 49-123 fewer
+v_cndmask per shader; pipeline compiles 2-7% faster.
+
 The planet in the overworld shows blotchy dark patches and the background a fine dot pattern.
 Upstream `main` (5a705dd) renders the same artifacts, so they predate this branch.
 
@@ -696,6 +712,7 @@ gpu-timestamp-scale = 115   # dynamic-resolution headroom
 pipeline-libraries = false  # build every graphics pipeline in one piece
 async-pipelines = true      # skip draws whose new pipeline is compiling
 relaxed-readback = true     # game reads of GPU-written memory may see the previous value
+exec-region-branching = true  # pixel shaders skip EXEC-masked guest code per lane
 fullscreen
 ```
 
