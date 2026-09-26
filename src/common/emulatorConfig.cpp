@@ -224,17 +224,6 @@ void SetRelaxedReadbackEnabled(bool enabled) {
 	g_relaxed_readback_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
-static std::atomic<int> g_exec_region_branching_override {-1};
-
-bool ExecRegionBranchingEnabled() {
-	const auto enabled = g_exec_region_branching_override.load(std::memory_order_relaxed);
-	return enabled >= 0 ? enabled != 0 : g_config->exec_region_branching_enabled;
-}
-
-void SetExecRegionBranchingEnabled(bool enabled) {
-	g_exec_region_branching_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
-}
-
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {

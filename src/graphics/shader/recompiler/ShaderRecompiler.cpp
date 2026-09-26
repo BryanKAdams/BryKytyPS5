@@ -11,7 +11,6 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
-#include "graphics/shader/recompiler/ir/passes/ExecRegionBranching.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -637,13 +636,6 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::ApplyResourceSpecialization(ir, specialization);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
-	if (options.exec_region_branching) {
-		const auto regions = IR::BranchExecRegions(ir);
-		if (regions != 0u && options.dump_ir) {
-			LOGF("%s EXEC regions branched per lane: %" PRIu32 "\n", GetDumpLabel(options),
-			     regions);
-		}
-	}
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	IR::AllocateBindings(ir, push_data_start_dword);

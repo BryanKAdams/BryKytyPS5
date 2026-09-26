@@ -105,8 +105,6 @@ static void PrintUsage() {
 	         "compiling instead of stalling; they appear a few frames late. Default: false.\n");
 	::printf("  --relaxed-readback <true|false>      Let game threads read memory the GPU is still "
 	         "writing without waiting; a value can be a frame old. Default: false.\n");
-	::printf("  --exec-region-branching <true|false> Let pixel shaders skip EXEC-masked guest code "
-	         "per lane. Default: false.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -456,11 +454,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--relaxed-readback") {
 			if (!ParseBool(value, options.config.relaxed_readback_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--exec-region-branching") {
-			if (!ParseBool(value, options.config.exec_region_branching_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

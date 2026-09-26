@@ -82,7 +82,6 @@ struct ConfigOptions {
 	bool                   pipeline_libraries_enabled  = true;
 	bool                   async_pipelines_enabled     = false;
 	bool                   relaxed_readback_enabled    = false;
-	bool                   exec_region_branching_enabled = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -164,12 +163,6 @@ void SetAsyncPipelinesEnabled(bool enabled);
 bool RelaxedReadbackEnabled();
 // Changes it while running (the settings panel).
 void SetRelaxedReadbackEnabled(bool enabled);
-// Pixel shaders branch per lane around guest code that runs under a partial EXEC mask, so the GPU
-// skips it for lanes that are off instead of computing it and discarding the result. Off by
-// default until measured on each GPU.
-bool ExecRegionBranchingEnabled();
-// Changes it while running (the settings panel); applies to shaders compiled afterwards.
-void SetExecRegionBranchingEnabled(bool enabled);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

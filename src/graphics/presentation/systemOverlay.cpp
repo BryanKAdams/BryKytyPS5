@@ -1117,20 +1117,6 @@ struct SystemOverlay::Impl {
 		    "reads can then be one frame old.");
 		ImGui::PopTextWrapPos();
 		ImGui::Separator();
-
-		bool exec_regions = Config::ExecRegionBranchingEnabled();
-		if (ImGui::Checkbox("Per-lane shader branches", &exec_regions)) {
-			Config::SetExecRegionBranchingEnabled(exec_regions);
-			settings_save_failed = !Common::SettingsFile::Save("exec-region-branching",
-			                                                   exec_regions ? "true" : "false");
-		}
-		ImGui::PushTextWrapPos(0.0f);
-		ImGui::TextDisabled(
-		    "Pixel shaders skip work for pixels the game has switched off, instead of computing it "
-		    "and throwing it away. Applies to shaders compiled from now on; restart the game to "
-		    "apply it to all of them.");
-		ImGui::PopTextWrapPos();
-		ImGui::Separator();
 		if (settings_save_failed) {
 			ImGui::TextColored({1.0f, 0.5f, 0.4f, 1.0f}, "Could not save %s",
 			                   Common::SettingsFile::FileName);

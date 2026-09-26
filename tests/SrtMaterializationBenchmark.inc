@@ -255,8 +255,6 @@ CompileJournalRecord(ShaderPrecompile::PermutationRecord &record,
   options.dump_ir = dump_ir;
   options.early_dump = false;
   options.dump_label = label;
-  // KYTY_EXEC_REGIONS=1 compiles as with the exec-region-branching setting on.
-  options.exec_region_branching = std::getenv("KYTY_EXEC_REGIONS") != nullptr;
   std::visit(
       [&](auto &info) {
         using Info = std::decay_t<decltype(info)>;
