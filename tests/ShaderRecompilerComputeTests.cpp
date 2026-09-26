@@ -34113,6 +34113,10 @@ int main(int argc, char **argv) {
     DumpJournalShader(argv[2], argv[3], argv[4]);
     return 0;
   }
+  if (argc == 3 && std::strcmp(argv[1], "--spirv-digest") == 0) {
+    PrintSpirvDigests(argv[2]);
+    return 0;
+  }
   if (argc >= 5 && std::strcmp(argv[1], "--pipeline-compile-time") == 0) {
     VulkanHarness vulkan;
     TimePipelineCompile(vulkan, argv[2], argv[3],

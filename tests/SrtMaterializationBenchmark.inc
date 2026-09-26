@@ -327,6 +327,51 @@ double MedianOf(std::vector<double> values) {
   return values.empty() ? 0.0 : values[values.size() / 2];
 }
 
+// --spirv-digest <journal copy>: recompiles every recorded permutation as the
+// boot-time replay does and prints one line per permutation (shader hash,
+// SPIR-V digest, words, recompile time), then the totals. Diff the lines of two
+// builds to prove a recompiler change leaves the SPIR-V byte-identical.
+void PrintSpirvDigests(const char *journal_path) {
+  constexpr const char *name = "SpirvDigest";
+  auto records = ReadShaderJournalCopy(journal_path);
+  Require(name, "journal", !records.empty(),
+          std::string("no records read from ") + journal_path);
+  double total_ms = 0.0;
+  double slowest_ms = 0.0;
+  uint64_t slowest_hash = 0;
+  size_t total_words = 0;
+  size_t skipped = 0;
+  for (auto &record : records) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto compiled = CompileJournalRecord(record, name, false);
+    const auto ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    total_ms += ms;
+    if (ms > slowest_ms) {
+      slowest_ms = ms;
+      slowest_hash = record.hash;
+    }
+    if (!compiled) {
+      skipped++;
+      std::printf("digest %016llx skip\n",
+                  static_cast<unsigned long long>(record.hash));
+      continue;
+    }
+    const auto &spirv = compiled->spirv;
+    total_words += spirv.size();
+    std::printf("digest %016llx %016llx %7zu %9.2f ms\n",
+                static_cast<unsigned long long>(record.hash),
+                static_cast<unsigned long long>(
+                    XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t))),
+                spirv.size(), ms);
+  }
+  std::printf("[host]    %s: %zu permutations (%zu skipped), %zu SPIR-V words, "
+              "recompile %.1f ms total, slowest %016llx %.1f ms\n",
+              name, records.size(), skipped, total_words, total_ms,
+              static_cast<unsigned long long>(slowest_hash), slowest_ms);
+}
+
 // --pipeline-compile-time <journal copy> <hash> <rounds> [spv files...]: times
 // vkCreateComputePipelines for one recorded compute shader. Without files it
 // times the SPIR-V this build produces; with files (for example --dump-shader
