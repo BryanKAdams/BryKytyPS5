@@ -298,7 +298,10 @@ timestamps stay within a frame's stretch of the CPU clock. In the overworld (alt
 | 125 | 60.0, 60.0, 60.0 | 2.07 Mpx | 0% | 17 ms |
 
 At 115 and above the GPU keeps about 5 ms of each frame idle (busy about 11.5 ms), and the game
-holds a steady 60. At 110 it still sometimes settles at the 3328x1872 level. The game's
+holds a steady 60. After the upstream merge ab5e6a7f (which removed per-draw diagnostic atomics,
+so Thread_Gpu parses faster), 115 settles one level higher, at 2432x1368 (busy 12.3-13.0 ms). It
+still holds 60 once the resolution has settled, a few seconds after loading. Anything that makes
+Thread_Gpu faster shortens the parse-time timestamps, so the game raises its resolution a little. At 110 it still sometimes settles at the 3328x1872 level. The game's
 resolution levels are discrete, so there is no setting between those two outcomes. For a window
 around 1920x1080, a 1080p internal resolution is about native.
 
