@@ -419,9 +419,115 @@ void ListJournalOpcodes(const char *journal_path, const char *opcode) {
   }
 }
 
+// A Location-decorated interface variable of a SPIR-V module, with its type as a SPIR-V
+// assembly name ("float", "v4float", "v2uint", ...).
+struct SpirvInterfaceVariable {
+  uint32_t location = 0;
+  std::string type;
+};
+
+std::vector<SpirvInterfaceVariable> SpirvInterface(const std::vector<uint32_t> &words,
+                                                   uint32_t storage_class) {
+  constexpr uint32_t OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23, OpTypeArray = 28,
+                     OpTypePointer = 32, OpVariable = 59, OpDecorate = 71;
+  constexpr uint32_t DecorationLocation = 30, DecorationPerVertex = 5285;
+  std::map<uint32_t, std::string> types;
+  std::map<uint32_t, std::pair<uint32_t, uint32_t>> pointers;
+  std::map<uint32_t, uint32_t> arrays;
+  std::map<uint32_t, uint32_t> locations;
+  std::set<uint32_t> per_vertex;
+  std::vector<std::pair<uint32_t, uint32_t>> variables;
+  for (size_t offset = 5; offset < words.size();) {
+    const auto *word = &words[offset];
+    const auto count = std::max<uint32_t>(word[0] >> 16u, 1u);
+    switch (word[0] & 0xffffu) {
+      case OpTypeFloat:
+        if (word[2] == 32u) types[word[1]] = "float";
+        break;
+      case OpTypeInt:
+        if (word[2] == 32u) types[word[1]] = word[3] != 0u ? "int" : "uint";
+        break;
+      case OpTypeVector:
+        if (types.contains(word[2])) {
+          types[word[1]] = fmt::format("v{}{}", word[3], types[word[2]]);
+        }
+        break;
+      case OpTypeArray: arrays[word[1]] = word[2]; break;
+      case OpTypePointer: pointers[word[1]] = {word[2], word[3]}; break;
+      case OpDecorate:
+        if (word[2] == DecorationLocation) locations[word[1]] = word[3];
+        if (word[2] == DecorationPerVertex) per_vertex.insert(word[1]);
+        break;
+      case OpVariable:
+        if (word[3] == storage_class) variables.emplace_back(word[1], word[2]);
+        break;
+      default: break;
+    }
+    offset += count;
+  }
+  std::vector<SpirvInterfaceVariable> result;
+  for (const auto &[pointer, id] : variables) {
+    const auto location = locations.find(id);
+    if (location == locations.end()) {
+      continue; // built-in
+    }
+    auto pointee = pointers.at(pointer).second;
+    if (per_vertex.contains(id) && arrays.contains(pointee)) {
+      pointee = arrays.at(pointee);
+    }
+    Require("SpirvInterface", "type", types.contains(pointee),
+            fmt::format("unsupported interface type at location {}", location->second));
+    result.push_back({location->second, types.at(pointee)});
+  }
+  return result;
+}
+
+// A vertex shader that writes zero to gl_Position and to each given output, so a recorded
+// pixel shader can be compiled in a graphics pipeline without its real vertex stage.
+std::vector<uint32_t> PassThroughVertexShader(
+    const std::vector<SpirvInterfaceVariable> &outputs) {
+  std::string text = "OpCapability Shader\nOpMemoryModel Logical GLSL450\n"
+                     "OpEntryPoint Vertex %main \"main\" %position";
+  for (size_t index = 0; index < outputs.size(); index++) {
+    text += fmt::format(" %out{}", index);
+  }
+  text += "\nOpDecorate %position BuiltIn Position\n";
+  for (size_t index = 0; index < outputs.size(); index++) {
+    text += fmt::format("OpDecorate %out{} Location {}\n", index, outputs[index].location);
+  }
+  text += "%void = OpTypeVoid\n%function = OpTypeFunction %void\n%float = OpTypeFloat 32\n"
+          "%uint = OpTypeInt 32 0\n%int = OpTypeInt 32 1\n";
+  for (uint32_t size = 2; size <= 4; size++) {
+    for (const char *scalar : {"float", "uint", "int"}) {
+      text += fmt::format("%v{0}{1} = OpTypeVector %{1} {0}\n", size, scalar);
+    }
+  }
+  text += "%position_pointer = OpTypePointer Output %v4float\n"
+          "%position = OpVariable %position_pointer Output\n"
+          "%position_value = OpConstantNull %v4float\n";
+  for (size_t index = 0; index < outputs.size(); index++) {
+    text += fmt::format("%out{0}_pointer = OpTypePointer Output %{1}\n"
+                        "%out{0} = OpVariable %out{0}_pointer Output\n"
+                        "%out{0}_value = OpConstantNull %{1}\n",
+                        index, outputs[index].type);
+  }
+  text += "%main = OpFunction %void None %function\n%entry = OpLabel\n"
+          "OpStore %position %position_value\n";
+  for (size_t index = 0; index < outputs.size(); index++) {
+    text += fmt::format("OpStore %out{0} %out{0}_value\n", index);
+  }
+  text += "OpReturn\nOpFunctionEnd\n";
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::vector<uint32_t> binary;
+  Require("PassThroughVertexShader", "assemble", tools.Assemble(text, &binary),
+          "could not assemble the pass-through vertex shader");
+  return binary;
+}
+
 // --pipeline-compile-time <journal copy> <hash> <rounds> [spv files...]: times
-// vkCreateComputePipelines for one recorded compute shader. Without files it
-// times the SPIR-V this build produces; with files (for example --dump-shader
+// pipeline creation for one recorded compute or pixel shader (a pixel shader is
+// paired with a generated pass-through vertex shader and 16-bit float targets).
+// Without files it times the SPIR-V this build produces; with files (for example --dump-shader
 // output from two builds) it times each, interleaved round by round, against
 // the layout this build derives. Each compile patches the SPIR-V generator
 // word with a fresh value, so neither the driver's own shader cache nor an
@@ -435,8 +541,9 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
   auto record = std::find_if(records.begin(), records.end(),
                              [&](const auto &item) { return item.hash == hash; });
   Require(name, "journal", record != records.end(), "no record has that hash");
-  Require(name, "stage", record->stage == ShaderType::Compute,
-          "only compute shaders are timed");
+  const bool pixel = record->stage == ShaderType::Pixel;
+  Require(name, "stage", pixel || record->stage == ShaderType::Compute,
+          "only compute and pixel shaders are timed");
   std::vector<double> recompile_times;
   std::optional<ShaderRecompiler::CompileResult> compiled;
   for (uint32_t pass = 0; pass < 5; pass++) {
@@ -471,14 +578,15 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
   }
 
   const auto device = vulkan.Device();
+  const auto stage_flag =
+      pixel ? vk::ShaderStageFlagBits::eFragment : vk::ShaderStageFlagBits::eCompute;
   std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
   for (const auto &binding : compiled->program.bindings.descriptors) {
     const auto count = NativeDescriptorCount(binding);
     if (count != 0) {
       layout_bindings.push_back(
-          {ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, binding.kind),
-           NativeDescriptorType(binding.kind), count,
-           vk::ShaderStageFlagBits::eCompute});
+          {ShaderRecompiler::IR::NativeBinding(record->stage, binding.kind),
+           NativeDescriptorType(binding.kind), count, stage_flag});
     }
   }
   vk::DescriptorSetLayoutCreateInfo layout_info{};
@@ -488,8 +596,12 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
   RequireVk(name, "layout",
             device.createDescriptorSetLayout(&layout_info, nullptr, &descriptor_layout),
             "vkCreateDescriptorSetLayout");
-  const vk::PushConstantRange push_range{vk::ShaderStageFlagBits::eCompute, 0,
-                                         ShaderRecompiler::IR::NativePushConstantSize};
+  // As the runtime: compute pushes to the compute stage, graphics to vertex and fragment.
+  const vk::PushConstantRange push_range{
+      pixel ? vk::ShaderStageFlags{vk::ShaderStageFlagBits::eVertex |
+                                   vk::ShaderStageFlagBits::eFragment}
+            : vk::ShaderStageFlags{vk::ShaderStageFlagBits::eCompute},
+      0, ShaderRecompiler::IR::NativePushConstantSize};
   vk::PipelineLayoutCreateInfo pipeline_layout_info{};
   pipeline_layout_info.setLayoutCount = 1;
   pipeline_layout_info.pSetLayouts = &descriptor_layout;
@@ -500,6 +612,137 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
             device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
             "vkCreatePipelineLayout");
 
+  // A pixel shader gets a pass-through vertex shader for its inputs and one attachment per
+  // output location (16-bit float, or 32-bit integer for integer outputs).
+  vk::ShaderModule vertex_module = nullptr;
+  std::vector<vk::Format> color_formats;
+  std::vector<vk::PipelineColorBlendAttachmentState> blend_attachments;
+  if (pixel) {
+    const auto vertex = PassThroughVertexShader(SpirvInterface(compiled->spirv, 1u));
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = vertex.size() * sizeof(uint32_t);
+    module_info.pCode = vertex.data();
+    RequireVk(name, "vertex module",
+              device.createShaderModule(&module_info, nullptr, &vertex_module),
+              "vkCreateShaderModule");
+    for (const auto &output : SpirvInterface(compiled->spirv, 3u)) {
+      if (color_formats.size() <= output.location) {
+        color_formats.resize(output.location + 1u, vk::Format::eUndefined);
+      }
+      color_formats[output.location] =
+          output.type.ends_with("uint")  ? vk::Format::eR32G32B32A32Uint
+          : output.type.ends_with("int") ? vk::Format::eR32G32B32A32Sint
+                                         : vk::Format::eR16G16B16A16Sfloat;
+    }
+    vk::PipelineColorBlendAttachmentState attachment{};
+    attachment.colorWriteMask =
+        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    blend_attachments.assign(color_formats.size(), attachment);
+  }
+
+  // As the runtime: compute pins the guest wave size when the driver allows it.
+  vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size{};
+  subgroup_size.requiredSubgroupSize = record->wave_size;
+  const bool pin_wave = !pixel && vulkan.SubgroupSizeControlSupported();
+
+  // Creates one pipeline from the given SPIR-V with extra flags; returns the pipeline, the
+  // module to destroy with it, and how long pipeline creation took.
+  struct Created {
+    vk::Pipeline pipeline = nullptr;
+    vk::ShaderModule module = nullptr;
+    double ms = 0.0;
+  };
+  const auto create_pipeline = [&](const std::string &label, std::vector<uint32_t> &words,
+                                   vk::PipelineCreateFlags flags) {
+    // A "noopt:" input, or KYTY_TEST_DISABLE_OPT=1 for every input, times the driver's
+    // unoptimized compile instead.
+    const char *disable_opt = std::getenv("KYTY_TEST_DISABLE_OPT");
+    if (label.starts_with(no_optimization) ||
+        (disable_opt != nullptr && disable_opt[0] == '1')) {
+      flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+    }
+    Created created;
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = words.size() * sizeof(uint32_t);
+    module_info.pCode = words.data();
+    RequireVk(name, "module", device.createShaderModule(&module_info, nullptr, &created.module),
+              "vkCreateShaderModule");
+    vk::PipelineShaderStageCreateInfo stage{};
+    stage.stage = stage_flag;
+    stage.module = created.module;
+    stage.pName = "main";
+    if (pin_wave) {
+      stage.pNext = &subgroup_size;
+    }
+    std::chrono::steady_clock::time_point start;
+    if (!pixel) {
+      vk::ComputePipelineCreateInfo pipeline_info{};
+      pipeline_info.stage = stage;
+      pipeline_info.layout = pipeline_layout;
+      pipeline_info.flags = flags;
+      start = std::chrono::steady_clock::now();
+      RequireVk(name, "pipeline",
+                device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr,
+                                              &created.pipeline),
+                "vkCreateComputePipelines");
+    } else {
+      vk::PipelineShaderStageCreateInfo vertex_stage{};
+      vertex_stage.stage = vk::ShaderStageFlagBits::eVertex;
+      vertex_stage.module = vertex_module;
+      vertex_stage.pName = "main";
+      const std::array stages{vertex_stage, stage};
+      vk::PipelineVertexInputStateCreateInfo vertex_input{};
+      vk::PipelineInputAssemblyStateCreateInfo input_assembly{};
+      input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+      vk::PipelineViewportStateCreateInfo viewport{};
+      viewport.viewportCount = 1;
+      viewport.scissorCount = 1;
+      vk::PipelineRasterizationStateCreateInfo rasterization{};
+      rasterization.polygonMode = vk::PolygonMode::eFill;
+      rasterization.cullMode = vk::CullModeFlagBits::eNone;
+      rasterization.lineWidth = 1.0f;
+      vk::PipelineMultisampleStateCreateInfo multisample{};
+      multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+      vk::PipelineColorBlendStateCreateInfo blend{};
+      blend.attachmentCount = static_cast<uint32_t>(blend_attachments.size());
+      blend.pAttachments = blend_attachments.data();
+      const std::array dynamic_states{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+      vk::PipelineDynamicStateCreateInfo dynamic{};
+      dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
+      dynamic.pDynamicStates = dynamic_states.data();
+      vk::PipelineRenderingCreateInfo rendering{};
+      rendering.colorAttachmentCount = static_cast<uint32_t>(color_formats.size());
+      rendering.pColorAttachmentFormats = color_formats.data();
+      vk::GraphicsPipelineCreateInfo pipeline_info{};
+      pipeline_info.pNext = &rendering;
+      pipeline_info.flags = flags;
+      pipeline_info.stageCount = static_cast<uint32_t>(stages.size());
+      pipeline_info.pStages = stages.data();
+      pipeline_info.pVertexInputState = &vertex_input;
+      pipeline_info.pInputAssemblyState = &input_assembly;
+      pipeline_info.pViewportState = &viewport;
+      pipeline_info.pRasterizationState = &rasterization;
+      pipeline_info.pMultisampleState = &multisample;
+      pipeline_info.pColorBlendState = &blend;
+      pipeline_info.pDynamicState = &dynamic;
+      pipeline_info.layout = pipeline_layout;
+      start = std::chrono::steady_clock::now();
+      RequireVk(name, "pipeline",
+                device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr,
+                                               &created.pipeline),
+                "vkCreateGraphicsPipelines");
+    }
+    created.ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+    return created;
+  };
+  const auto destroy = [&](const Created &created) {
+    device.destroyPipeline(created.pipeline, nullptr);
+    device.destroyShaderModule(created.module, nullptr);
+  };
+
   // Distinct per run, so a later run cannot hit this run's cache entries.
   auto generator = static_cast<uint32_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
@@ -508,33 +751,9 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
     if (fresh) {
       words[2] = ++generator;
     }
-    vk::ShaderModuleCreateInfo module_info{};
-    module_info.codeSize = words.size() * sizeof(uint32_t);
-    module_info.pCode = words.data();
-    vk::ShaderModule module = nullptr;
-    RequireVk(name, "module", device.createShaderModule(&module_info, nullptr, &module),
-              "vkCreateShaderModule");
-    vk::ComputePipelineCreateInfo pipeline_info{};
-    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
-    pipeline_info.stage.module = module;
-    pipeline_info.stage.pName = "main";
-    pipeline_info.layout = pipeline_layout;
-    // A "noopt:" input, or KYTY_TEST_DISABLE_OPT=1 for every input, times the driver's
-    // unoptimized compile instead.
-    const char *disable_opt = std::getenv("KYTY_TEST_DISABLE_OPT");
-    if (label.starts_with(no_optimization) ||
-        (disable_opt != nullptr && disable_opt[0] == '1')) {
-      pipeline_info.flags = vk::PipelineCreateFlagBits::eDisableOptimization;
-    }
-    vk::Pipeline pipeline = nullptr;
-    const auto start = std::chrono::steady_clock::now();
-    RequireVk(name, "pipeline",
-              device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
-              "vkCreateComputePipelines");
-    const auto end = std::chrono::steady_clock::now();
-    device.destroyPipeline(pipeline, nullptr);
-    device.destroyShaderModule(module, nullptr);
-    return std::chrono::duration<double, std::milli>(end - start).count();
+    const auto created = create_pipeline(label, words, {});
+    destroy(created);
+    return created.ms;
   };
 
   std::vector<std::vector<double>> times(inputs.size());
@@ -548,43 +767,32 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
       }
     }
   }
+
   // With VK_KHR_pipeline_executable_properties, print the driver's statistics for each
-  // input (VGPRs, SGPRs, instruction count, ...), and with KYTY_PIPELINE_ISA=<dir> write its
-  // internal representations (the ISA) there.
+  // input and stage (VGPRs, SGPRs, ...), and with KYTY_PIPELINE_ISA=<dir> write its internal
+  // representations (the ISA) there.
   const auto *isa_dir = std::getenv("KYTY_PIPELINE_ISA");
   const auto capture = [&](const std::string &label, std::vector<uint32_t> &words) {
     words[2] = ++generator;
-    vk::ShaderModuleCreateInfo module_info{};
-    module_info.codeSize = words.size() * sizeof(uint32_t);
-    module_info.pCode = words.data();
-    vk::ShaderModule module = nullptr;
-    RequireVk(name, "module", device.createShaderModule(&module_info, nullptr, &module),
-              "vkCreateShaderModule");
-    vk::ComputePipelineCreateInfo pipeline_info{};
-    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
-    pipeline_info.stage.module = module;
-    pipeline_info.stage.pName = "main";
-    pipeline_info.layout = pipeline_layout;
-    pipeline_info.flags = vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+    vk::PipelineCreateFlags flags = vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
     if (isa_dir != nullptr) {
-      pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+      flags |= vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
     }
-    if (label.starts_with(no_optimization)) {
-      pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
-    }
-    vk::Pipeline pipeline = nullptr;
-    RequireVk(name, "pipeline",
-              device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
-              "vkCreateComputePipelines");
+    const auto created = create_pipeline(label, words, flags);
     vk::PipelineInfoKHR info{};
-    info.pipeline = pipeline;
+    info.pipeline = created.pipeline;
     uint32_t executables = 0;
     RequireVk(name, "executables",
               device.getPipelineExecutablePropertiesKHR(&info, &executables, nullptr),
               "vkGetPipelineExecutablePropertiesKHR");
+    std::vector<vk::PipelineExecutablePropertiesKHR> properties(executables);
+    RequireVk(name, "executables",
+              device.getPipelineExecutablePropertiesKHR(&info, &executables,
+                                                        properties.data()),
+              "vkGetPipelineExecutablePropertiesKHR");
     for (uint32_t index = 0; index < executables; index++) {
       vk::PipelineExecutableInfoKHR executable{};
-      executable.pipeline = pipeline;
+      executable.pipeline = created.pipeline;
       executable.executableIndex = index;
       uint32_t count = 0;
       RequireVk(name, "statistics",
@@ -613,7 +821,8 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
             break;
         }
       }
-      std::printf("[host]    %s: stats %s:%s\n", name, label.c_str(), line.c_str());
+      std::printf("[host]    %s: stats %s [%s]:%s\n", name, label.c_str(),
+                  properties[index].name.data(), line.c_str());
       if (isa_dir == nullptr) {
         continue;
       }
@@ -647,8 +856,7 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
                   static_cast<std::streamsize>(representations[item].dataSize));
       }
     }
-    device.destroyPipeline(pipeline, nullptr);
-    device.destroyShaderModule(module, nullptr);
+    destroy(created);
   };
 
   for (size_t i = 0; i < inputs.size(); i++) {
@@ -662,6 +870,9 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
     if (vulkan.ExecutableInfoSupported()) {
       capture(inputs[i].first, words);
     }
+  }
+  if (vertex_module != nullptr) {
+    device.destroyShaderModule(vertex_module, nullptr);
   }
   device.destroyPipelineLayout(pipeline_layout, nullptr);
   device.destroyDescriptorSetLayout(descriptor_layout, nullptr);

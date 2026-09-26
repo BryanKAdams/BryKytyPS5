@@ -1870,6 +1870,9 @@ public:
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
   // VK_KHR_pipeline_executable_properties: driver statistics and ISA per pipeline.
+  [[nodiscard]] bool SubgroupSizeControlSupported() const {
+    return m_subgroup_size_control_supported;
+  }
   [[nodiscard]] bool ExecutableInfoSupported() const {
     return m_executable_info_supported;
   }
@@ -16432,6 +16435,9 @@ private:
                                   : static_cast<void *>(&device_features12);
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    // As the runtime does for compute: pin the guest wave size when the driver allows it.
+    device_features13.subgroupSizeControl = available_features13.subgroupSizeControl;
+    m_subgroup_size_control_supported = available_features13.subgroupSizeControl == true;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;
@@ -16867,6 +16873,7 @@ private:
   bool m_provoking_vertex_supported = false;
   bool m_conditional_rendering_supported = false;
   bool m_executable_info_supported = false;
+  bool m_subgroup_size_control_supported = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 
