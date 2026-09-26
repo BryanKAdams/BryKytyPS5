@@ -9,6 +9,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -35,7 +36,7 @@ public:
 
 	// Queues a link-time-optimized link of `parts` with `layout`; `target` names the result.
 	// `layout` must stay alive until the result is taken or the thread stops.
-	void QueueOptimizedLink(const void* target, const std::array<vk::Pipeline, 4>& parts,
+	void QueueOptimizedLink(const void* target, std::span<const vk::Pipeline> parts,
 	                        vk::PipelineLayout layout);
 	// Nothing while the link is queued or running; then the optimized pipeline, which the caller
 	// now owns, or null when the link failed and the fast-linked pipeline stays.
@@ -46,8 +47,10 @@ public:
 private:
 	struct LinkJob {
 		const void*                 target = nullptr;
+		// Three parts for mesh pipelines, which have no vertex input part.
 		std::array<vk::Pipeline, 4> parts {};
-		vk::PipelineLayout          layout = nullptr;
+		uint32_t                    part_count = 0;
+		vk::PipelineLayout          layout     = nullptr;
 	};
 
 	void LinkThread(const std::stop_token& stop);

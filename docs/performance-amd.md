@@ -356,10 +356,24 @@ pre-rasterization shaders, fragment shader and fragment output, each cached unde
 depends on. Only parts no earlier pipeline built are compiled, and the two shader parts compile in
 parallel. The parts are then fast-linked, which averages 0.45 ms. A background thread relinks
 each such pipeline with link-time optimization, and the draw path swaps that pipeline in on a
-later lookup, retiring the fast-linked one once the GPU is done with it. Mesh and RectList
-pipelines stay monolithic, as do all pipelines on drivers without fast linking. The switch is
+later lookup, retiring the fast-linked one once the GPU is done with it. A mesh pipeline has no
+vertex input part: its mesh shader is the pre-rasterization part, and its push constant range
+covers the mesh and fragment stages. RectList pipelines stay monolithic (their tessellation
+shaders are generated per vertex and pixel shader pair, and Astro Bot draws none to test a
+library form with), as do all pipelines on drivers without fast linking. The switch is
 "Pipeline libraries" in the settings panel (`pipeline-libraries` in the settings file), on by
 default.
+
+Astro Bot's main geometry uses mesh shaders of 84k-103k SPIR-V words, and each one appears in
+several pipelines with different pixel shaders. Built monolithically, the 13 mesh pipelines of a
+cold run took 7.0 s (up to 1.24 s each), recompiling the same mesh shader every time. As library
+pipelines they take 3.75 s, and the cold run's stalls drop from about 37 s to 33 s (worst frame
+7.8 s to 6.5 s), two rounds each.
+
+Also tried: `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` on the library parts (the background
+link still optimizes fully) cut graphics pipeline creation only 6-8% (stalls 36.4 s to 34.7 s,
+two rounds). It is not adopted: new pipelines would run unoptimized code until the relink swaps
+in, which is a GPU cost not yet measured.
 
 Pixel shader resources use descriptor set 1 and vertex-side stages set 0. Layouts with
 independent sets would let each shader part ignore the other stage's set, but on this driver any

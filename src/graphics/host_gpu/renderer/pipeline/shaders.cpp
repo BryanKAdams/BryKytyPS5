@@ -690,7 +690,10 @@ vk::Pipeline CreateLibraryPart(GraphicContext& graphics, vk::GraphicsPipelineLib
 // part ignore the other stage's descriptor set, but on AMD's 26.6 driver any pipeline with such a
 // layout (even a monolithic one) lost the device within the first frames. So a shader part is
 // shared by pipelines whose two descriptor set layouts match, and all parts use one push constant
-// range for every stage.
+// range for every stage (mesh pipelines: the mesh and fragment stages, which the mesh draw path
+// pushes its parameter record to).
+//
+// A mesh pipeline has no vertex input part: its mesh shader is the pre-rasterization part.
 uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                const GraphicsPipelineState&           state,
                                const PipelineCache::GraphicsPrograms& programs,
@@ -702,11 +705,15 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 	shared_dynamic_state.dynamicStateCount = state.shared_dynamic_state_count;
 	shared_dynamic_state.pDynamicStates    = state.dynamic_states.data();
 
-	CreateGraphicsLayouts(graphics, pipeline, state, LibraryPushConstantStages);
-	pipeline.push_constant_stages = LibraryPushConstantStages;
+	const vk::ShaderStageFlags push_stages =
+	    state.mesh ? vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment
+	               : LibraryPushConstantStages;
+	CreateGraphicsLayouts(graphics, pipeline, state, push_stages);
+	pipeline.push_constant_stages = push_stages;
 	std::string layout_key;
 	AppendBindingsKey(layout_key, state.vertex_bindings, state.vertex_uses_push);
 	AppendBindingsKey(layout_key, state.pixel_bindings, state.pixel_uses_push);
+	AppendKey(layout_key, static_cast<uint32_t>(push_stages));
 
 	std::string vertex_input_key(1, 'V');
 	AppendKey(vertex_input_key, state.vertex_input.vertexBindingDescriptionCount);
@@ -811,7 +818,7 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 		fragment = libraries.Insert(std::move(fragment_key), fragment_compile.get());
 		built |= 1u << 2u;
 	}
-	if (vertex_input == nullptr) {
+	if (vertex_input == nullptr && !state.mesh) {
 		vk::GraphicsPipelineCreateInfo info {};
 		info.pVertexInputState   = &state.vertex_input;
 		info.pInputAssemblyState = &state.input_assembly;
@@ -832,7 +839,8 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 		built |= 1u << 3u;
 	}
 
-	const std::array parts {vertex_input, pre_raster, fragment, fragment_output};
+	const std::array all_parts {pre_raster, fragment, fragment_output, vertex_input};
+	const std::span  parts = std::span(all_parts).first(state.mesh ? 3u : 4u);
 	vk::PipelineLibraryCreateInfoKHR link_libraries {};
 	link_libraries.libraryCount = static_cast<uint32_t>(parts.size());
 	link_libraries.pLibraries   = parts.data();
@@ -873,12 +881,12 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
 		     (static_params.blend_enable[0] ? "true" : "false"),
 		     state.dynamic_state.dynamicStateCount);
 	}
-	// Mesh and RectList pipelines stay monolithic: mesh shading has no library parts here, and
-	// RectList tessellation shaders are generated per vertex/pixel shader pair. Static feedback
-	// loop flags only appear where the dynamic feedback loop state is unsupported.
+	// RectList pipelines stay monolithic: their tessellation shaders are generated per vertex and
+	// pixel shader pair, and Astro Bot draws none to test a library form with. Static feedback loop
+	// flags only appear where the dynamic feedback loop state is unsupported.
 	if (libraries != nullptr && graphics.pipeline_library_enabled &&
 	    graphics.pipeline_library_fast_linking && Config::PipelineLibrariesEnabled() &&
-	    !state.mesh && !state.rect_list && !state.flags) {
+	    !state.rect_list && !state.flags) {
 		return static_cast<int>(
 		    CreateLibraryPipeline(graphics, pipeline, state, programs, *libraries, driver_cache));
 	}

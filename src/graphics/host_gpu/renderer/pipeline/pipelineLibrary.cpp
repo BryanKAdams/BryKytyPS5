@@ -5,6 +5,8 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics {
 
 PipelineLibraryCache::PipelineLibraryCache(GraphicContext& graphics, vk::PipelineCache driver_cache)
@@ -38,9 +40,15 @@ vk::Pipeline PipelineLibraryCache::Insert(std::string key, vk::Pipeline library)
 	return iter->second;
 }
 
-void PipelineLibraryCache::QueueOptimizedLink(const void*                        target,
-                                              const std::array<vk::Pipeline, 4>& parts,
-                                              vk::PipelineLayout                 layout) {
+void PipelineLibraryCache::QueueOptimizedLink(const void*                   target,
+                                              std::span<const vk::Pipeline> parts,
+                                              vk::PipelineLayout            layout) {
+	LinkJob job;
+	EXIT_IF(parts.size() > job.parts.size());
+	job.target     = target;
+	job.part_count = static_cast<uint32_t>(parts.size());
+	job.layout     = layout;
+	std::ranges::copy(parts, job.parts.begin());
 	{
 		std::lock_guard lock(m_link_mutex);
 		if (m_stopped) {
@@ -48,7 +56,7 @@ void PipelineLibraryCache::QueueOptimizedLink(const void*                       
 			m_optimized.emplace(target, nullptr);
 			return;
 		}
-		m_link_jobs.push_back({target, parts, layout});
+		m_link_jobs.push_back(job);
 	}
 	m_link_available.notify_one();
 }
@@ -92,7 +100,7 @@ void PipelineLibraryCache::LinkThread(const std::stop_token& stop) {
 			m_link_jobs.pop_front();
 		}
 		vk::PipelineLibraryCreateInfoKHR libraries {};
-		libraries.libraryCount = static_cast<uint32_t>(job.parts.size());
+		libraries.libraryCount = job.part_count;
 		libraries.pLibraries   = job.parts.data();
 		vk::GraphicsPipelineCreateInfo info {};
 		info.pNext  = &libraries;
