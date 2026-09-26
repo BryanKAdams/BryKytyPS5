@@ -459,6 +459,11 @@ add_executable(shader_precompile_record_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_precompile_record_tests PRIVATE fmt::fmt xxhash)
 target_include_directories(shader_precompile_record_tests PRIVATE ${inc_headers})
 
+add_executable(lru_cache_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
+)
+target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -619,6 +624,7 @@ if(BUILD_TESTING)
 	add_test(NAME frame_statistics COMMAND $<TARGET_FILE:frame_statistics_tests>)
 	add_test(NAME mesh_dispatch COMMAND $<TARGET_FILE:mesh_dispatch_tests>)
 	add_test(NAME shader_precompile_record COMMAND $<TARGET_FILE:shader_precompile_record_tests>)
+	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -692,6 +698,7 @@ if(BUILD_TESTING)
 		frame_statistics_tests
 		mesh_dispatch_tests
 		shader_precompile_record_tests
+		lru_cache_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -703,6 +710,7 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 		save_data_memory_tests
 		ngs2_sampler_tests
+		save_data_memory_tests
 	)
 endif()
 

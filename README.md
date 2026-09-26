@@ -79,7 +79,7 @@ or graphical glitches, so please include the version you tested when reporting a
 ## Contributing
 
 Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
-issues first, then use the **Game Emulation Bug Report** template and attach the complete log file.
+issues first, then use the **Game Emulation Status Report** template and attach the complete log file.
 
 Code contributions should be focused, build successfully on the platforms they touch, and include
 relevant tests where practical. Windows is the primary target, so a change that alters shared code
@@ -132,7 +132,7 @@ the Vulkan/SPIR-V validation rules.
 ### Build requirements (Windows)
 
 - Git
-- CMake 3.12 or newer
+- CMake 3.22.1 or newer
 - Ninja
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
@@ -178,7 +178,7 @@ sudo apt-get install --no-install-recommends \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 
-Qt 6 (Concurrent, Network, Widgets) is also required — either the distribution packages
+Qt 6 (Concurrent, Network, Widgets) is required for the launcher — either the distribution packages
 (`qt6-base-dev`) or an official Qt installation.
 
 ```bash
@@ -196,6 +196,18 @@ The install step copies the Qt libraries and plugins next to the binaries, so
 `_Build/linux/install` runs without a matching system Qt. FFmpeg is linked statically
 from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
 release, including VP9 and WebM support. System FFmpeg packages are not required.
+
+To build `kyty_emulator` and the `kyty_tests` target without Qt, use a separate build directory:
+
+```bash
+git submodule update --init --recursive
+
+cmake -S . -B _Build/linux-no-qt -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DKYTY_BUILD_LAUNCHER=OFF
+
+cmake --build _Build/linux-no-qt --target kyty_emulator kyty_tests --parallel
+```
 
 As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
 time.

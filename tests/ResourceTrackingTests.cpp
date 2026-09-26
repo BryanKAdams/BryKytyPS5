@@ -2815,6 +2815,31 @@ void TestGraphicsPushConstantLayout() {
 }
 
 void TestResourceLimitIsTransactional() {
+  Fixture accepted;
+  MemoryInfo accepted_memory;
+  accepted_memory.kind = ResourceKind::Buffer;
+  for (uint32_t index = 0; index < ShaderInfo::MaxBuffers; index++) {
+    const auto handle = accepted.Buffer(
+        {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
+        index * 4u);
+    accepted.Emit(ValueOpcode::LoadBufferU32,
+                  {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+                  accepted.AddMemory(accepted_memory, index * 4u));
+  }
+  accepted.PlanAndTrack();
+  Check(accepted.program.info.buffers.size() == 64u &&
+            accepted.program.descriptor_sources.size() == 64u &&
+            accepted.program.memory_info.back().resource == 63u,
+        "compute shader did not retain all 64 distinct buffers");
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(accepted.program, {.compute = &compute});
+  AllocateBindings(accepted.program);
+  const auto *binding = FindBinding(accepted.program.bindings,
+                                    DescriptorBindingKind::Buffers);
+  Check(binding != nullptr && binding->resources.size() == 64u &&
+            accepted.program.bindings.memory_offset_count == 64u,
+        "compute shader binding layout truncated the 64 buffers");
+
   Fixture fixture;
   MemoryInfo memory;
   memory.kind = ResourceKind::Buffer;
