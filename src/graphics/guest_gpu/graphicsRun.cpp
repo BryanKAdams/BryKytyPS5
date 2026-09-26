@@ -777,10 +777,30 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
+	// Loading bursts span several submissions. When the previous submission created several
+	// pipelines, walk this one from its first packet, so its first new pipeline is prefetched
+	// too instead of starting the walk only after compiling it. Single misses during play do not
+	// qualify, so ordinary frames never pay for a walk.
+	constexpr uint64_t BurstPipelines = 3;
+	const auto&        pipelines      = m_renderer.GetPipelineCache();
+	const uint64_t     created =
+	    pipelines.GraphicsPipelinesCreated() + pipelines.ComputePipelinesCreated();
+	if (execution.m_buffer_stack.size() == 1 && execution.m_buffer_stack.back().offset_dw == 0) {
+		if (m_last_submission_created >= BurstPipelines && m_lookahead_draws_left == 0) {
+			RunPipelineLookahead(execution);
+		}
+		m_submission_created_start = created;
+	}
+
 	ProcessPm4(execution);
 	DrainStats::SetPm4Op(DrainStats::NoPm4Op);
-	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
-	                                        : Pm4ProcessResult::Blocked;
+	if (execution.m_buffer_stack.empty()) {
+		m_last_submission_created = pipelines.GraphicsPipelinesCreated() +
+		                            pipelines.ComputePipelinesCreated() -
+		                            m_submission_created_start;
+		return Pm4ProcessResult::Complete;
+	}
+	return Pm4ProcessResult::Blocked;
 }
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
@@ -918,8 +938,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			if (m_lookahead_draws_left > 0) {
 				m_lookahead_draws_left--;
 			} else if (pipelines.GraphicsPipelinesCreated() + pipelines.ComputePipelinesCreated() !=
-			               pipelines_before &&
-			           !IsAsyncComputeQueue()) {
+			           pipelines_before) {
+				// Compute queues are walked too: their command processors run on this thread,
+				// and their dispatches are among the largest compiles.
 				RunPipelineLookahead(execution);
 			}
 		}

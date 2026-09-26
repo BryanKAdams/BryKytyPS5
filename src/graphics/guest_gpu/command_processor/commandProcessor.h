@@ -205,6 +205,9 @@ private:
 	bool      m_predicate_skip              = false;
 	// Draws the last look-ahead already covered; no new look-ahead runs until they are processed.
 	uint32_t  m_lookahead_draws_left        = 0;
+	// Pipelines created while processing the current and the previous submission.
+	uint64_t  m_submission_created_start    = 0;
+	uint64_t  m_last_submission_created     = 0;
 };
 
 } // namespace Libs::Graphics
