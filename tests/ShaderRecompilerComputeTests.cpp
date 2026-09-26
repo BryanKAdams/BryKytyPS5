@@ -34409,6 +34409,10 @@ int main(int argc, char **argv) {
     PrintSpecializationGuesses(argv[2]);
     return 0;
   }
+  if (argc == 3 && std::strcmp(argv[1], "--ps-inputs") == 0) {
+    PrintPixelInputs(argv[2]);
+    return 0;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--journal-specs") == 0) {
     PrintJournalSpecializations(argv[2]);
     return 0;

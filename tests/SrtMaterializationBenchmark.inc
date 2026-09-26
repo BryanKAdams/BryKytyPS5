@@ -980,5 +980,56 @@ void PrintSpecializationGuesses(const char *journal_path) {
               "buffer guess identical %zu\n",
               compiled_count, images_match, all_match);
 }
+
+// --ps-inputs <journal copy>: each recorded pixel permutation's SPI_PS_INPUT_CNTL values, marking
+// DEFAULT inputs (OFFSET bit 5 without FLAT_SHADE: a constant instead of a vertex export; with
+// FLAT_SHADE the bit means raw per-vertex reads), and each vertex or mesh shader's parameter
+// exports, to compare what a pixel shader reads against what its partner writes.
+void PrintPixelInputs(const char *journal_path) {
+  constexpr const char *name = "PixelInputs";
+  auto records = ReadShaderJournalCopy(journal_path);
+  Require(name, "journal", !records.empty(),
+          std::string("no records read from ") + journal_path);
+  size_t with_default = 0;
+  size_t pixel = 0;
+  std::set<std::tuple<ShaderType, uint64_t, uint32_t>> exports;
+  for (auto &record : records) {
+    if (std::holds_alternative<ShaderVertexInputInfo>(record.info)) {
+      const auto compiled = CompileJournalRecord(record, name, false);
+      uint32_t mask = 0;
+      for (const auto &output : compiled ? compiled->program.info.outputs
+                                         : decltype(compiled->program.info.outputs){}) {
+        if (output.kind == ShaderRecompiler::IR::StageOutputKind::Parameter &&
+            output.index < 32u) {
+          mask |= 1u << output.index;
+        }
+      }
+      exports.emplace(record.stage, record.hash, mask);
+      continue;
+    }
+    const auto *info = std::get_if<ShaderPixelInputInfo>(&record.info);
+    if (info == nullptr) {
+      continue;
+    }
+    pixel++;
+    std::string text = fmt::format("ps {:016x} inputs={}", record.hash, info->input_num);
+    bool has_default = false;
+    for (uint32_t i = 0; i < info->input_num; i++) {
+      const auto value = info->interpolator_settings[i];
+      text += fmt::format(" {:08x}", value);
+      has_default = has_default || ((value & 0x20u) != 0 && (value & 0x400u) == 0);
+    }
+    with_default += has_default ? 1u : 0u;
+    std::printf("%s%s%s%s%s\n", text.c_str(), has_default ? " DEFAULT" : "",
+                info->ps_early_z ? " early-z" : "", info->ps_pixel_kill_enable ? " kill" : "",
+                info->ps_depth_export_enable ? " z-export" : "");
+  }
+  for (const auto &[stage, hash, mask] : exports) {
+    std::printf("%s %016llx params=%08x\n", stage == ShaderType::Mesh ? "ms" : "vs",
+                static_cast<unsigned long long>(hash), mask);
+  }
+  std::printf("pixel permutations: %zu, with a default-value input %zu\n", pixel,
+              with_default);
+}
 } // namespace
 } // namespace Libs::Graphics
