@@ -458,6 +458,15 @@ pipelines (1.1 s, 0.83 s and 0.65 s) still compile when their dispatch arrives: 
 first miss of its loading burst, which no look-ahead precedes, or runs on an asynchronous
 compute queue, whose command stream this walk does not follow.
 
+Two follow-ups address that. When a submission created three or more pipelines, the next
+submission is walked from its first packet before it runs, so a burst's later submissions are
+covered from their start; single misses during play do not qualify, so ordinary frames never
+pay for a walk. And compute-queue command processors (which also run on Thread_Gpu) start walks
+on a miss. One cold round: stalls 23.8 to 22.5 s, worst frame 3.0 to 2.25 s (top frames
+3.0/2.85/2.8 s to 2.25/2.05/1.78 s), compute pipelines prefetched 18 to 36 of 52. The two
+largest compute pipelines are now prefetched but still cost about their full compile, because
+they are needed right after the walk that queues them.
+
 Pixel shader resources use descriptor set 1 and vertex-side stages set 0. Layouts with
 independent sets would let each shader part ignore the other stage's set, but on this driver any
 pipeline whose layout has independent sets, even a monolithic one, lost the device within the
