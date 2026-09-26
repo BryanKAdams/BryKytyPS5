@@ -544,8 +544,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			             : vk::ImageLayout::eGeneral;
 		}
 		// The attachment store writes even when guest depth/stencil tests do not.
-		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		              vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		// A draw that samples the depth image without writing what it samples also reads it as a
+		// texture: request that access now, as the descriptors will. Otherwise the state flips
+		// between attachment and attachment-plus-shader-read, and each flip records a barrier and
+		// ends the rendering instance, twice per draw (Astro Bot draws its sand trail as hundreds of
+		// two-point draws a frame that sample depth). Entering this state from any other still
+		// records the barrier that orders earlier depth writes before the reads.
+		if (sampled_aspects && !feedback_aspects) {
+			access |= vk::AccessFlagBits2::eShaderRead;
+		}
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;

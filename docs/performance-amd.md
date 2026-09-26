@@ -454,8 +454,22 @@ map (`KYTY_DEBUG_LOOP_HEAT`) shows that 6996d4e2 draws the groove Astro drags th
 and that every loop there stays in the lowest band (fewer than 16 passes per wave), so the light
 lists are short. With the heat map on, the driver drops all of the shader's lighting and
 texture work, and the dip was unchanged (t=13-18: 25.6-32.7 fps against 26.5-33.0). The cost is
-the trail's geometry or rasterization (it draws through the mesh-emulated path), not its pixel
-shading.
+not its pixel shading.
+
+A per-draw log (`KYTY_DEBUG_DRAW_LOG`) found the real shape: while Astro walks, the game draws
+the trail as 14,000-22,000 separate two-point draws a second (300-700 a frame), each expanded
+by its geometry shader through the mesh-emulated path. Every one of them sampled the depth
+buffer it had bound read-only, and the depth image's state flipped per draw: attachment access
+when the render targets were acquired, attachment plus shader read when the descriptors were
+bound. Each flip recorded a barrier and ended the rendering instance, so every tiny draw
+drained the GPU twice. A draw that samples depth without writing what it samples now requests
+the combined state when the targets are acquired, so back-to-back trail draws record no barrier
+and stay in one rendering instance; entering that state from a draw that wrote depth still
+records the barrier. Ship route at the resolution floor, same build: the worst second of the dip
+rose from 24.7 to 30.6 fps, the worst five seconds from about 29 to 39 fps, and the dip ended
+about two seconds sooner (one run a side; earlier runs without the change all dipped to 25-33
+fps). Screenshots show no difference. What remains is the per-draw cost of hundreds of tiny
+mesh-emulated draws.
 
 ## First-use stutter (pipeline compiles)
 
