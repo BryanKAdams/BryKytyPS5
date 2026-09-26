@@ -663,13 +663,31 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto ballot = ctx.Ballot(inst.Arg(1));
-	const auto lane   = ctx.FirstLane(ballot);
-	return ctx.Shuffle(inst, 0, lane);
+	const auto ballot   = ctx.Ballot(inst.Arg(1));
+	const auto lane     = ctx.FirstLane(ballot);
+	const auto shuffled = ctx.Shuffle(inst, 0, lane);
+	// Every lane now holds the same value, so reading the first active lane changes nothing but
+	// tells the driver the result is uniform. AMD compiles the shuffle alone to ds_bpermute and
+	// treats its result as per-lane, which turned everything derived from a waterfall key
+	// (scalar loads, address math, loop exits) into vector code.
+	auto&      state  = ctx.state;
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst,
+	                          TypeId(state, inst.Arg(0).GetType()), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), shuffled);
+	return result;
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	// V_READLANE's lane is an SGPR or a constant, so the result is uniform too; see
+	// EmitReadFirstLane.
+	const auto shuffled = ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	auto&      state    = ctx.state;
+	const auto result   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst,
+	                          TypeId(state, inst.Arg(0).GetType()), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), shuffled);
+	return result;
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
