@@ -1026,10 +1026,14 @@ void PipelineCache::WaitForPrecompile() {
 
 void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationRecord> records) {
 	KYTY_PROFILER_THREAD("ShaderPrecompile");
-	size_t compiled = 0;
-	size_t skipped  = 0;
-	for (auto& record: records) {
-		ShaderParams params;
+	// The first draw waits for the replay, so it translates and compiles the records on several
+	// threads without the cache lock, then adds them in order under it.
+	struct Replayed {
+		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+		ProgramCache::CompiledModule                     compiled;
+		bool                                             valid = false;
+	};
+	const auto options_for = [](ShaderPrecompile::PermutationRecord& record, ShaderParams& params) {
 		params.code            = record.code;
 		params.back_code       = record.back_code;
 		params.hash            = record.hash;
@@ -1044,11 +1048,6 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 		options.dump_ir        = false;
 		options.early_dump     = false;
 		options.dump_label     = "ShaderPrecompile";
-		ProgramCache::ProgramKey key;
-		key.stage           = record.stage;
-		key.hash            = record.hash;
-		key.user_data_count = record.user_data_count;
-		key.code_size       = static_cast<uint32_t>(record.code.size());
 		std::visit(
 		    [&](auto& info) {
 			    using Info = std::decay_t<decltype(info)>;
@@ -1058,12 +1057,62 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 				    options.input_info.pixel = &info;
 			    else
 				    options.input_info.compute = &info;
-			    BuildStageStaticKey(info, key.static_state);
 		    },
 		    record.info);
+		return options;
+	};
 
-		Common::LockGuard lock(m_mutex);
-		auto              entry = m_program_cache->programs.find(key);
+	std::vector<Replayed> replayed(records.size());
+	std::atomic_size_t    next {0};
+	const auto            work = [&] {
+		for (size_t index = next.fetch_add(1); index < records.size(); index = next.fetch_add(1)) {
+			auto&        record = records[index];
+			ShaderParams params;
+			const auto   options    = options_for(record, params);
+			auto         translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			// Reject inconsistent metadata before ApplyResourceSpecialization's hard assertions.
+			// Live guest lookups still compile normally if a record cannot be replayed.
+			if (translated.skip_dispatch || !translated.program.resource_tracking_complete ||
+			    translated.program.info.buffers.size() != record.specialization.buffers.size() ||
+			    translated.program.info.images.size() > record.specialization.images.size()) {
+				continue;
+			}
+			auto& result = replayed[index];
+			result.plan  = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			result.compiled =
+			    ProgramCache::CompileModule(m_graphics.device, params.code, options, std::move(translated),
+			                                record.specialization, record.push_data_start_dword);
+			result.valid = true;
+		}
+	};
+	const auto threads = std::clamp(std::thread::hardware_concurrency(), 2u, 8u) - 1u;
+	{
+		std::vector<std::jthread> helpers;
+		for (uint32_t i = 1; i < threads; i++) {
+			helpers.emplace_back(work);
+		}
+		work();
+	}
+
+	size_t              compiled = 0;
+	size_t              skipped  = 0;
+	Common::LockGuard   lock(m_mutex);
+	for (size_t index = 0; index < records.size(); index++) {
+		auto& record = records[index];
+		auto& result = replayed[index];
+		if (!result.valid) {
+			++skipped;
+			continue;
+		}
+		ShaderParams                    params;
+		const auto                      options = options_for(record, params);
+		ProgramCache::ProgramKey        key;
+		key.stage           = record.stage;
+		key.hash            = record.hash;
+		key.user_data_count = record.user_data_count;
+		key.code_size       = static_cast<uint32_t>(record.code.size());
+		std::visit([&](auto& info) { BuildStageStaticKey(info, key.static_state); }, record.info);
+		auto entry = m_program_cache->programs.find(key);
 		if (entry != m_program_cache->programs.end() &&
 		    std::ranges::any_of(entry->second.permutations, [&](const auto& candidate) {
 			    const auto& layout = candidate.program.bindings;
@@ -1071,30 +1120,20 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 				       layout.push_data_start_dword ==
 				           ShaderRecompiler::IR::PushData::StartFor(record.push_data_start_dword,
 				                                                    layout.ShaderDataDwords());
-		    }))
-			continue;
-
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
-		// Reject inconsistent metadata before ApplyResourceSpecialization's hard assertions.
-		// Live guest lookups still compile normally if a record cannot be replayed.
-		if (translated.skip_dispatch || !translated.program.resource_tracking_complete ||
-		    translated.program.info.buffers.size() != record.specialization.buffers.size() ||
-		    translated.program.info.images.size() > record.specialization.images.size()) {
-			++skipped;
+		    })) {
+			m_graphics.device.destroyShaderModule(result.compiled.module, nullptr);
 			continue;
 		}
 		if (entry == m_program_cache->programs.end()) {
-			entry = m_program_cache->programs
-			            .try_emplace(std::move(key),
-			                         ShaderRecompiler::IR::ExtractResourcePlan(translated.program))
+			entry = m_program_cache->programs.try_emplace(std::move(key), std::move(*result.plan))
 			            .first;
 		}
-		entry->second.permutations.push_back(m_program_cache->CompilePermutation(
-		    params, options, std::move(translated), record.specialization,
-		    record.push_data_start_dword));
+		entry->second.permutations.push_back(m_program_cache->MakePermutation(
+		    options, record.specialization, std::move(result.compiled)));
 		++compiled;
 	}
-	PipelineCacheLog("Shader precompile: replayed {} permutations; skipped {}", compiled, skipped);
+	PipelineCacheLog("Shader precompile: replayed {} permutations on {} threads; skipped {}",
+	                 compiled, threads, skipped);
 }
 
 void PipelineCache::Save() {
