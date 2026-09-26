@@ -400,7 +400,27 @@ frame in those windows, so the game's resolution does not follow the measured ti
 (`s_mov_b64 exec`), while Astro Bot's pixel shaders are wave32. The 9070 XT allows a required
 subgroup size for fragment shaders, so a test build requested 32 for wave32 guest pixel shaders.
 In alternating sand runs (two per side, after a warm-up run), the dip's 5 s windows were 40.6-48.2
-fps against 41.6-48.8 for wave64, and the steady GPU busy was 10.6 ms either way. Not adopted.
+fps against 41.6-48.8 for wave64, and the steady GPU busy was 10.6 ms either way. Not adopted for
+speed; adopted later for correctness (d420fd5d): a pixel shader's EXEC, VCC and ballots cover one
+guest wave, so under wave64 a wave32 shader's host lanes 32-63 read lanes 0-31's masks, and an
+EXECZ or VCCZ loop exit (the waterfall loops over shadow cascades and light-list tiles) can leave
+them unprocessed. The fragment stage now requests the guest's wave size. At a pinned resolution
+(`--gpu-timestamp-scale 200`) GPU busy and per-shader times were unchanged within noise.
+
+**Dead end: per-lane branches for EXEC-masked regions** (the SRT session's
+`exec-region-branching`, reverted). At the same DRS level neither converting every region nor only
+those with memory reads saved GPU time: sand stand-still busy 8.8-9.0 ms off vs 8.9-9.2 ms on,
+overworld +1.5% (`ef31694ed8d87754`) to +5% (`92b1436c8042e396`) with every region converted. An
+earlier "2x resolution" result was the game picking a different DRS level between runs; compare
+GPU-cost changes at `--gpu-timestamp-scale 200` (the DRS floor) and on per-frame milliseconds,
+never microseconds per megapixel across different render areas.
+
+**Where the sand dip is:** even at the DRS floor, walking onto the open sand drops to 28-46 fps.
+In that window `6996d4e234bd5b8e` draws about 1.8 times a frame at about 6.7 ms per draw (2.07
+Mpx), against 0.16 ms per draw at the same area when standing still in the sand. Its loops are
+waterfalls over cascade and tile keys and a walk over each tile's light list, so the likely cause
+is long per-tile lists (built by the light-assignment compute `6216dac0cc17c2d4`), which the SRT
+session is measuring with a list-length heat map.
 
 ## First-use stutter (pipeline compiles)
 
