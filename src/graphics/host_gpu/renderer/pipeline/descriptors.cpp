@@ -335,8 +335,10 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
+	                              resource.atomic;
 	const bool format_ok =
-	    raw_sint_storage ||
+	    raw_sint_storage || raw_float_atomic ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -640,7 +642,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
+	const auto storage_view_format = storage && (resource.atomic ||
+	                                            format == Prospero::BufferFormat::k32SInt)
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
@@ -795,9 +798,14 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	auto&       cache    = m_context.GetBufferCache();
 
 	prepared.buffer_sources.clear();
-	prepared.buffer_sources.reserve(program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+	const auto& layout = program.bindings;
+	if (layout.memory_offset_count == 0) {
+		return;
+	}
+	const auto& resources = layout.descriptors.front().resources;
+	prepared.buffer_sources.reserve(resources.size());
+	for (const auto resource: resources) {
+		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 		const auto address = descriptor.Base48();
 		const auto requested_size = descriptor.GetSize();
 		if (address == 0 || requested_size == 0) {
@@ -815,10 +823,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
-	EXIT_IF(prepared.buffer_sources.size() != program.info.buffers.size());
+	EXIT_IF(prepared.buffer_sources.size() != layout.memory_offset_count);
 
 	prepared.buffers.clear();
-	prepared.buffers.reserve(program.info.buffers.size());
+	prepared.buffers.reserve(layout.memory_offset_count);
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
@@ -827,11 +835,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
+		const auto resource = layout.descriptors.front().resources[i];
 		uint32_t buffer_offset = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset));
+		                                               program.info.buffers[resource],
+		                                               program.stage, resource, buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
@@ -1048,8 +1057,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else {
 				switch (binding.kind) {
 					case BindingKind::Buffers:
-						for (const auto resource: binding.resources) {
-							const auto& view = descriptors.buffers.at(resource);
+						EXIT_IF(descriptors.buffers.size() != binding.resources.size());
+						for (const auto& view: descriptors.buffers) {
 							EXIT_IF(view.buffer == nullptr);
 							m_descriptor_buffers.push_back(view);
 						}

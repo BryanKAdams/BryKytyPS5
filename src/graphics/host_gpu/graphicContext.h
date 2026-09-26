@@ -29,6 +29,7 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	// Layout support is sufficient for static pipeline feedback flags. Dynamic state is optional.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                                      attachment_feedback_loop_dynamic_enabled = false;
