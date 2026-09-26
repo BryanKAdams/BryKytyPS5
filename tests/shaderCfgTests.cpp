@@ -7891,6 +7891,89 @@ void TestNewShaderRecompilerCfgLoopExitSharedWithSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// x post-dominates b when every path from b to a return passes x. A block that
+// cannot reach a return keeps every block as a post-dominator.
+void CheckPostDominatorsMatchPaths(const ShaderRecompiler::CFG::Graph &graph,
+                                   const char *text) {
+  const auto count = static_cast<uint32_t>(graph.blocks.size());
+  for (uint32_t x = 0; x < count; x++) {
+    std::vector<bool> escapes(count, false);
+    std::vector<uint32_t> pending;
+    for (const auto &block : graph.blocks) {
+      if (block.id != x && block.successors.empty()) {
+        escapes[block.id] = true;
+        pending.push_back(block.id);
+      }
+    }
+    while (!pending.empty()) {
+      const auto id = pending.back();
+      pending.pop_back();
+      for (const auto predecessor : graph.FindBlock(id)->predecessors) {
+        if (predecessor != x && !escapes[predecessor]) {
+          escapes[predecessor] = true;
+          pending.push_back(predecessor);
+        }
+      }
+    }
+    for (const auto &block : graph.blocks) {
+      Check(graph.PostDominates(x, block.id) == (block.id == x || !escapes[block.id]),
+            text);
+    }
+  }
+}
+
+void TestNewShaderRecompilerCfgPostDominatorsMatchPaths() {
+  // Runs of diamonds around an early return and inside a loop, then a trap
+  // loop that never reaches a return.
+  std::vector<uint32_t> shader = {EncodeSMovB32(0, 128)};
+  const auto add_diamonds = [&shader](uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+      shader.push_back(EncodeSopc(0x06, 0, 1 + i % 6)); // s_cmp_eq_u32 s0, sN
+      shader.push_back(EncodeSopp(0x05, 2));            // skip the first arm
+      shader.push_back(EncodeSMovB32(7, 129));
+      shader.push_back(EncodeSopp(0x02, 1)); // join
+      shader.push_back(EncodeSMovB32(7, 130));
+    }
+  };
+  add_diamonds(6);
+  shader.push_back(EncodeSopc(0x06, 7, 8));
+  shader.push_back(EncodeSopp(0x04, 1)); // skip the early return
+  shader.push_back(0xbf810000u);
+  const auto loop_start = static_cast<uint32_t>(shader.size());
+  add_diamonds(6);
+  shader.push_back(EncodeSopc(0x0a, 0, 129)); // s_cmp_lt_u32 s0, 1
+  shader.push_back(EncodeSopp(0x04, 2));      // leave the loop
+  shader.push_back(EncodeSop2(0x00, 0, 0, 129));
+  shader.push_back(EncodeSopp(
+      0x02, static_cast<uint16_t>(loop_start - (shader.size() + 1)))); // backedge
+  shader.push_back(0xbf810000u);
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(graph.natural_loops.size() == 1u && graph.blocks.size() > 30u,
+        "post-dominator fixture has the wrong native CFG");
+  CheckPostDominatorsMatchPaths(graph, "native post-dominators do not match their paths");
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        "post-dominator fixture did not structurize");
+  CheckPostDominatorsMatchPaths(graph,
+                                "structured post-dominators do not match their paths");
+
+  const uint32_t trap[] = {
+      EncodeSopc(0x06, 0, 1),
+      EncodeSopp(0x05, 2),          // to the trap
+      EncodeSMovB32(1, 129),
+      0xbf810000u,
+      EncodeSMovB32(2, 129),        // trap
+      EncodeSopp(0x02, 0xfffeu),    // spin
+      0xbf810000u,                  // unreachable decoder terminator
+  };
+  decoded = {};
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{trap}, decoded);
+  graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  CheckPostDominatorsMatchPaths(graph, "a trap loop's post-dominators do not match its paths");
+}
+
 void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
   const uint32_t shader[] = {
       EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
@@ -13635,6 +13718,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
   TestNewShaderRecompilerCfgLoopExitSharedWithSelection();
+  TestNewShaderRecompilerCfgPostDominatorsMatchPaths();
   TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
   TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
   TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();

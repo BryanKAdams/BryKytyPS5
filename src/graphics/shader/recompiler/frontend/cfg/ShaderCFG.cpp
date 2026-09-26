@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 #include <iterator>
 #include <map>
+#include <ranges>
 #include <set>
 #include <span>
 #include <stack>
@@ -761,10 +762,14 @@ void ComputePostDominators(Graph& graph) {
 		block.post_dominators = block.successors.empty() ? std::vector<uint32_t> {block.id} : all;
 	}
 
+	// Blocks are laid out in program order, so visiting them backwards sees most successors
+	// before their predecessors and the backward problem settles in a few passes. Any visiting
+	// order reaches the same greatest fixpoint from these starting sets; forward order needed
+	// about one pass per block of post-dominator depth, rerun after every merge split.
 	bool changed = true;
 	while (changed) {
 		changed = false;
-		for (auto& block: graph.blocks) {
+		for (auto& block: std::views::reverse(graph.blocks)) {
 			std::vector<uint32_t> next;
 			if (block.successors.empty()) {
 				next = {block.id};
