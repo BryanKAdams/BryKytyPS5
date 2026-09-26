@@ -391,6 +391,17 @@ d-pad. It applies immediately and is saved to `kyty_settings.ini`. Esc, F2, circ
 the panel, and the game gets no input while it is open. After a live change, Astro Bot took about
 20-25 s to step its resolution down and settle at a flat 60.
 
+The headroom does not help on the open sand of the crash site (the warm `ship` route with relaxed
+readback). The dip there lasts about 8 s at 30-45 fps per second at every scale: lowest second
+31.8 fps at 115, 29.6 at 140 and 28.8 at 160, with a longer dip at 160. GPU busy stays 14-19 ms a
+frame in those windows, so the game's resolution does not follow the measured time there.
+
+**Dead end: wave32 pixel shaders.** AMD's driver compiles a Vulkan fragment shader as wave64
+(`s_mov_b64 exec`), while Astro Bot's pixel shaders are wave32. The 9070 XT allows a required
+subgroup size for fragment shaders, so a test build requested 32 for wave32 guest pixel shaders.
+In alternating sand runs (two per side, after a warm-up run), the dip's 5 s windows were 40.6-48.2
+fps against 41.6-48.8 for wave64, and the steady GPU busy was 10.6 ms either way. Not adopted.
+
 ## First-use stutter (pipeline compiles)
 
 `--drain-stats` prints a `hitch:` line for every game frame of 50 ms or more, listing what was
