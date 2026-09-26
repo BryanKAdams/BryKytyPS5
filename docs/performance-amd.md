@@ -445,7 +445,10 @@ of cold-start stalls.
 Also tried: `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` on the library parts (the background
 link still optimizes fully) cut graphics pipeline creation only 6-8% (stalls 36.4 s to 34.7 s,
 two rounds). It is not adopted: new pipelines would run unoptimized code until the relink swaps
-in, which is a GPU cost not yet measured.
+in, which is a GPU cost not yet measured. Creating the parts without
+`VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT` (and so without the optimized
+relink) saved nothing: matched graphics pipelines took 12.96 s against 13.36 s in one cold round
+each, within the 3.5% that the compute pipelines, which the flag does not touch, moved too.
 
 Also tried: loading bounds-checked buffer elements without a branch (the SRT session's
 6820afbd). Matched pipeline creation fell 9% (graphics) and 6-10% (compute), but a warm check
