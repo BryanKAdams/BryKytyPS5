@@ -248,6 +248,8 @@ SpecializationDiff(const ShaderRecompiler::IR::ResourceSpecialization& a,
 		add("buf", i, "format", static_cast<uint64_t>(x.descriptor_format),
 		    static_cast<uint64_t>(y.descriptor_format));
 		add("buf", i, "swizzle", x.descriptor_swizzle, y.descriptor_swizzle);
+		add("buf", i, "oob", static_cast<uint64_t>(x.zero_stride_oob),
+		    static_cast<uint64_t>(y.zero_stride_oob));
 	}
 	for (size_t i = 0; i < a.images.size(); i++) {
 		const auto& x = a.images[i];

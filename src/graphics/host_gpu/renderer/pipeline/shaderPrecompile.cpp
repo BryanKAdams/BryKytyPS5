@@ -12,7 +12,7 @@ namespace Libs::Graphics::ShaderPrecompile {
 namespace {
 
 constexpr std::array<uint8_t, 8> Magic {'K', 'Y', 'T', 'Y', 'S', 'H', 'D', 'R'};
-constexpr uint32_t               FormatVersion  = 2;
+constexpr uint32_t               FormatVersion  = 3; // 3: buffers record zero_stride_oob.
 constexpr uint32_t               MaxCodeWords   = 256u * 1024u;
 constexpr uint32_t               MaxRecordBytes = 4u * 1024u * 1024u;
 constexpr uint64_t               MaxFileBytes   = 256u * 1024u * 1024u;
@@ -199,7 +199,7 @@ void Specialization(Archive& a, ShaderRecompiler::IR::ResourceSpecialization& s)
 	}
 	s.buffers.resize(count);
 	for (auto& b: s.buffers)
-		a(b.packed_stride, b.descriptor_format, b.descriptor_swizzle);
+		a(b.packed_stride, b.descriptor_format, b.descriptor_swizzle, b.zero_stride_oob);
 	count = static_cast<uint32_t>(s.images.size());
 	a(count);
 	if (count > ShaderRecompiler::IR::ShaderInfo::MaxImages) {

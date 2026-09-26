@@ -25348,9 +25348,8 @@ TestCase TBufferCapturedZeroStrideOob(bool raw_bounds = false, bool scalar = fal
   test.user_data[35] = 0x0004d000u | (raw_bounds ? 3u << 28u : 0u);
   test.has_user_data = true;
   test.storage_buffer_offsets = {0, 0, 16};
-  test.expected_buffer_resources = raw_bounds || scalar
-                                       ? std::vector<u32>{0, 1, 2}
-                                       : std::vector<u32>{0, 2};
+  // This fork binds every buffer (the unused-buffer pruning conflicts with its buffer cache).
+  test.expected_buffer_resources = std::vector<u32>{0, 1, 2};
   auto &code = test.code;
   AppendVMovLiteral(&code, 0, test.initial[0]);
   AppendStoreVgpr(&code, 0, 0); // Keep resource zero before the removed middle slot.
@@ -25396,7 +25395,7 @@ TestCase BufferZeroStrideOobFormatsAndWidths() {
     test.user_data[base + 3] = (format << 12u) | DstSel(1, 4, 1, 0);
   }
   test.has_user_data = true;
-  test.expected_buffer_resources = std::vector<u32>{0};
+  test.expected_buffer_resources = std::vector<u32>{0, 1, 2}; // Every buffer stays bound here.
   auto &code = test.code;
   AppendVMovU32(&code, 0, 0);
   AppendStoreVgpr(&code, 0, 0);
