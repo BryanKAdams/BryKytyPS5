@@ -11,16 +11,25 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
 
-// Loads an element whose index may be out of bounds without branching: an out-of-bounds lane
-// reads element 0 instead and gets zero, which is what a branch around the load gave. Reading
-// element 0 is always allowed (robustBufferAccess covers an empty storage binding). AMD's
-// compiler spends far longer on a branch around every load than on two selects: pipeline
-// creation for Astro Bot's largest compute shader is about 20% faster this way.
+bool IsStorageBufferAccess(const MemoryResourceAccess& resource) {
+	return resource.kind == IR::ResourceKind::Buffer ||
+	       resource.kind == IR::ResourceKind::ScalarBuffer || resource.kind == IR::ResourceKind::Gds;
+}
+
+// Loads an element that may be out of bounds; out-of-bounds lanes get zero. A storage-buffer load
+// is issued at its own index without a branch and its value is replaced by zero: the device
+// always enables robustBufferAccess, which keeps an out-of-bounds load harmless. Leaving the
+// address alone keeps constant offsets foldable into the load (clamping the index instead made
+// Astro Bot's hottest pixel shaders up to 18% slower). AMD's compiler spends far longer on a
+// branch around every load than on a select: pipeline creation for Astro Bot's largest compute
+// shader is about 20% faster. LDS and scratch have no such guarantee and keep the branch.
 template <typename Fn>
-uint32_t LoadElementOrZero(EmitterState& state, uint32_t in_bounds, uint32_t index, Fn&& load) {
-	const auto zero       = ConstantU32(state, 0);
-	const auto safe_index = Select(state, TypeU32(state), in_bounds, index, zero);
-	return Select(state, TypeU32(state), in_bounds, load(safe_index), zero);
+uint32_t LoadElementOrZero(EmitterState& state, const MemoryResourceAccess& resource,
+                           uint32_t in_bounds, uint32_t index, Fn&& load) {
+	if (!IsStorageBufferAccess(resource)) {
+		return EmitValueOrZeroIfCondition(state, in_bounds, [&]() { return load(index); });
+	}
+	return Select(state, TypeU32(state), in_bounds, load(index), ConstantU32(state, 0));
 }
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
@@ -298,7 +307,7 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
                           const MemoryResourceAccess& resource) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
 	const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
-	return LoadElementOrZero(ctx.state, in_bounds, index, [&](uint32_t element) {
+	return LoadElementOrZero(ctx.state, resource, in_bounds, index, [&](uint32_t element) {
 		return LoadWordInBounds(ctx, resource, element);
 	});
 }
@@ -318,7 +327,7 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	                              ConstantU32(ctx.state, 2));
 	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
 	return LoadElementOrZero(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), index,
+	    ctx.state, resource, EmitMemoryElementInBounds(ctx.state, resource, index), index,
 	    [&](uint32_t element) {
 		    return LoadSubwordInBounds(ctx, resource, address, element, bits, sign_extend);
 	    });
@@ -711,6 +720,16 @@ uint32_t ConstructU32Composite(EmitterState& state, uint32_t components,
 	return result;
 }
 
+uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                   const PreparedFormattedMemory& plan, uint32_t components) {
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
+		values[component] = FormattedConstant(ctx, plan.info, source.kind);
+	}
+	return ConstructU32Composite(ctx.state, components, values);
+}
+
 void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                             const PreparedFormattedMemory& plan, uint32_t component,
                             uint32_t data) {
@@ -836,27 +855,25 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 		    if (info.type != Format::ComponentType::Unknown) {
 			    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components,
 			                                             FormattedAccess::Load);
-			    // As in LoadElementOrZero: when any component is out of bounds, every element
-			    // is read at index 0 and each output takes the format's out-of-bounds value.
-			    auto safe = plan;
-			    for (uint32_t component = 0; component < safe.info.component_count; component++) {
-				    if (plan.indices[component] == 0) continue;
-				    uint32_t previous = 0;
-				    while (previous < component && plan.indices[previous] != plan.indices[component]) {
-					    previous++;
-				    }
-				    safe.indices[component] =
-				        previous < component
-				            ? safe.indices[previous]
-				            : Select(state, TypeU32(state), plan.in_bounds, plan.indices[component],
-				                     ConstantU32(state, 0));
+			    if (!IsStorageBufferAccess(resource)) {
+				    return EmitValueOrDefaultIfCondition(
+				        state, plan.in_bounds, TypeU32Composite(state, components),
+				        FormattedOutOfBoundsValue(ctx, mem, plan, components), [&]() {
+					        std::array<uint32_t, 4> values {};
+					        for (uint32_t component = 0; component < components; component++) {
+						        values[component] = LoadFormattedInBounds(ctx, mem, plan, component);
+					        }
+					        return ConstructU32Composite(state, components, values);
+				        });
 			    }
+			    // As in LoadElementOrZero: the elements are loaded at their own indices, and when
+			    // any component is out of bounds each output takes the format's out-of-bounds value.
 			    std::array<uint32_t, 4> values {};
 			    for (uint32_t component = 0; component < components; component++) {
 				    const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
 				    values[component] =
 				        Select(state, TypeU32(state), plan.in_bounds,
-				               LoadFormattedInBounds(ctx, mem, safe, component),
+				               LoadFormattedInBounds(ctx, mem, plan, component),
 				               FormattedConstant(ctx, plan.info, source.kind));
 			    }
 			    return ConstructU32Composite(state, components, values);
@@ -918,7 +935,7 @@ uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 			                                  address, ConstantU32(state, 2));
 			    const auto index     = EmitMemoryElementIndex(state, resource, raw_index);
 			    values[component]    = LoadElementOrZero(
-			        state, EmitMemoryElementInBounds(state, resource, index), index,
+			        state, resource, EmitMemoryElementInBounds(state, resource, index), index,
 			        [&](uint32_t element) { return LoadWordInBounds(ctx, resource, element); });
 		    }
 		    return ConstructU32Composite(state, components, values);
@@ -1173,9 +1190,9 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	const auto element   = EmitMemoryElementIndex(state, access, index);
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
-	ctx.Define(inst, LoadElementOrZero(state, condition, element, [&](uint32_t safe_element) {
+	ctx.Define(inst, LoadElementOrZero(state, access, condition, element, [&](uint32_t target) {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, safe_element));
+		               state, EmitMemoryElementPointer(state, access, target));
 	           }));
 }
 

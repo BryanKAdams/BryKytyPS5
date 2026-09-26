@@ -9414,16 +9414,13 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
         "buffer load SPIR-V lacks storage element access");
   Check(exec_branch < array_length,
         "buffer load bounds check was emitted outside EXEC guard");
-  // Out-of-bounds lanes read element 0 and select zero, without a branch.
+  // The load keeps its own index (robustBufferAccess bounds it) and an out-of-bounds lane
+  // selects zero, without a branch.
   const auto in_bounds = result_id(line_at(bounds));
-  const auto index_select = source.find("OpSelect %uint " + in_bounds + " ", bounds);
-  const auto value_select =
-      source.find("OpSelect %uint " + in_bounds + " ", element_access);
-  Check(index_select != std::string::npos && index_select < element_access &&
-            line_at(element_access).ends_with(" " + result_id(line_at(index_select))),
-        "buffer load storage element index was not clamped by its bounds check");
-  Check(value_select != std::string::npos &&
-            source.find("OpBranchConditional", array_length) > value_select,
+  const auto first_select = source.find("OpSelect %uint " + in_bounds + " ", bounds);
+  Check(first_select != std::string::npos && first_select > element_access,
+        "buffer load storage element index depends on its bounds check");
+  Check(source.find("OpBranchConditional", array_length) > first_select,
         "buffer load out-of-bounds value is not selected without a branch");
 }
 

@@ -16380,6 +16380,8 @@ private:
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
+    // The emulator requires it, and storage-buffer loads rely on it for out-of-bounds lanes.
+    device_features.robustBufferAccess = true;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
