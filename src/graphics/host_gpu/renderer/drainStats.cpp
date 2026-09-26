@@ -123,6 +123,8 @@ const char* KindName(Kind kind) {
 		case Kind::GpuTimestamp: return "gpu-timestamp";
 		case Kind::ShaderCompile: return "shader-compile";
 		case Kind::PipelineCreate: return "pipeline-create";
+		case Kind::Lookahead: return "lookahead";
+		case Kind::GpuThreadIdle: return "gpu-thread-idle";
 		case Kind::Count: break;
 	}
 	return "?";
@@ -341,7 +343,9 @@ bool IsTimeKind(Kind kind) {
 		case Kind::GpuGap:
 		case Kind::QueueLockWait:
 		case Kind::ShaderCompile:
-		case Kind::PipelineCreate: return true;
+		case Kind::PipelineCreate:
+		case Kind::Lookahead:
+		case Kind::GpuThreadIdle: return true;
 		default: return false;
 	}
 }
@@ -613,7 +617,9 @@ void ReportHitch(int64_t ms) noexcept {
 			                    static_cast<double>(values[kind]) / (1024.0 * 1024.0));
 		}
 	}
-	text += '\n';
+	text += fmt::format(" t={:.3f}\n", std::chrono::duration<double>(
+	                                      std::chrono::steady_clock::now().time_since_epoch())
+	                                      .count());
 	Log::WriteToConsoleAndLog(text);
 }
 

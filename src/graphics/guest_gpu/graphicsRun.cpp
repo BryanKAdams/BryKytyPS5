@@ -30,6 +30,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <vector>
@@ -571,8 +572,12 @@ void GuestGpu::ThreadRun(void* data) {
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
 		{
-			Common::LockGuard lock(gpu->m_queue_mutex);
+			Common::LockGuard                    lock(gpu->m_queue_mutex);
+			std::optional<DrainStats::WaitTimer> idle;
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				if (!idle) {
+					idle.emplace(DrainStats::Kind::GpuThreadIdle);
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
@@ -949,6 +954,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 void CommandProcessor::RunPipelineLookahead(const Pm4Execution& execution) {
 	KYTY_PROFILER_FUNCTION();
+	DrainStats::WaitTimer walk_timer(DrainStats::Kind::Lookahead);
 	// Enough for a loading frame's draws; the walk costs a few microseconds per known draw.
 	constexpr uint32_t MaxDraws   = 256;
 	constexpr uint32_t MaxPackets = 1u << 16u;

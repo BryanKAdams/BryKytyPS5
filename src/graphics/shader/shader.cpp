@@ -21,7 +21,10 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -71,6 +74,8 @@ void ShaderInit() {
 	g_shader_map = std::make_unique<std::unordered_map<uint64_t, ShaderMappedData>>();
 }
 
+static uint64_t GetDeclaredShaderHash(uint64_t shader_addr);
+
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	EXIT_IF(g_shader_map == nullptr);
 
@@ -81,6 +86,23 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	entry                      = data;
 	entry.generation           = ++generation;
 	entry.hash                 = 0;
+
+	// KYTY_PERMUTATION_LOG=1 (diagnostic): when each shader is registered, to compare with the
+	// time of its first permutation.
+	static const bool log_enabled = [] {
+		const char* value = std::getenv("KYTY_PERMUTATION_LOG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (log_enabled && data.code_size_bytes != 0 && data.code_size_bytes % 4u == 0) [[unlikely]] {
+		auto hash = GetDeclaredShaderHash(addr);
+		if (hash == 0) {
+			hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
+		}
+		const auto now = std::chrono::steady_clock::now().time_since_epoch();
+		std::printf("agc-shader: type=%u hash=%016llx bytes=%u t=%.3f\n",
+		            static_cast<uint32_t>(data.type), static_cast<unsigned long long>(hash),
+		            data.code_size_bytes, std::chrono::duration<double>(now).count());
+	}
 }
 
 static void ShaderStoreHash(uint64_t addr, uint64_t generation, uint64_t hash) {
