@@ -107,7 +107,7 @@ private:
 	bool EvaluateWide(uint32_t node, uint64_t& result);
 	bool EvaluateInst(const ResourceNode& node, uint64_t& result);
 	bool EvaluateRawRead(const ResourceNode& node, uint64_t& result);
-	// Reads a run's dwords into their flat slots and memos; false leaves both unchanged.
+	// Reads a run's dwords into their flat slots; false leaves them unchanged.
 	bool ReadFlatRun(const CompiledResourcePlan::FlatRun& run, std::vector<uint32_t>& flat);
 
 	const ResourcePlan&              m_program;

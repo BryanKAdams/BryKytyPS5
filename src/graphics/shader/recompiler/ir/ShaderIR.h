@@ -601,8 +601,9 @@ struct CompiledResourcePlan {
 		uint32_t dwords = 0;
 	};
 	struct FlatRunEntry {
-		uint32_t slot  = 0; // srt_reads index.
-		uint32_t dword = 0; // Within the run.
+		uint32_t slot        = 0; // srt_reads index.
+		uint32_t dword       = 0; // Within the run.
+		uint32_t flat_offset = 0; // srt_reads[slot].flat_offset.
 	};
 	static constexpr uint32_t MaxRunDwords = 64;
 

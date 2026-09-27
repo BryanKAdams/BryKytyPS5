@@ -1571,7 +1571,8 @@ void BuildFlatRuns(const ResourcePlan& program, CompiledResourcePlan& compiled) 
 			first_imm = candidate.imm;
 		}
 		last_imm = candidate.imm;
-		entries.push_back({candidate.slot, static_cast<uint32_t>((candidate.imm - first_imm) / 4)});
+		entries.push_back({candidate.slot, static_cast<uint32_t>((candidate.imm - first_imm) / 4),
+		                   program.srt_reads[candidate.slot].flat_offset});
 	}
 	flush(first_imm, last_imm);
 	if (!compiled.flat_runs.empty()) {
@@ -1785,6 +1786,12 @@ bool SrtEvaluator::EvaluateInst(const ResourceNode& node, uint64_t& result) {
 		case NodeOp::ShaderBase: result = m_runtime.shader_base; return true;
 		case NodeOp::Forward: return EvaluateWide(node.args[0], result);
 		case NodeOp::ReadConst:
+			// After RefreshFlatBuffer the slot's value is in the flat buffer, read as this read
+			// would evaluate it (clean slots by the clean walker).
+			if (m_flat != nullptr && node.aux < m_program.srt_reads.size()) {
+				result = (*m_flat)[m_program.srt_reads[node.aux].flat_offset];
+				return true;
+			}
 			if ((node.flags & ResourceNode::CleanSlot) != 0u && m_clean_flat_slots &&
 			    m_clean_evaluator != nullptr) {
 				return m_clean_evaluator->EvaluateWide(node.args[0], result);
@@ -2261,15 +2268,10 @@ bool SrtEvaluator::ReadFlatRun(const CompiledResourcePlan::FlatRun& run,
 		}
 		done += static_cast<uint32_t>(count);
 	}
+	// Later ReadConsts of these slots read the flat buffer (see EvaluateInst), so the slot nodes'
+	// memos are left alone.
 	for (uint32_t index = 0; index < run.count; index++) {
-		const auto& entry = entries[index];
-		auto&       memo  = m_memo[m_compiled.slots[entry.slot]];
-		// A slot this refresh already evaluated (a condition read it) keeps that value.
-		if (memo.generation != m_generation) {
-			memo.value      = words[entry.dword];
-			memo.generation = m_generation;
-		}
-		flat[m_program.srt_reads[entry.slot].flat_offset] = static_cast<uint32_t>(memo.value);
+		flat[entries[index].flat_offset] = words[entries[index].dword];
 	}
 	return true;
 }
