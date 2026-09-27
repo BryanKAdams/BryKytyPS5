@@ -289,6 +289,15 @@ private:
 	}
 	// Changed under m_lock; IsTextureCurrent reads it without.
 	std::atomic<uint64_t>                m_image_set_generation {NextGenerationBase()};
+	// Bumped whenever an image becomes GPU-modified (MarkGpuModified); with the image set
+	// generation it validates IsRegionGpuModified's per-thread record of clean pages.
+	std::atomic<uint64_t>                m_gpu_modified_generation {NextGenerationBase()};
+	void MarkGpuModified(Image& image) noexcept {
+		if (!image.IsGpuModified()) {
+			image.MarkGpuModified();
+			m_gpu_modified_generation.fetch_add(1, std::memory_order_release);
+		}
+	}
 
 	friend struct TextureCacheTestAccess;
 	friend struct PerformanceMemoryTestAccess;

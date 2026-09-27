@@ -758,7 +758,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.CopyImageWithBuffer(source, copy_buffer);
 	}
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		MarkGpuModified(destination);
 	}
 	destination.ClearBufferModified();
 }
@@ -775,7 +775,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 	destination.CopyMip(source, mip, layer);
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		MarkGpuModified(destination);
 	}
 }
 
@@ -1784,7 +1784,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 	}
 	if (desc.type == BindingType::Storage) {
-		image.MarkGpuModified();
+		MarkGpuModified(image);
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id);
@@ -1826,7 +1826,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.MarkGpuModified();
+	MarkGpuModified(image);
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1845,7 +1845,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.MarkGpuModified();
+	MarkGpuModified(image);
 	image.usage.depth_target = true;
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
@@ -1885,7 +1885,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
-	image.MarkGpuModified();
+	MarkGpuModified(image);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -2326,14 +2326,42 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
 	}
-	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, false)) {
-		const auto& image = m_slot_images[id];
-		if (!image.depth_id && image.IsGpuModified()) {
-			return true;
-		}
+	// Strict SRT reads ask this for the same small CPU-written tables every draw. A tracker page
+	// without a GPU-modified image stays so until an image is registered or becomes GPU-modified;
+	// every other change only cleans pages further (and stencil associations never go away).
+	struct CleanPage {
+		uint64_t page       = UINT64_MAX;
+		uint64_t images     = 0;
+		uint64_t gpu_writes = 0;
+	};
+	thread_local std::array<CleanPage, 64> clean_pages {};
+	// KYTY_DEBUG_AB=cleanpages scans the images every time in every other window.
+	static const bool ab       = AbSelected("cleanpages");
+	const auto        page     = address / TRACKER_PAGE_SIZE;
+	const bool        one_page = (address + size - 1) / TRACKER_PAGE_SIZE == page &&
+	                      !(ab && AbFeatureOff());
+	auto& slot = clean_pages[page % clean_pages.size()];
+	if (one_page && slot.page == page &&
+	    slot.images == m_image_set_generation.load(std::memory_order_acquire) &&
+	    slot.gpu_writes == m_gpu_modified_generation.load(std::memory_order_acquire)) {
+		return false;
 	}
-	return false;
+	std::scoped_lock lock {m_lock};
+	const auto gpu_modified = [this](uint64_t begin, uint64_t bytes) {
+		for (const auto id: FindImagesInRegion(begin, bytes, false)) {
+			const auto& image = m_slot_images[id];
+			if (!image.depth_id && image.IsGpuModified()) {
+				return true;
+			}
+		}
+		return false;
+	};
+	if (one_page && !gpu_modified(page * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE)) {
+		slot = {page, m_image_set_generation.load(std::memory_order_relaxed),
+		        m_gpu_modified_generation.load(std::memory_order_relaxed)};
+		return false;
+	}
+	return gpu_modified(address, size);
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {

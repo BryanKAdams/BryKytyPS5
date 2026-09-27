@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <deque>
 #include <map>
 #include <span>
@@ -174,6 +175,15 @@ private:
 		std::vector<std::pair<uint64_t, uint64_t>> ranges;
 	};
 	std::deque<InFlightDownload> m_inflight_downloads;
+	// HasGpuDirtyBytes: tracker pages found clean, valid while m_gpu_dirty_generation is
+	// unchanged. It is bumped when bytes become GPU-dirty or a download starts; nothing else can
+	// dirty a page. GPU thread only, like HasGpuDirtyBytes.
+	struct CleanPage {
+		uint64_t page       = UINT64_MAX;
+		uint64_t generation = 0;
+	};
+	std::array<CleanPage, 64> m_clean_pages {};
+	uint64_t                  m_gpu_dirty_generation = 1;
 };
 
 } // namespace Libs::Graphics

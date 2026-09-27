@@ -212,6 +212,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
 	arm();
 	PruneInFlight();
+	m_gpu_dirty_generation++;
 	auto& inflight = m_inflight_downloads.emplace_back();
 	inflight.tick  = m_scheduler.CurrentTick();
 	inflight.ranges.reserve(copies.size());
@@ -667,7 +668,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		(void)SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	if (is_written) {
-		m_gpu_modified_ranges.Add(vaddr, size);
+		if (m_gpu_modified_ranges.Add(vaddr, size)) {
+			m_gpu_dirty_generation++;
+		}
 		m_texture_cache.OnBufferGpuWrite(vaddr, size);
 		if (!m_hot_pages.empty()) {
 			QueueEagerReadback(vaddr, size);
@@ -794,6 +797,24 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	// Downloaded bytes have left the byte set, but their backing is valid only once published.
 	// Other bytes of an armed page are valid already: a window download around a CPU fault
 	// arms whole pages, and Thread_Gpu reads game tables that share such pages every frame.
+	// Strict SRT reads ask this for the same small tables every draw: remember clean pages.
+	// KYTY_DEBUG_AB=cleanpages asks the byte sets every time in every other window.
+	static const bool ab       = AbSelected("cleanpages");
+	const auto        page     = vaddr / TRACKER_PAGE_SIZE;
+	const bool        one_page = (vaddr + size - 1) / TRACKER_PAGE_SIZE == page &&
+	                      !(ab && AbFeatureOff());
+	auto& slot = m_clean_pages[page % m_clean_pages.size()];
+	if (one_page && slot.page == page && slot.generation == m_gpu_dirty_generation) {
+		return false;
+	}
+	if (one_page) {
+		const auto begin = page * TRACKER_PAGE_SIZE;
+		if (!m_gpu_modified_ranges.Intersects(begin, TRACKER_PAGE_SIZE) &&
+		    !InFlightIntersects(begin, TRACKER_PAGE_SIZE)) {
+			slot = {page, m_gpu_dirty_generation};
+			return false;
+		}
+	}
 	return m_gpu_modified_ranges.Intersects(vaddr, size) || InFlightIntersects(vaddr, size);
 }
 
