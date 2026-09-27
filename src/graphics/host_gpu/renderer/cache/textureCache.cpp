@@ -1534,10 +1534,13 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* unique_generation) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
+	}
+	if (unique_generation != nullptr) {
+		*unique_generation = 0;
 	}
 	ValidateImageDesc(desc);
 	if (desc.info.data.Empty()) {
@@ -1598,6 +1601,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (memo_enabled && remembered.generation == m_image_set_generation &&
 		    remembered.Matches(desc.info, exact_format)) {
 			result = remembered.id;
+			if (unique_generation != nullptr) {
+				*unique_generation = m_image_set_generation;
+			}
 		} else {
 			lookup();
 			if (!result && m_last_pressure_gc_tick != m_gc_tick &&
@@ -1631,6 +1637,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				              .type            = desc.info.type,
 				              .exact_format    = exact_format,
 				              .id              = result};
+				if (unique_generation != nullptr) {
+					*unique_generation = m_image_set_generation;
+				}
 			}
 		}
 		auto& image = m_slot_images[result];
@@ -1643,11 +1652,32 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 	}
-	MaterializeDccClear(result, desc, metadata_base_layer);
+	FinishFind(result, desc, metadata_base_layer);
+	return result;
+}
+
+bool TextureCache::RefindImage(ImageId id, uint64_t generation, const ImageDesc& desc,
+                               uint32_t metadata_base_layer) {
+	{
+		std::scoped_lock lock {m_lock};
+		if (generation == 0 || generation != m_image_set_generation) {
+			return false;
+		}
+		auto& image              = m_slot_images[id];
+		image.tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(image);
+	}
+	FinishFind(id, desc, metadata_base_layer);
+	return true;
+}
+
+// The part of FindImage after the lookup that runs without the lock.
+void TextureCache::FinishFind(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer) {
+	MaterializeDccClear(id, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		std::scoped_lock lock {m_lock};
-		const auto& image = m_slot_images[result];
+		const auto& image = m_slot_images[id];
 		const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
 		const bool native_current =
 		    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
@@ -1656,7 +1686,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			     "contents\n");
 		}
 	}
-	return result;
 }
 
 void TextureCache::UpdateImage(ImageId id) {

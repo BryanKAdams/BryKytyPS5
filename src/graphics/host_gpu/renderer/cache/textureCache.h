@@ -48,7 +48,15 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// When the lookup finds exactly one image with the same backing, *unique_generation receives
+	// the image set's generation, else 0: until an image is registered or unregistered, the same
+	// request finds the same image, and RefindImage does the rest of FindImage for it.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
+	                                      uint64_t* unique_generation = nullptr);
+	// FindImage's bookkeeping for a request FindImage resolved to id under generation (see
+	// unique_generation). Returns false, doing nothing, when the image set changed since.
+	[[nodiscard]] bool          RefindImage(ImageId id, uint64_t generation, const ImageDesc& desc,
+	                                        uint32_t metadata_base_layer);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -157,6 +165,8 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	void                        FinishFind(ImageId id, const ImageDesc& desc,
+	                                       uint32_t metadata_base_layer);
 	// Applies clears found in GPU-written DCC metadata with conditional rendering. Returns false
 	// when the target needs the CPU readback path.
 	[[nodiscard]] bool MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,

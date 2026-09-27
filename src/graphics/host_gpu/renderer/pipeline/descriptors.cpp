@@ -33,6 +33,8 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <optional>
@@ -723,7 +725,11 @@ private:
 } // namespace
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              PreparedBindings::ImageSource*               source) {
+	if (source != nullptr) {
+		source->generation = 0;
+	}
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
@@ -745,10 +751,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto        desc      = described.desc;
 	describe_probe.reset();
 
-	ImageId id;
+	const auto metadata_base_layer = desc.view_info.base_layer;
+	uint64_t   generation          = 0;
+	ImageId    id;
 	{
 		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::TextureImage);
-		id = texture_cache.FindImage(desc, described.shader_conversion);
+		id = texture_cache.FindImage(desc, described.shader_conversion, &generation);
+	}
+	if (source != nullptr && generation != 0) {
+		source->resource            = resource;
+		source->value               = value;
+		source->found               = id;
+		source->generation          = generation;
+		source->metadata_base_layer = metadata_base_layer;
 	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -824,6 +839,27 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+// Whether a stage slot's previous image binding stands for ResolveTexture(resource, value): the
+// same resource and descriptor find the same image while the image set is unchanged, and the
+// binding follows that image's stencil association, which must not have changed either.
+static bool ReuseTexture(TextureCache& cache, const PreparedBindings::ImageSource& source,
+                         const TextureBinding&                        binding,
+                         const ShaderRecompiler::IR::ImageResource&   resource,
+                         const ShaderRecompiler::IR::DescriptorValue& value) {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_TEXTURE_REUSE");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	if (!enabled || source.generation == 0 || !(source.value == value) ||
+	    !(source.resource == resource) ||
+	    !cache.RefindImage(source.found, source.generation, binding.desc,
+	                       source.metadata_base_layer)) {
+		return false;
+	}
+	const auto depth_id = cache.GetImage(source.found).depth_id;
+	return (depth_id ? depth_id : source.found) == binding.image_id;
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -837,10 +873,25 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.buffer_sources.clear();
 	prepared.buffers.clear();
 	prepared.images.resize(program.info.images.size());
+	prepared.image_sources.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	auto& texture_cache = m_context.GetTextureCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		// Consecutive draws mostly bind the same textures.
+		auto& previous = prepared.images[i];
+		if (ReuseTexture(texture_cache, prepared.image_sources[i], previous,
+		                 program.info.images[i], snapshot.images[i])) {
+			// As ResolveTexture returns it; RebindImages acquires the views.
+			previous.image_view = nullptr;
+			previous.layout     = vk::ImageLayout::eUndefined;
+			previous.mip_views.clear();
+			BindImage(previous.image_id,
+			          previous.desc.type == TextureCache::BindingType::Storage);
+			continue;
+		}
+		auto binding =
+		    ResolveTexture(program.info.images[i], snapshot.images[i], &prepared.image_sources[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
@@ -928,6 +979,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto& snapshot = *prepared.runtime->resources;
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
+	// Bindings assembled without PrepareBindings have no recorded sources.
+	prepared.image_sources.resize(images.size());
 	auto& texture_cache = m_context.GetTextureCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
@@ -936,7 +989,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i],
+			                           &prepared.image_sources[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
