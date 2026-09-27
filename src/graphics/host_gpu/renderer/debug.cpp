@@ -802,6 +802,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	static uint64_t other_ticks  = 0;
 	static auto     window_start = std::chrono::steady_clock::now();
 	static uint64_t window_tsc   = Now();
+	static uint64_t window_gpu   = g_gpu_busy_ns.load(std::memory_order_relaxed);
 	uint64_t        sum          = 0;
 	for (const auto ticks: current) {
 		sum += ticks;
@@ -826,15 +827,17 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	const auto   tsc     = Now();
 	const double seconds = std::chrono::duration<double>(now - window_start).count();
 	const double to_us   = seconds * 1e6 / static_cast<double>(tsc - window_tsc);
+	const auto   gpu_ns  = g_gpu_busy_ns.load(std::memory_order_relaxed);
 	uint64_t     all     = 0;
 	for (const auto ticks: totals) {
 		all += ticks;
 	}
 	std::string line = fmt::format("draw-phases: {:.1f}s draws/s={:.0f} us/draw={:.2f} ms/s={:.1f} "
-	                               "other draws/s={:.0f} other ms/s={:.1f}{} |",
+	                               "other draws/s={:.0f} other ms/s={:.1f} gpu-ms/s={:.1f}{} |",
 	                               seconds, draws / seconds, draws != 0 ? all * to_us / draws : 0.0,
 	                               all * to_us / 1000.0 / seconds, other_draws / seconds,
 	                               other_ticks * to_us / 1000.0 / seconds,
+	                               static_cast<double>(gpu_ns - window_gpu) / 1e6 / seconds,
 	                               !AbEnabled() ? "" : (AbFeatureOff() ? " ab=off" : " ab=on"));
 	for (uint32_t i = 0; i < Count; i++) {
 		line += fmt::format(" {}={:.2f}", Names[i], draws != 0 ? totals[i] * to_us / draws : 0.0);
@@ -858,6 +861,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	other_ticks  = 0;
 	window_start = now;
 	window_tsc   = tsc;
+	window_gpu   = gpu_ns;
 }
 
 void LogDrawPhase(const char* draw_name, const char* phase) {

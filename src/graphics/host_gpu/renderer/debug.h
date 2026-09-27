@@ -30,6 +30,8 @@ inline RenderDebugCounters g_render_debug_counters;
 // cpwrite (BDA epochs started by the GPU thread's own guest memory writes).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
+// GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
+inline std::atomic<uint64_t> g_gpu_busy_ns {0};
 
 // KYTY_DEBUG_DRAW_PHASES=<pixel shader hash> times the render thread's CPU phases of that pixel
 // shader's draws and prints their average every 5 s; =all times every draw. Each Mark charges the
