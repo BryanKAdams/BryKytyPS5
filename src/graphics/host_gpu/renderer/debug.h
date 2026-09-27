@@ -24,7 +24,8 @@ inline RenderDebugCounters g_render_debug_counters;
 // With KYTY_DEBUG_DRAW_PHASES set, KYTY_DEBUG_AB=<features> turns the named features off in every
 // other 5 s window, so one run compares both under the same scene and machine load; each
 // draw-phases line reports its window's mode. Features: reuse (texture and render-target reuse;
-// also KYTY_DEBUG_AB=1), pending (rate-limited GPU progress queries at draw entry).
+// also KYTY_DEBUG_AB=1), pending (rate-limited GPU progress queries at draw entry), backing
+// (lock-free cached guest backing reads).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 

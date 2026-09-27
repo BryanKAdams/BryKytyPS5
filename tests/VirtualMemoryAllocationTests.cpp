@@ -1340,6 +1340,21 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	      "TryReadBacking should reject a range crossing an unmapped span");
 	Check(test, rejected_read == transaction_sentinel,
 	      "failed backing reads must not modify a destination prefix");
+	// The reads before the unmap left base's four-page mapping in this thread's backing read
+	// cache: the unmap must invalidate it, and the surviving page must still resolve (twice, the
+	// second time through the cache again).
+	uint64_t removed_read = 0;
+	Check(test,
+	      !Libs::LibKernel::Memory::TryReadBacking(base + SceKernelPageSize, &removed_read,
+	                                               sizeof(removed_read)),
+	      "TryReadBacking resolved an unmapped page through a cached mapping");
+	for (int pass = 0; pass < 2; pass++) {
+		backing_read = 0;
+		Check(test,
+		      Libs::LibKernel::Memory::TryReadBacking(base, &backing_read, sizeof(backing_read)) &&
+		          backing_read == alias_test_value,
+		      "TryReadBacking should still resolve the page left of an unmapped span");
+	}
 	Check(test,
 	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0xf30, 0x1560) ==
 	          0xf30,

@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -169,6 +170,12 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 #endif
+
+// GuestBackingStore::TryReadCached; KYTY_DEBUG_AB=backing turns it off in every other window.
+static bool BackingReadCacheEnabled() noexcept {
+	static const bool ab = Graphics::AbSelected("backing");
+	return !(ab && Graphics::AbFeatureOff());
+}
 
 #include "memoryAddressSpace.inc"
 

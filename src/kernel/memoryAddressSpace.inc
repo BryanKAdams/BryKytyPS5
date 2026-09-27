@@ -182,6 +182,9 @@ public:
 			return false;
 		}
 		auto* destination = static_cast<uint8_t*>(data);
+		if (BackingReadCacheEnabled() && TryReadCached(vaddr, destination, size)) {
+			return true;
+		}
 		return TryTransferBacking(
 		    vaddr, size, [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			    std::memcpy(destination + data_offset, backing, bytes);
@@ -247,6 +250,7 @@ public:
 		{
 			std::lock_guard lock(m_mutex);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			MapsChangedUnlocked();
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -258,6 +262,7 @@ public:
 		{
 			std::lock_guard lock(m_mutex);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			MapsChangedUnlocked();
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -348,6 +353,7 @@ public:
 					old = entry->second;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 					m_maps.erase(entry);
+					MapsChangedUnlocked();
 #endif
 				}
 			}
@@ -370,6 +376,7 @@ public:
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
 				m_maps.emplace(old.vaddr, old);
+				MapsChangedUnlocked();
 				return false;
 			}
 			if (placeholder_preserved != nullptr) {
@@ -418,6 +425,7 @@ public:
 		}
 		std::lock_guard lock(m_mutex);
 		m_maps.emplace(old.vaddr, old);
+		MapsChangedUnlocked();
 		return false;
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
@@ -428,6 +436,7 @@ public:
 
 		std::lock_guard lock(m_mutex);
 		m_maps.erase(old.vaddr);
+		MapsChangedUnlocked();
 		if (left_size != 0) {
 			m_maps.emplace(old.vaddr,
 			               MapEntry {old.vaddr, left_size, old.backing_offset, old.mode});
@@ -479,6 +488,7 @@ private:
 		std::lock_guard lock(m_mutex);
 		const auto      end     = vaddr + size;
 		auto            current = vaddr;
+		MapEntry        single {};
 		while (current < end) {
 			MapEntry entry {};
 			if (!FindContainingUnlocked(current, 1, &entry)) {
@@ -487,6 +497,9 @@ private:
 			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
 			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
 				return false;
+			}
+			if (bytes == size) {
+				single = entry;
 			}
 			current += bytes;
 		}
@@ -500,7 +513,36 @@ private:
 			transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
 			current += bytes;
 		}
+		if (single.size != 0) {
+			t_read_cache = {this, m_map_generation.load(std::memory_order_relaxed), single};
+		}
 		return true;
+	}
+
+	// Reads through the calling thread's last single-mapping transfer without the mutex or the
+	// map search. The generation is checked before and after the copy, seqlock style: the backing
+	// view stays mapped for the store's lifetime, so a copy that races with a mapping change only
+	// reads bytes the second check then discards, and the caller takes the locked path.
+	bool TryReadCached(uint64_t vaddr, uint8_t* destination, uint64_t size) const {
+		const auto& cache = t_read_cache;
+		const auto& entry = cache.entry;
+		if (cache.owner != this || size == 0 || vaddr < entry.vaddr || size > entry.size ||
+		    vaddr - entry.vaddr > entry.size - size) {
+			return false;
+		}
+		const auto generation = m_map_generation.load(std::memory_order_acquire);
+		if (generation != cache.generation) {
+			return false;
+		}
+		std::memcpy(destination, m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
+		            size);
+		std::atomic_thread_fence(std::memory_order_acquire);
+		return m_map_generation.load(std::memory_order_relaxed) == generation;
+	}
+
+	// Called under m_mutex whenever m_maps changes; see TryReadCached.
+	void MapsChangedUnlocked() noexcept {
+		m_map_generation.fetch_add(1, std::memory_order_release);
 	}
 
 	struct MapEntry {
@@ -509,6 +551,16 @@ private:
 		uint64_t            backing_offset = 0;
 		VirtualMemory::Mode mode           = VirtualMemory::Mode::NoAccess;
 	};
+
+	// A thread's last transfer that one mapping covered, valid while m_map_generation still
+	// holds `generation`.
+	struct ReadCache {
+		const GuestBackingStore* owner      = nullptr;
+		uint64_t                 generation = 0;
+		MapEntry                 entry;
+	};
+	// Defined after the class: its initializers need the complete class.
+	static thread_local ReadCache t_read_cache;
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
 		EXIT_IF(out == nullptr);
@@ -638,7 +690,11 @@ private:
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	// Bumped under m_mutex on every change to m_maps (MapsChangedUnlocked).
+	std::atomic<uint64_t>        m_map_generation {1};
 };
+
+thread_local GuestBackingStore::ReadCache GuestBackingStore::t_read_cache;
 
 class GuestAddressSpace {
 public:
