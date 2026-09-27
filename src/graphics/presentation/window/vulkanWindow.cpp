@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -569,6 +570,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		conditional_rendering.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &conditional_rendering;
 	}
+	const bool executable_properties_extension =
+	    HasExtension(device_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_properties {};
+	if (executable_properties_extension) {
+		executable_properties.pNext = supported_features2.pNext;
+		supported_features2.pNext    = &executable_properties;
+	}
 	const bool pipeline_library_extension =
 	    HasExtension(device_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
 	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
@@ -739,6 +747,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.pipeline_library_enabled) {
 		pipeline_library.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext      = &pipeline_library;
+	}
+	graphics.pipeline_executable_info_enabled =
+	    executable_properties_extension && executable_properties.pipelineExecutableInfo;
+	if (graphics.pipeline_executable_info_enabled) {
+		executable_properties.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext           = &executable_properties;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1111,6 +1125,12 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// Debugging aid: the driver's statistics and ISA for chosen pipelines (see shaders.cpp).
+		if (std::getenv("KYTY_DEBUG_PIPELINE_STATS") != nullptr &&
+		    HasExtension(available_extensions,
+		                 VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions,
 		                 VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME)) {

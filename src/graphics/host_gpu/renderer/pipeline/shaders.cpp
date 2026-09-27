@@ -22,12 +22,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <limits>
 #include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -1008,6 +1012,126 @@ uint32_t PrefetchLibraryParts(GraphicContext& graphics, const PipelineRenderingS
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// Debugging aid: KYTY_DEBUG_PIPELINE_STATS=<vertex or pixel shader hashes, hex, comma-separated>
+// compiles each graphics pipeline using one of them once more, as a monolithic pipeline that
+// captures the driver's statistics (registers, spills) and internal representations (ISA), and
+// writes them to pipeline-stats-<vertex hash>-<pixel hash>-<n>.txt in the working directory.
+static const std::vector<uint64_t>& PipelineStatsHashes() {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		for (const char* text = std::getenv("KYTY_DEBUG_PIPELINE_STATS"); text != nullptr;) {
+			char* end = nullptr;
+			result.push_back(std::strtoull(text, &end, 16));
+			text = end != nullptr && *end == ',' ? end + 1 : nullptr;
+		}
+		return result;
+	}();
+	return hashes;
+}
+
+static void DumpPipelineStatistics(GraphicContext& graphics, const GraphicsPipelineState& state,
+                            vk::PipelineLayout layout, uint64_t vertex_hash, uint64_t pixel_hash) {
+	vk::GraphicsPipelineCreateInfo info {};
+	info.flags = state.flags | vk::PipelineCreateFlagBits::eCaptureStatisticsKHR |
+	             vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+	info.pNext               = &state.rendering;
+	info.stageCount          = state.stage_count;
+	info.pStages             = state.stages.data();
+	info.pVertexInputState   = state.mesh ? nullptr : &state.vertex_input;
+	info.pInputAssemblyState = state.mesh ? nullptr : &state.input_assembly;
+	info.pTessellationState  = state.uses_tessellation ? &state.tessellation : nullptr;
+	info.pViewportState      = &state.viewport;
+	info.pRasterizationState = &state.rasterizer;
+	info.pMultisampleState   = &state.multisampling;
+	info.pDepthStencilState  = state.with_depth ? &state.depth_stencil : nullptr;
+	info.pColorBlendState    = &state.color_blending;
+	info.pDynamicState       = &state.dynamic_state;
+	info.layout              = layout;
+	info.basePipelineIndex   = -1;
+	vk::Pipeline pipeline    = nullptr;
+	// A capturing compile usually bypasses the driver's shader cache: roughly a cold compile time.
+	const auto start = std::chrono::steady_clock::now();
+	if (graphics.device.createGraphicsPipelines(nullptr, 1, &info, nullptr, &pipeline) !=
+	        vk::Result::eSuccess ||
+	    pipeline == nullptr) {
+		std::printf("pipeline-stats: capture failed vs=%016llx ps=%016llx\n",
+		            static_cast<unsigned long long>(vertex_hash),
+		            static_cast<unsigned long long>(pixel_hash));
+		return;
+	}
+	static std::atomic_uint32_t dumps = 0;
+	const auto path = fmt::format("pipeline-stats-{:016x}-{:016x}-{}.txt", vertex_hash, pixel_hash,
+	                              dumps++);
+	FILE* file = std::fopen(path.c_str(), "w");
+	const vk::PipelineInfoKHR pipeline_info {.pipeline = pipeline};
+	uint32_t                  executables = 0;
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &executables, nullptr);
+	std::vector<vk::PipelineExecutablePropertiesKHR> properties(executables);
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &executables,
+	                                                         properties.data());
+	std::string summary = fmt::format(
+	    " compile_ms={:.1f}",
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	for (uint32_t index = 0; index < executables && file != nullptr; index++) {
+		const vk::PipelineExecutableInfoKHR executable {.pipeline = pipeline, .executableIndex = index};
+		std::fprintf(file, "== %s: %s\n", properties[index].name.data(),
+		             properties[index].description.data());
+		uint32_t count = 0;
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &count, nullptr);
+		std::vector<vk::PipelineExecutableStatisticKHR> statistics(count);
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &count,
+		                                                         statistics.data());
+		summary += fmt::format(" [{}]", properties[index].name.data());
+		for (const auto& statistic: statistics) {
+			std::string value;
+			switch (statistic.format) {
+				case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+					value = statistic.value.b32 ? "true" : "false";
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+					value = fmt::format("{}", statistic.value.i64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+					value = fmt::format("{}", statistic.value.u64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
+					value = fmt::format("{:.3f}", statistic.value.f64);
+					break;
+			}
+			std::fprintf(file, "stat %s = %s\n", statistic.name.data(), value.c_str());
+			summary += fmt::format(" {}={}", statistic.name.data(), value);
+		}
+		count = 0;
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &count,
+		                                                                      nullptr);
+		std::vector<vk::PipelineExecutableInternalRepresentationKHR> representations(count);
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(
+		    &executable, &count, representations.data());
+		std::vector<std::vector<char>> texts(count);
+		for (uint32_t r = 0; r < count; r++) {
+			texts[r].resize(representations[r].dataSize + 1u, '\0');
+			representations[r].pData = texts[r].data();
+		}
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(
+		    &executable, &count, representations.data());
+		for (uint32_t r = 0; r < count; r++) {
+			std::fprintf(file, "-- %s: %s\n", representations[r].name.data(),
+			             representations[r].description.data());
+			if (representations[r].isText) {
+				std::fputs(texts[r].data(), file);
+				std::fputc('\n', file);
+			}
+		}
+	}
+	if (file != nullptr) {
+		std::fclose(file);
+	}
+	std::printf("pipeline-stats: vs=%016llx ps=%016llx -> %s:%s\n",
+	            static_cast<unsigned long long>(vertex_hash),
+	            static_cast<unsigned long long>(pixel_hash), path.c_str(), summary.c_str());
+	graphics.device.destroyPipeline(pipeline, nullptr);
+}
+
 int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                            const PipelineRenderingState&          rendering,
                            const PipelineVertexInputState&        vertex_input,
@@ -1029,12 +1153,25 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
 		     (static_params.blend_enable[0] ? "true" : "false"),
 		     state.dynamic_state.dynamicStateCount);
 	}
+	int library_parts = -1;
 	if (libraries != nullptr && UsesLibraries(graphics, state)) {
-		return static_cast<int>(
+		library_parts = static_cast<int>(
 		    CreateLibraryPipeline(graphics, pipeline, state, programs, *libraries, driver_cache));
+	} else {
+		CreateMonolithicPipeline(graphics, pipeline, state, driver_cache);
 	}
-	CreateMonolithicPipeline(graphics, pipeline, state, driver_cache);
-	return -1;
+	if (const auto& hashes = PipelineStatsHashes();
+	    !hashes.empty() && graphics.pipeline_executable_info_enabled) [[unlikely]] {
+		const auto* vertex = vertex_info.empty() ? nullptr : vertex_info[0].stage.program;
+		const auto* pixel  = ps_input_info != nullptr ? ps_input_info->stage.program : nullptr;
+		const auto  vertex_hash = vertex != nullptr ? vertex->shader_hash : 0;
+		const auto  pixel_hash  = pixel != nullptr ? pixel->shader_hash : 0;
+		if (std::ranges::find(hashes, vertex_hash) != hashes.end() ||
+		    std::ranges::find(hashes, pixel_hash) != hashes.end()) {
+			DumpPipelineStatistics(graphics, state, pipeline.pipeline_layout, vertex_hash, pixel_hash);
+		}
+	}
+	return library_parts;
 }
 
 Common::UniqueFunction<vk::Pipeline> PrepareComputePipeline(GraphicContext&               graphics,

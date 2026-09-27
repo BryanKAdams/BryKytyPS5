@@ -39,6 +39,8 @@ struct GraphicContext {
 	// VK_EXT_graphics_pipeline_library: compile pipeline stages as libraries and link them.
 	bool                               pipeline_library_enabled              = false;
 	bool                               pipeline_library_fast_linking         = false;
+	// VK_KHR_pipeline_executable_properties, enabled only for KYTY_DEBUG_PIPELINE_STATS.
+	bool                               pipeline_executable_info_enabled      = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
