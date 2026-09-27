@@ -496,6 +496,32 @@ build warm in its own folder: the worst five seconds rose from 45.2 and 43.6 fps
 56.2 (render-thread gap 14.4 to 10.4 ms a frame, GPU time unchanged), the worst second from 25.4
 and 39.9 to 43.9 and 41.9. Screenshots match.
 
+## Sky Garden (the flamingo planet)
+
+At the level start, standing still, Sky Garden ran at about 13 fps: about 5,000 draws a frame,
+GPU busy 43-45 ms a frame and the GPU idle another ~31 ms waiting for Thread_Gpu.
+`KYTY_DEBUG_DRAW_STATS=1` showed about 10,000 rendering restarts a second, one per draw of the
+foliage G-buffer shaders (3cf24e1b, db5cce1c, c88ebedb, ...). Each of their vertex shaders does
+one fire-and-forget `BUFFER_ATOMIC_UMAX` (a wave maximum written by one lane: per-draw feedback
+for the game), so every draw counted as a buffer-writing draw, and the renderer ended rendering
+and recorded a full shader-write barrier after each one.
+
+PS5 orders such writes only through the game's own sync packets. A draw's buffer writes now
+leave their barrier pending (`CommandBuffer::DeferShaderWriteBarrier`): `EndRendering` records it,
+and every non-draw command (copies, readbacks, dispatches, image transitions, the end of the
+command buffer) ends rendering before it records. A later draw ends rendering first only when it
+may read the written bytes: an overlapping buffer binding, vertex, index or argument range, or a
+shader reading memory through addresses. Two draws that only touch a range through atomics
+need no barrier between them (`BufferResource::loaded` now tells plain loads from atomic reads).
+Restarts fell from about 10,000 to 2,100 a second and GPU busy from 44 to 34 ms a frame. The
+frame rate stayed at 13.3 fps, because Thread_Gpu (about 14 us a draw) is now the limit. The
+desert's sand dip gained from the same change: its worst second rose to 51 fps.
+
+`scratchpad\flamingo.ps1` in the session that did this drives the route: a copy of the user's
+save (`C:\Games\_SaveFlamingo`, slot 1), the overworld up to the Gorilla Nebula, Sky Garden
+(hold cross to dive in), then samples standing still at the level start. Game runs share one
+GPU and window: sessions take `C:\Games\runs\RUN.lock` before launching or building.
+
 ## First-use stutter (pipeline compiles)
 
 `--drain-stats` prints a `hitch:` line for every game frame of 50 ms or more, listing what was

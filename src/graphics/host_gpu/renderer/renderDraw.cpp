@@ -1183,6 +1183,74 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// Whether a draw may read buffer bytes that pending writes changed: any buffer binding, vertex,
+// index or argument range overlapping them, or a shader reading memory through addresses. Only
+// atomics on both sides need no barrier: atomics on the same memory are coherent without one.
+bool RenderExecutor::ReadsPendingWrites(std::span<PreparedBindings* const> stages,
+                                        const ShaderVertexInputInfo&       vertex_input,
+                                        const DrawIndexBufferSource&       index_source,
+                                        const DrawCallInfo&                draw) const {
+	const auto overlaps = [&](uint64_t begin, uint64_t size, bool atomic_only) {
+		const auto end = begin + size;
+		return std::ranges::any_of(m_pending_writes, [&](const PendingWrite& write) {
+			return begin < write.end && write.begin < end && !(atomic_only && write.atomic_only);
+		});
+	};
+	for (const auto* stage: stages) {
+		const auto& program = *stage->runtime->program;
+		if (program.info.uses_dma) {
+			return true;
+		}
+		const auto count = std::min(program.info.buffers.size(), stage->buffer_sources.size());
+		for (size_t i = 0; i < count; i++) {
+			const auto& source   = stage->buffer_sources[i];
+			const auto& resource = program.info.buffers[i];
+			if (source.address != 0 && source.size != 0 &&
+			    overlaps(source.address, source.size,
+			             resource.atomic && !resource.stored && !resource.loaded)) {
+				return true;
+			}
+		}
+	}
+	for (int i = 0; i < vertex_input.buffers_num; i++) {
+		const auto& vertex = vertex_input.buffers[i];
+		const auto  size   = VertexBufferDescriptorSize(vertex, vertex_input);
+		if (vertex.addr != 0 && size != 0 && overlaps(vertex.addr, size, false)) {
+			return true;
+		}
+	}
+	return (index_source.address != 0 && index_source.size != 0 &&
+	        overlaps(index_source.address, index_source.size, false)) ||
+	       (draw.indirect_args != 0 &&
+	        overlaps(draw.indirect_args, MeshIndirectArgs::ArgumentsSize, false));
+}
+
+// Adds the buffer ranges a draw's shaders write to the pending writes. Draws usually repeat the
+// same few ranges, so an existing entry is reused.
+void RenderExecutor::RecordPendingWrites(std::span<PreparedBindings* const> stages) {
+	for (const auto* stage: stages) {
+		const auto& program = *stage->runtime->program;
+		const auto  count   = std::min(program.info.buffers.size(), stage->buffer_sources.size());
+		for (size_t i = 0; i < count; i++) {
+			const auto& source   = stage->buffer_sources[i];
+			const auto& resource = program.info.buffers[i];
+			if (!resource.written || source.address == 0 || source.size == 0) {
+				continue;
+			}
+			const PendingWrite write {source.address, source.address + source.size,
+			                          resource.atomic && !resource.stored};
+			const auto same = std::ranges::find_if(m_pending_writes, [&](const PendingWrite& other) {
+				return other.begin == write.begin && other.end == write.end;
+			});
+			if (same == m_pending_writes.end()) {
+				m_pending_writes.push_back(write);
+			} else {
+				same->atomic_only = same->atomic_only && write.atomic_only;
+			}
+		}
+	}
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1367,6 +1435,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	// Earlier draws' buffer writes may still wait for their barrier (see
+	// CommandBuffer::DeferShaderWriteBarrier). When this draw may read them, it ends rendering
+	// first, which records the barrier.
+	if (!buffer.HasPendingShaderWrites()) {
+		m_pending_writes.clear();
+	} else if (ReadsPendingWrites(stages, state.vertex_info[0], index_source, draw)) {
+		m_context.GetCommandScheduler().EndRendering();
+		m_pending_writes.clear();
+	}
+
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
@@ -1485,8 +1563,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (shader_write_stages) {
-		m_context.GetCommandScheduler().EndRendering();
-		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		// Games write per-draw feedback (atomic maxima, counters) from thousands of draws a frame.
+		// PS5 orders such writes only through the game's own sync packets, so the barrier waits
+		// until something may read them instead of restarting rendering after every draw.
+		buffer.DeferShaderWriteBarrier(shader_write_stages);
+		RecordPendingWrites(stages);
+		// Bound the per-draw overlap checks.
+		if (m_pending_writes.size() > 64) {
+			m_context.GetCommandScheduler().EndRendering();
+			m_pending_writes.clear();
+		}
 	}
 	m_context.GetBufferCache().OnCommandRecorded();
 	g_draw_phases.Mark(DrawPhaseTimer::Record);
@@ -1497,7 +1583,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw_logged) [[unlikely]] {
 		std::printf(
 		    "draw-log end: render_begins=%" PRIu64 " render_ends=%" PRIu64
-		    " image_barriers=%" PRIu64 " shader_write_barrier=%u\n",
+		    " image_barriers=%" PRIu64 " shader_writes=%u\n",
 		    g_render_debug_counters.render_begins.load(std::memory_order_relaxed) - counters_before[0],
 		    g_render_debug_counters.render_ends.load(std::memory_order_relaxed) - counters_before[1],
 		    g_render_debug_counters.image_barriers.load(std::memory_order_relaxed) -
@@ -1519,7 +1605,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    pixel != nullptr ? pixel->shader_hash : 0, vertex != nullptr ? vertex->shader_hash : 0,
 		    g_render_debug_counters.render_begins.load(std::memory_order_relaxed) - counters_before[0],
 		    g_render_debug_counters.image_barriers.load(std::memory_order_relaxed) -
-		        counters_before[2] + (shader_write_stages ? 1u : 0u));
+		        counters_before[2]);
 	}
 }
 

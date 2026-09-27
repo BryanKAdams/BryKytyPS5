@@ -117,7 +117,17 @@ public:
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
+	// Ends the rendering instance, then records the barrier of any deferred shader writes.
 	void EndRendering() const;
+	// A draw whose shaders wrote buffers leaves the barrier that makes the writes visible pending
+	// while rendering continues. Every command other than a draw ends rendering before it records,
+	// which records the barrier; a later draw that may read the writes ends rendering first.
+	void DeferShaderWriteBarrier(vk::PipelineStageFlags source_stages) const {
+		m_pending_shader_writes |= source_stages;
+	}
+	[[nodiscard]] bool HasPendingShaderWrites() const noexcept {
+		return static_cast<bool>(m_pending_shader_writes);
+	}
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -149,6 +159,7 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable vk::PipelineStageFlags m_pending_shader_writes;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -215,8 +226,22 @@ private:
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool ReadsPendingWrites(std::span<PreparedBindings* const> stages,
+	                                      const ShaderVertexInputInfo&       vertex_input,
+	                                      const DrawIndexBufferSource&       index_source,
+	                                      const DrawCallInfo&                draw) const;
+	void RecordPendingWrites(std::span<PreparedBindings* const> stages);
+
+	// Buffer ranges that draws wrote while their barrier is still pending (see
+	// CommandBuffer::DeferShaderWriteBarrier), and whether only atomics wrote each one.
+	struct PendingWrite {
+		uint64_t begin       = 0;
+		uint64_t end         = 0;
+		bool     atomic_only = false;
+	};
 
 	RenderContext&                        m_context;
+	std::vector<PendingWrite>             m_pending_writes;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;

@@ -103,9 +103,10 @@ struct BufferResource {
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
 	uint32_t               image_alias        = NoImageAlias;
-	bool                   read               = false;
+	bool                   read               = false; // Loads or atomics.
 	bool                   written            = false; // Stores or atomics.
 	bool                   stored             = false; // Plain (non-atomic) stores.
+	bool                   loaded             = false; // Plain (non-atomic) loads.
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
