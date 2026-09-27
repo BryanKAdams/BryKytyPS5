@@ -1350,14 +1350,11 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	const auto buffer_size = buffer[0];
 	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
+	// REPORT_AND_RESET or FORCE_RESET: the counting starts anew after this report.
+	const bool reset = (buffer[3] & 0x000c0000u) != 0;
 
 	if (dst != nullptr && buffer_size != 0) {
-		memset(dst, 0, buffer_size);
-		// Hack?
-		if (buffer_size >= sizeof(uint32_t)) {
-			auto* label = static_cast<uint32_t*>(dst);
-			*label      = 1;
-		}
+		cp.ReportMipStats(dst, buffer_size, reset);
 	}
 
 	return 4;

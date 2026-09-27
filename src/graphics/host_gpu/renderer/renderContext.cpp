@@ -10,6 +10,9 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -216,6 +219,97 @@ void RenderContext::PrepareBda() {
 	}
 	if (mode == Config::BdaSyncMode::SelectiveChecked) {
 		EXIT_IF(!m_buffer_cache.CheckBdaHintInvariant(m_mapped_ranges));
+	}
+}
+
+// KYTY_DEBUG_MIP_STATS=1 prints, every 300 reports (every 30 during a relief), whether draws
+// marked a counter since the last report and how many counters report no samples.
+static bool MipStatsDebugEnabled() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_MIP_STATS") != nullptr;
+	return enabled;
+}
+
+// The last NoteStreamingThrash, in steady_clock ticks; 0: none yet.
+static std::atomic<int64_t> g_streaming_thrash_time {0};
+
+void NoteStreamingThrash() noexcept {
+	g_streaming_thrash_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+	                              std::memory_order_relaxed);
+}
+
+void RenderContext::ReportMipStats(void* dst, uint32_t size, bool reset) {
+	// A report is a 64-byte header, whose first dword marks it complete, then a 64-bit value per
+	// counter, as Astro Bot's texture streamer reads them: the finest mip sampled in bits 56-59
+	// (15: none) and a sample count in bits 0-23. The streamer moves a texture's detail to the mip
+	// reported, and lets textures that report no samples drop to coarser mips.
+	//
+	// Every counter reports mip 0: draws only tell which textures they bind, not the mips they
+	// sample, and reporting no samples for counters that no draw marked kept Astro Bot reloading
+	// textures throughout play (a texture at full detail no longer carries its counter, so the
+	// counter looks unused). But when every texture claims full detail, the streamer can
+	// overflow its memory and reload the same textures in turn forever (Astro Bot at times never
+	// left the warp to a level). So when the game is seen thrashing (NoteStreamingThrash), for
+	// ReliefTime counters that no draw marked in the last InUseReports reports report no
+	// samples, and their textures drop out of the way. The reloads that this causes in turn are
+	// no new thrash: the next relief waits for a thrash noted a Cooldown after this one.
+	constexpr uint32_t HeaderSize   = 64;
+	constexpr uint64_t SampledMip0  = 0;
+	constexpr uint64_t NotSampled   = uint64_t {0xf} << 56u;
+	constexpr uint64_t InUseReports = 300;
+	constexpr std::chrono::steady_clock::duration ReliefTime = std::chrono::seconds(15);
+	constexpr std::chrono::steady_clock::duration Cooldown   = std::chrono::seconds(20);
+
+	m_mip_stats_reports++;
+	bool marked_any = false;
+	for (uint32_t id = 0; id < m_mip_stats_last_marked.size(); id++) {
+		if (((m_mip_stats_counters[id / 64u] >> (id % 64u)) & 1u) != 0) {
+			m_mip_stats_last_marked[id] = m_mip_stats_reports;
+			marked_any                  = true;
+		}
+	}
+	if (marked_any) {
+		m_mip_stats_last_marked_any = m_mip_stats_reports;
+	}
+	if (reset) {
+		m_mip_stats_counters = {};
+	}
+	const auto in_use = [&](uint64_t last_marked) {
+		return last_marked != 0 && m_mip_stats_reports - last_marked <= InUseReports;
+	};
+	const auto now         = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto thrash_time = g_streaming_thrash_time.load(std::memory_order_relaxed);
+	if (m_mip_stats_relief_end == 0 && thrash_time != 0 && thrash_time > m_mip_stats_rearm_time) {
+		m_mip_stats_relief_end = now + ReliefTime.count();
+	}
+	if (m_mip_stats_relief_end != 0 && now >= m_mip_stats_relief_end) {
+		m_mip_stats_relief_end = 0;
+		m_mip_stats_rearm_time = now + Cooldown.count();
+	}
+	const bool relief = m_mip_stats_relief_end != 0;
+	// Until draws mark some counter, nothing is known to be unused.
+	const bool counting = relief && in_use(m_mip_stats_last_marked_any);
+
+	std::memset(dst, 0, size);
+	if (size < sizeof(uint32_t)) {
+		return;
+	}
+	*static_cast<uint32_t*>(dst) = 1;
+	const auto counters =
+	    std::min<uint32_t>(size > HeaderSize ? (size - HeaderSize) / 8u : 0u,
+	                       static_cast<uint32_t>(m_mip_stats_last_marked.size()));
+	auto*    values = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(dst) + HeaderSize);
+	uint32_t unused = 0;
+	for (uint32_t id = 0; id < counters; id++) {
+		const bool sampled = !counting || in_use(m_mip_stats_last_marked[id]);
+		values[id]         = sampled ? SampledMip0 : NotSampled;
+		unused += sampled ? 0u : 1u;
+	}
+	const bool print = m_mip_stats_reports % 300 == 0 || (counting && m_mip_stats_reports % 30 == 0);
+	if (MipStatsDebugEnabled() && print) {
+		std::printf("mip-stats: report %llu marked=%d relief=%d unused=%u of %u\n",
+		            static_cast<unsigned long long>(m_mip_stats_reports), marked_any ? 1 : 0,
+		            relief ? 1 : 0, unused, counters);
+		std::fflush(stdout);
 	}
 }
 

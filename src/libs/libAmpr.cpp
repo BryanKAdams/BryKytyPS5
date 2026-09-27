@@ -3,6 +3,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -1295,6 +1297,41 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
+// Games read a large file region once and keep it, unless a texture streamer is asked to keep more
+// than it can fit and reloads the same textures in turn (Graphics::NoteStreamingThrash).
+static void NoteRepeatedRead(uint32_t file_id, uint64_t offset, uint64_t size) {
+	constexpr uint64_t MinSize = 1024 * 1024;
+	constexpr uint32_t Repeats = 4;
+	constexpr auto     Window  = std::chrono::seconds(10);
+	if (size < MinSize) {
+		return;
+	}
+	struct Read {
+		uint64_t                              key   = 0;
+		uint32_t                              count = 0;
+		std::chrono::steady_clock::time_point first;
+	};
+	static std::mutex            mutex;
+	static std::array<Read, 256> reads;
+	const uint64_t key = (static_cast<uint64_t>(file_id) * 0x9E3779B97F4A7C15ull) ^
+	                     (offset * 0xC2B2AE3D27D4EB4Full) ^ size;
+	const auto     now  = std::chrono::steady_clock::now();
+	bool           note = false;
+	{
+		std::scoped_lock lock(mutex);
+		auto&            read = reads[(key ^ (key >> 29u)) % reads.size()];
+		if (read.key != key || now - read.first > Window) {
+			read = {key, 1, now};
+		} else if (++read.count >= Repeats) {
+			read = {key, 0, now};
+			note = true;
+		}
+	}
+	if (note) {
+		Graphics::NoteStreamingThrash();
+	}
+}
+
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
                                    uint32_t* error_offset) {
 	if (execution_result == nullptr || error_offset == nullptr) {
@@ -1377,6 +1414,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 					*error_offset     = static_cast<uint32_t>(command.record_offset);
 					return OK;
 				}
+				NoteRepeatedRead(command.file_id, command.file_offset, bytes_read);
 			} break;
 			case CommandKind::KernelEvent: {
 				const auto& command = state.kernel_event_commands[entry.index];

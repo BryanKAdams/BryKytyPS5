@@ -421,6 +421,10 @@ void CommandProcessor::AdvanceBdaEpoch() {
 	m_renderer.AdvanceBdaEpoch();
 }
 
+void CommandProcessor::ReportMipStats(void* dst, uint32_t size, bool reset) {
+	m_renderer.ReportMipStats(dst, size, reset);
+}
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {

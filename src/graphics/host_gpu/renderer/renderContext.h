@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <shared_mutex>
@@ -27,6 +28,10 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+
+// The game re-read the same large file several times in a row: a texture streamer asked to keep
+// more than it can fit (see RenderContext::ReportMipStats).
+void NoteStreamingThrash() noexcept;
 
 class RenderContext {
 public:
@@ -61,6 +66,14 @@ public:
 	// The GPU thread wrote guest memory itself: a page that is not write-protected takes the
 	// write without a fault, so the write starts an epoch.
 	void AdvanceBdaEpochForGpuWrite() noexcept;
+	// Counts a draw's sampled texture in its mip statistics counter (the descriptor's
+	// MIP_STATS_CNT_ID) for the next GET_LOD_STATS report (Thread_Gpu only).
+	void MarkMipStatsCounter(uint32_t id) noexcept {
+		m_mip_stats_counters[(id / 64u) & 3u] |= uint64_t {1} << (id % 64u);
+	}
+	// Writes a GET_LOD_STATS report of `size` bytes to `dst` (see there), then starts counting
+	// anew if `reset`.
+	void ReportMipStats(void* dst, uint32_t size, bool reset);
 	void RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -91,6 +104,16 @@ private:
 	// PrepareBda's current epoch and the epoch of its last synchronization (Thread_Gpu only).
 	std::atomic<uint64_t>     m_bda_epoch {1};
 	uint64_t                  m_bda_synced_epoch = 0;
+	// Mip statistics (Thread_Gpu only): the counters sampled since the last report, one bit each,
+	// the reports made, the last report in which each counter, and any, was sampled, and when the
+	// current relief from a streaming thrash ends (0: none) and the next may start (steady_clock
+	// ticks).
+	std::array<uint64_t, 4>   m_mip_stats_counters {};
+	uint64_t                  m_mip_stats_reports         = 0;
+	uint64_t                  m_mip_stats_last_marked_any = 0;
+	std::array<uint64_t, 256> m_mip_stats_last_marked {};
+	int64_t                   m_mip_stats_relief_end = 0;
+	int64_t                   m_mip_stats_rearm_time = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

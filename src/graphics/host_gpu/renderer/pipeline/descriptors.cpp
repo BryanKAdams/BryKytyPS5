@@ -880,6 +880,19 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+// A sampled texture whose descriptor enables mip statistics counts in its counter, which texture
+// streamers read back (RenderContext::ReportMipStats).
+static void MarkMipStats(RenderContext& context, const ShaderRecompiler::IR::ImageResource& resource,
+                         const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (resource.written || value.dword_count < 8) {
+		return;
+	}
+	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	if (descriptor.MipStatsCntEn()) {
+		context.MarkMipStatsCounter(descriptor.MipStatsCntId());
+	}
+}
+
 // Whether a stage slot's previous image binding stands for ResolveTexture(resource, value): the
 // same resource and descriptor find the same image while the image set is unchanged, and the
 // binding follows that image's stencil association, which must not have changed either.
@@ -915,6 +928,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data.clear();
 	auto& texture_cache = m_context.GetTextureCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		MarkMipStats(m_context, program.info.images[i], snapshot.images[i]);
 		// Consecutive draws mostly bind the same textures.
 		auto& previous = prepared.images[i];
 		if (ReuseTexture(texture_cache, prepared.image_sources[i], previous,

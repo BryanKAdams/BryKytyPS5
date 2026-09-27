@@ -143,6 +143,8 @@ public:
 	// A packet decides on guest memory the CPU may have just written: later draws reading memory
 	// through addresses must see the CPU's writes (RenderContext::PrepareBda).
 	void AdvanceBdaEpoch();
+	// GET_LOD_STATS: see RenderContext::ReportMipStats.
+	void ReportMipStats(void* dst, uint32_t size, bool reset);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
