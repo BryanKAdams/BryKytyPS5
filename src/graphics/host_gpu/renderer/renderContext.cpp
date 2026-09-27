@@ -10,6 +10,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -92,6 +94,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		RecordUpload(UploadSource::Fault, fault_vaddr, 0x1000);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		if (gpu_thread) {
+			// The command stream writes this (WRITE_DATA, fills): later draws must see it.
+			AdvanceBdaEpoch();
+		}
 	} else {
 		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadReadFault
 		                                          : DrainStats::Reason::GuestReadFault);
@@ -107,6 +113,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	DrainStats::ReasonScope reason(DrainStats::Reason::KernelInvalidate);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	AdvanceBdaEpoch();
 	return true;
 }
 
@@ -122,6 +129,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	m_buffer_cache.PublishBdaHints(vaddr, size);
+	AdvanceBdaEpoch();
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -152,6 +160,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		AdvanceBdaEpoch();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -162,8 +171,35 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+// KYTY_DEBUG_BDA_EPOCH=0 synchronizes before every draw that reads memory through addresses;
+// KYTY_DEBUG_AB=bdaepoch alternates.
+static bool BdaEpochEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_BDA_EPOCH");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	static const bool ab = AbSelected("bdaepoch");
+	return enabled && !(ab && AbFeatureOff());
+}
+
+// Draws reading memory through addresses must see the CPU writes made before their submission,
+// so the first such draw of each epoch uploads every CPU-dirty page. Meanwhile guest threads keep
+// writing later frames' data (Astro Bot's Sky Garden faults about 150k pages/s): uploading and
+// re-protecting those pages before every such draw only brings the next fault sooner, since no
+// draw of this submission may read them. Everything that can make newer CPU writes visible to
+// later draws starts an epoch: a submission starting or resuming, packets that read guest memory
+// (waits, conditions, predication), new page-table entries (buffer registration), GPU mappings,
+// kernel invalidations and the GPU thread's own writes.
 void RenderContext::PrepareBda() {
 	RecordUpload(UploadSource::BdaPass, 0, 0);
+	m_fault_process_pending = true;
+	const auto epoch        = m_bda_epoch.load(std::memory_order_acquire);
+	if (epoch == m_bda_synced_epoch && BdaEpochEnabled()) {
+		return;
+	}
+	// An epoch started during the synchronization below leaves the next call synchronizing.
+	m_bda_synced_epoch = epoch;
+	RecordUpload(UploadSource::BdaSync, 0, 0);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	const auto       mode = Config::GetBdaSyncMode();
 	if (mode == Config::BdaSyncMode::Legacy ||
@@ -173,7 +209,6 @@ void RenderContext::PrepareBda() {
 	if (mode == Config::BdaSyncMode::SelectiveChecked) {
 		EXIT_IF(!m_buffer_cache.CheckBdaHintInvariant(m_mapped_ranges));
 	}
-	m_fault_process_pending = true;
 }
 
 void RenderContext::RunGarbageCollector() {

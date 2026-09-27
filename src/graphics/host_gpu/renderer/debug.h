@@ -25,7 +25,7 @@ inline RenderDebugCounters g_render_debug_counters;
 // other 5 s window, so one run compares both under the same scene and machine load; each
 // draw-phases line reports its window's mode. Features: reuse (texture and render-target reuse;
 // also KYTY_DEBUG_AB=1), pending (rate-limited GPU progress queries at draw entry), backing
-// (lock-free cached guest backing reads).
+// (lock-free cached guest backing reads), bdaepoch (one BDA synchronization per epoch).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 
@@ -129,6 +129,7 @@ enum class UploadSource : uint8_t {
 	Image,  // Image uploads (whole image ranges).
 	Fault,  // Not a copy: guest write faults on tracked pages, counted as one page each.
 	BdaPass, // Not a copy: PrepareBda calls.
+	BdaSync, // Not a copy: PrepareBda calls that synchronized (the first of their epoch).
 	Count
 };
 inline thread_local UploadSource t_upload_source = UploadSource::Buffer;

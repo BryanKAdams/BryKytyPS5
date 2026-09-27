@@ -698,7 +698,7 @@ UploadStats& GetUploadStats() {
 
 void PrintUploadStats(double seconds) {
 	static constexpr std::array<const char*, size_t(UploadSource::Count)> Names {
-	    "buffer", "bda", "stream", "image", "fault", "bda-pass"};
+	    "buffer", "bda", "stream", "image", "fault", "bda-pass", "bda-sync"};
 	auto&            stats = GetUploadStats();
 	std::scoped_lock lock {stats.mutex};
 	std::string      line = "uploads:";

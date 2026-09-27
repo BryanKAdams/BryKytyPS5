@@ -83,8 +83,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
-		// Publish the full resulting owner, including pages newly reachable after a merge.
+		// Publish the full resulting owner, including pages newly reachable after a merge. The new
+		// page-table entries make it readable through addresses before its next upload.
 		m_memory_tracker.PublishBdaHints(buffer.CpuAddress(), buffer.Size());
+		m_scheduler.Context().AdvanceBdaEpoch();
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -345,6 +347,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		m_scheduler.Context().AdvanceBdaEpoch();
 	}
 }
 
