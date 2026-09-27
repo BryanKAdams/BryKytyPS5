@@ -4,6 +4,7 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <cstdlib>
 #include <fmt/format.h>
 
 namespace Common {
@@ -624,6 +625,14 @@ Time Time::operator-=(int secs) {
 	return *this;
 }
 
+int64_t DebugTimeOffsetSeconds() {
+	static const int64_t offset = [] {
+		const char* text = std::getenv("KYTY_DEBUG_TIME_OFFSET");
+		return text != nullptr ? static_cast<int64_t>(std::strtoll(text, nullptr, 10)) : int64_t {0};
+	}();
+	return offset;
+}
+
 DateTime DateTime::FromSystem() {
 	SysTimeStruct t {};
 	SysGetSystemTime(t);
@@ -632,7 +641,21 @@ DateTime DateTime::FromSystem() {
 		return {};
 	}
 
-	return DateTime(Date(t.Year, t.Month, t.Day), Time(t.Hour, t.Minute, t.Second, t.Milliseconds));
+	const DateTime now(Date(t.Year, t.Month, t.Day), Time(t.Hour, t.Minute, t.Second, t.Milliseconds));
+	const auto     offset = DebugTimeOffsetSeconds();
+	if (offset == 0) {
+		return now;
+	}
+	const int64_t total = now.GetTime().MsecTotal() + offset * 1000;
+	int64_t       days  = total / TIME_MS_IN_DAY;
+	int64_t       msec  = total % TIME_MS_IN_DAY;
+	if (msec < 0) {
+		msec += TIME_MS_IN_DAY;
+		days--;
+	}
+	Time time;
+	time.Set(static_cast<int>(msec));
+	return DateTime(now.GetDate() + static_cast<int>(days), time);
 }
 
 DateTime DateTime::FromSystemUTC() {

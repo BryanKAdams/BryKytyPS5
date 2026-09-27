@@ -178,6 +178,10 @@ private:
 	Time m_time;
 };
 
+// Debugging aid: KYTY_DEBUG_TIME_OFFSET=<seconds, signed> shifts the guest's wall clock (the
+// realtime clocks, gettimeofday, the RTC and DateTime::FromSystem) by that much; 0 when unset.
+[[nodiscard]] int64_t DebugTimeOffsetSeconds();
+
 } // namespace Common
 
 #endif /* KYTY_COMMON_DATETIME_H_ */

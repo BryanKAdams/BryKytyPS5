@@ -238,7 +238,8 @@ static bool KernelRealtimeToTimespec(bool precise, KernelTimespec* tp) {
 		return false;
 	}
 
-	Kernel100nsToTimespec(value - WINDOWS_UNIX_EPOCH_DELTA_100NS, tp);
+	const auto shift = Common::DebugTimeOffsetSeconds() * 10000000;
+	Kernel100nsToTimespec(value - WINDOWS_UNIX_EPOCH_DELTA_100NS + static_cast<uint64_t>(shift), tp);
 	return true;
 }
 
@@ -3703,6 +3704,7 @@ int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	ticks |= ft.dwLowDateTime;
 	ticks /= 10;
 	ticks -= 11644473600000000ULL;
+	ticks += static_cast<uint64_t>(Common::DebugTimeOffsetSeconds() * 1000000);
 	tp->tv_sec  = static_cast<int64_t>(ticks / 1000000);
 	tp->tv_usec = static_cast<int64_t>(ticks % 1000000);
 #else

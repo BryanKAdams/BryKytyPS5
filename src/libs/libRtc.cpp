@@ -252,7 +252,8 @@ static int KYTY_SYSV_ABI RtcGetCurrentTick(RtcTick* tick) {
 	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	                              std::chrono::system_clock::now().time_since_epoch())
 	                              .count());
-	tick->tick = RTC_UNIX_EPOCH_TICKS + now_us;
+	tick->tick = RTC_UNIX_EPOCH_TICKS + now_us +
+	             static_cast<uint64_t>(Common::DebugTimeOffsetSeconds() * 1000000);
 	return OK;
 }
 
