@@ -1261,6 +1261,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
 		}
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::VertexParams);
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
@@ -1294,6 +1295,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::PixelParams);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
@@ -1327,6 +1329,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return translate_rest(0);
 		}
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::PixelProgram);
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor,
 		                                        wait, &result.pending);
@@ -1334,6 +1337,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return translate_rest(i + 1);
 		}
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::VertexProgram);
 	return result;
 }
 

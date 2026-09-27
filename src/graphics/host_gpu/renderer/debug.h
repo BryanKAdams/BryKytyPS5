@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -19,6 +20,54 @@ struct RenderDebugCounters {
 	std::atomic<bool>     log_barriers {false}; // Set while a logged draw records.
 };
 inline RenderDebugCounters g_render_debug_counters;
+
+// KYTY_DEBUG_DRAW_PHASES=<pixel shader hash> times the render thread's CPU phases of that pixel
+// shader's draws and prints their average every 5 s. Each Mark charges the time since the previous
+// mark to its phase; marks outside a Begin/End pair (other threads, other work) do nothing.
+struct DrawPhaseTimer {
+	enum Phase : uint32_t {
+		Setup,            // Draw entry up to shader lookup.
+		VertexParams,     // Vertex stage registers and code hash.
+		PixelParams,      // Pixel stage registers and code hash.
+		PixelProgram,     // Pixel program lookup and resource materialization.
+		VertexProgram,    // Vertex program lookup and resource materialization.
+		Targets,          // Render target resolution.
+		StageBindings,    // PrepareBindings: textures, samplers, user data.
+		GraphicsBindings, // PrepareGraphicsBindings: buffers, uploads.
+		RenderTargets,    // AcquireRenderTargets.
+		Pipeline,         // Pipeline lookup.
+		Records,          // Mesh draw records.
+		Commit,           // CommitBindings.
+		Record,           // Dynamic state, rendering and draw commands.
+		Tail,             // After the draw.
+		Count
+	};
+	static uint64_t Hash();
+	void            Begin() {
+		if (Hash() != 0) [[unlikely]] {
+			active = true;
+			current.fill(0);
+			last = Now();
+		}
+	}
+	void Mark(Phase phase) {
+		if (active) [[unlikely]] {
+			const auto now = Now();
+			current[phase] += now - last;
+			last = now;
+		}
+	}
+	// Accounts the draw if its pixel shader is the one timed.
+	void End(uint64_t pixel_hash);
+
+private:
+	static uint64_t Now();
+
+	bool                         active = false;
+	uint64_t                     last   = 0;
+	std::array<uint64_t, Count>  current {};
+};
+inline thread_local DrawPhaseTimer g_draw_phases;
 
 class CommandBuffer;
 

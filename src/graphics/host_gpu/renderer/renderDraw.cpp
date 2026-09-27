@@ -137,6 +137,33 @@ static void Flush() {
 	});
 }
 
+// FNV-1a fingerprints of what can differ between draws of one shader pair.
+static uint32_t HashWords(const uint32_t* words, size_t count, uint32_t hash = 2166136261u) {
+	for (size_t i = 0; i < count; i++) {
+		hash = (hash ^ words[i]) * 16777619u;
+	}
+	return hash;
+}
+
+static uint32_t HashDescriptors(const std::vector<ShaderRecompiler::IR::DescriptorValue>& values) {
+	uint32_t hash = 2166136261u;
+	for (const auto& value: values) {
+		hash = HashWords(value.dwords.data(), value.dword_count, hash);
+	}
+	return hash;
+}
+
+static void PrintStageKeys(const char* tag, const ShaderStageRuntime& stage) {
+	if (!stage) {
+		return;
+	}
+	const auto& r = *stage.resources;
+	std::printf(" %s_ud=%08x %s_buf=%08x %s_img=%08x %s_smp=%08x %s_srt=%08x", tag,
+	            HashWords(r.user_data.data(), r.user_data.size()), tag, HashDescriptors(r.buffers),
+	            tag, HashDescriptors(r.images), tag, HashDescriptors(r.samplers), tag,
+	            HashWords(r.flattened_srt.data(), r.flattened_srt.size()));
+}
+
 // KYTY_DEBUG_DRAW_STATS=1 prints, every 5 s, the draws per second and the rendering restarts and
 // barriers they caused, overall and for the pixel shaders causing the most, to find draw patterns
 // that stall the GPU (like the sand trail's).
@@ -996,6 +1023,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
 	DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
+	g_draw_phases.Mark(DrawPhaseTimer::Setup);
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
@@ -1035,6 +1063,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	g_draw_phases.Mark(DrawPhaseTimer::Targets);
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1236,6 +1265,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::StageBindings);
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	PreparedVertexBuffers vertex_bindings;
@@ -1245,9 +1275,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::GraphicsBindings);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                            state.depth_info, feedback_aspects, stages);
+	g_draw_phases.Mark(DrawPhaseTimer::RenderTargets);
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1270,6 +1302,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		return;
 	}
 	auto& pipeline = *found_pipeline;
+	g_draw_phases.Mark(DrawPhaseTimer::Pipeline);
 
 	// Mesh shaders load their draw parameters from a record by address (see
 	// EmitMeshDrawParameter). Write each slice's record now: the ring can wait and restart the
@@ -1309,6 +1342,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			    mesh_slices.emplace_back(slice, records.BufferDeviceAddress() + offset);
 		    });
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::Records);
 	if (draw_logged) [[unlikely]] {
 		static uint64_t draws = 0;
 		draws++;
@@ -1378,6 +1412,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::Commit);
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
 	if (m_context.GetGraphics().attachment_feedback_loop_dynamic_enabled) {
@@ -1454,6 +1489,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
 	m_context.GetBufferCache().OnCommandRecorded();
+	g_draw_phases.Mark(DrawPhaseTimer::Record);
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
@@ -1467,6 +1503,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    g_render_debug_counters.image_barriers.load(std::memory_order_relaxed) -
 		        counters_before[2],
 		    static_cast<uint32_t>(static_cast<bool>(shader_write_stages)));
+		std::printf("draw-log keys: pipeline=%p vertex_offset=%d first_vertex=%u first_instance=%u",
+		            static_cast<const void*>(&pipeline), emit.vertex_offset, emit.first_vertex,
+		            emit.first_instance);
+		DrawLog::PrintStageKeys("vs", state.vertex_info[0].stage);
+		if (state.ps_active) {
+			DrawLog::PrintStageKeys("ps", state.ps_input_info.stage);
+		}
+		std::printf("\n");
 	}
 	if (DrawLog::StatsEnabled()) [[unlikely]] {
 		const auto* pixel  = state.ps_active ? state.ps_input_info.stage.program : nullptr;
@@ -1486,6 +1530,7 @@ RenderExecutor::~RenderExecutor() = default;
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	g_draw_phases.Begin();
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1596,11 +1641,13 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();
+	g_draw_phases.End(state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	g_draw_phases.Begin();
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1685,6 +1732,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
 	ResetBindings();
+	g_draw_phases.End(state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0);
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {

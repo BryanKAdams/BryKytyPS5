@@ -11,8 +11,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fmt/format.h>
+#include <intrin.h>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -612,6 +616,75 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 			     cf.msaa_num_samples, cf.msaa_exposed_samples, cf.max_sample_dist);
 		}
 	}
+}
+
+uint64_t DrawPhaseTimer::Hash() {
+	static const uint64_t hash = [] {
+		const char* text = std::getenv("KYTY_DEBUG_DRAW_PHASES");
+		return text != nullptr ? std::strtoull(text, nullptr, 16) : uint64_t {0};
+	}();
+	return hash;
+}
+
+uint64_t DrawPhaseTimer::Now() {
+	return __rdtsc();
+}
+
+void DrawPhaseTimer::End(uint64_t pixel_hash) {
+	if (!active) {
+		return;
+	}
+	Mark(Tail);
+	active = false;
+	static constexpr std::array<const char*, Count> Names {
+	    "setup",  "vs-params", "ps-params", "ps-program", "vs-program", "targets", "stage-bind",
+	    "gfx-bind", "rt-acquire", "pipeline", "records", "commit", "record", "tail"};
+	static std::array<uint64_t, Count> totals {};
+	static uint64_t draws        = 0;
+	static uint64_t other_draws  = 0;
+	static uint64_t other_ticks  = 0;
+	static auto     window_start = std::chrono::steady_clock::now();
+	static uint64_t window_tsc   = Now();
+	uint64_t        sum          = 0;
+	for (const auto ticks: current) {
+		sum += ticks;
+	}
+	if (pixel_hash == Hash()) {
+		for (uint32_t i = 0; i < Count; i++) {
+			totals[i] += current[i];
+		}
+		draws++;
+	} else {
+		other_draws++;
+		other_ticks += sum;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - window_start < std::chrono::seconds(5)) {
+		return;
+	}
+	// The window calibrates the time stamp counter against the steady clock.
+	const auto   tsc     = Now();
+	const double seconds = std::chrono::duration<double>(now - window_start).count();
+	const double to_us   = seconds * 1e6 / static_cast<double>(tsc - window_tsc);
+	uint64_t     all     = 0;
+	for (const auto ticks: totals) {
+		all += ticks;
+	}
+	std::string line = fmt::format("draw-phases: {:.1f}s draws/s={:.0f} us/draw={:.2f} ms/s={:.1f} "
+	                               "other draws/s={:.0f} other ms/s={:.1f} |",
+	                               seconds, draws / seconds, draws != 0 ? all * to_us / draws : 0.0,
+	                               all * to_us / 1000.0 / seconds, other_draws / seconds,
+	                               other_ticks * to_us / 1000.0 / seconds);
+	for (uint32_t i = 0; i < Count; i++) {
+		line += fmt::format(" {}={:.2f}", Names[i], draws != 0 ? totals[i] * to_us / draws : 0.0);
+	}
+	std::printf("%s\n", line.c_str());
+	totals.fill(0);
+	draws        = 0;
+	other_draws  = 0;
+	other_ticks  = 0;
+	window_start = now;
+	window_tsc   = tsc;
 }
 
 void LogDrawPhase(const char* draw_name, const char* phase) {
