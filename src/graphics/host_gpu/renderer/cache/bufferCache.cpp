@@ -808,10 +808,12 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	if (one_page) {
-		const auto begin = page * TRACKER_PAGE_SIZE;
+		// Taken before the scan, as TextureCache::IsRegionGpuModified does.
+		const auto generation = m_gpu_dirty_generation;
+		const auto begin      = page * TRACKER_PAGE_SIZE;
 		if (!m_gpu_modified_ranges.Intersects(begin, TRACKER_PAGE_SIZE) &&
 		    !InFlightIntersects(begin, TRACKER_PAGE_SIZE)) {
-			slot = {page, m_gpu_dirty_generation};
+			slot = {page, generation};
 			return false;
 		}
 	}

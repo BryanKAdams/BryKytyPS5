@@ -2347,6 +2347,9 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 		return false;
 	}
 	std::scoped_lock lock {m_lock};
+	// Taken before the scan, so a change racing with it leaves the record stale, never clean.
+	const auto images       = m_image_set_generation.load(std::memory_order_acquire);
+	const auto gpu_writes   = m_gpu_modified_generation.load(std::memory_order_acquire);
 	const auto gpu_modified = [this](uint64_t begin, uint64_t bytes) {
 		for (const auto id: FindImagesInRegion(begin, bytes, false)) {
 			const auto& image = m_slot_images[id];
@@ -2357,8 +2360,7 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 		return false;
 	};
 	if (one_page && !gpu_modified(page * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE)) {
-		slot = {page, m_image_set_generation.load(std::memory_order_relaxed),
-		        m_gpu_modified_generation.load(std::memory_order_relaxed)};
+		slot = {page, images, gpu_writes};
 		return false;
 	}
 	return gpu_modified(address, size);
