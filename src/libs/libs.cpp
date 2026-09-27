@@ -37,9 +37,38 @@ struct CallCounter {
 	std::atomic<const char*> function {nullptr};
 	std::atomic<const char*> library {nullptr};
 	std::atomic<uint64_t>    count {0};
+	// KYTY_DEBUG_TRACE_FUNCTIONS: whether this function is traced, and its calls left to trace in
+	// the current 5 s window.
+	std::atomic<bool>        traced {false};
+	std::atomic<int64_t>     trace_budget {0};
 };
 constexpr size_t                          CallCounterCount = 4096;
 std::array<CallCounter, CallCounterCount> g_call_counters;
+
+// KYTY_DEBUG_TRACE_FUNCTIONS=<name>,<name>,...: prints the guest callers of the first
+// KYTY_DEBUG_TRACE_LIMIT (default 100) calls of each named function in every 5 s window (names as
+// call-counts prints them, without the library).
+int64_t TraceBudget(const char* function) {
+	static const std::vector<std::string> names = [] {
+		std::vector<std::string> list;
+		if (const char* value = std::getenv("KYTY_DEBUG_TRACE_FUNCTIONS"); value != nullptr) {
+			std::string text = value;
+			for (size_t begin = 0; begin <= text.size();) {
+				const auto end = std::min(text.find(',', begin), text.size());
+				if (end > begin) {
+					list.push_back(text.substr(begin, end - begin));
+				}
+				begin = end + 1;
+			}
+		}
+		return list;
+	}();
+	static const int64_t limit = [] {
+		const char* value = std::getenv("KYTY_DEBUG_TRACE_LIMIT");
+		return value != nullptr ? std::max<int64_t>(std::atoll(value), 0) : int64_t {100};
+	}();
+	return std::find(names.begin(), names.end(), function) != names.end() ? limit : 0;
+}
 
 void PrintCallCounts() {
 	for (uint64_t window = 1;; window++) {
@@ -48,6 +77,9 @@ void PrintCallCounts() {
 		uint64_t                                             total = 0;
 		for (auto& counter: g_call_counters) {
 			const auto count = counter.count.exchange(0);
+			if (counter.traced.load(std::memory_order_relaxed)) {
+				counter.trace_budget.store(TraceBudget(counter.function.load()));
+			}
 			if (count != 0) {
 				calls.emplace_back(count, &counter);
 				total += count;
@@ -56,7 +88,7 @@ void PrintCallCounts() {
 		std::sort(calls.begin(), calls.end(),
 		          [](const auto& a, const auto& b) { return a.first > b.first; });
 		std::string line = fmt::format("call-counts: t={}s total={}", window * 5, total);
-		for (size_t i = 0; i < std::min<size_t>(calls.size(), 60); i++) {
+		for (size_t i = 0; i < std::min<size_t>(calls.size(), 200); i++) {
 			const char* library  = calls[i].second->library.load();
 			const char* function = calls[i].second->function.load();
 			line += fmt::format(" {}::{}={}", library != nullptr ? library : "?",
@@ -137,11 +169,18 @@ static void CountCall(const char* library, const char* function, void* return_sl
 		if (owner == nullptr) {
 			if (counter.function.compare_exchange_strong(owner, function)) {
 				counter.library.store(library);
+				const auto budget = TraceBudget(function);
+				counter.trace_budget.store(budget);
+				counter.traced.store(budget > 0);
 				owner = function;
 			}
 		}
 		if (owner == function) {
 			counter.count.fetch_add(1, std::memory_order_relaxed);
+			if (counter.trace_budget.load(std::memory_order_relaxed) > 0 &&
+			    counter.trace_budget.fetch_sub(1, std::memory_order_relaxed) > 0) [[unlikely]] {
+				PrintTracedCall(library, function, return_slot);
+			}
 			return;
 		}
 	}

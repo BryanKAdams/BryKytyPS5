@@ -69,6 +69,15 @@
 		}                                                                                          \
 	} while (false)
 
+// The call-count half of PRINT_NAME, for hot functions that skip its logging.
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define COUNT_CALL()                                                                               \
+	do {                                                                                           \
+		if (Libs::g_count_call != nullptr) [[unlikely]] {                                          \
+			Libs::g_count_call(g_library, __func__, KYTY_RETURN_ADDRESS_SLOT());                   \
+		}                                                                                          \
+	} while (false)
+
 namespace Loader {
 class SymbolDatabase;
 } // namespace Loader
