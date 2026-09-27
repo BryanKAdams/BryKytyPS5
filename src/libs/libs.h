@@ -8,7 +8,6 @@
 #include "loader/timer.h" // IWYU pragma: keep
 
 #include <chrono>
-#include <cstdlib>
 #include <fmt/format.h>
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
@@ -65,8 +64,8 @@
 		if (PRINT_NAME_ENABLED) {                                                                  \
 			Libs::PrintName(g_library, g_module, __func__);                                        \
 		}                                                                                          \
-		if (Libs::g_count_calls) [[unlikely]] {                                                    \
-			Libs::CountCall(g_library, __func__, KYTY_RETURN_ADDRESS_SLOT());                      \
+		if (Libs::g_count_call != nullptr) [[unlikely]] {                                          \
+			Libs::g_count_call(g_library, __func__, KYTY_RETURN_ADDRESS_SLOT());                   \
 		}                                                                                          \
 	} while (false)
 
@@ -80,12 +79,13 @@ namespace Libs {
 // thread prints each 5 s window's counts, to see what a stalled game keeps calling (or stopped
 // calling). TraceCalls(n) also prints the calling thread's next n calls, each with the guest code
 // addresses on its stack above the return address, and TraceAllCalls(duration) every thread's
-// calls outside the command buffer builders for that long. Otherwise a call pays one flag test.
-inline const bool g_count_calls = std::getenv("KYTY_DEBUG_CALL_COUNTS") != nullptr;
-[[gnu::noinline]] void CountCall(const char* library, const char* function,
-                                 void* return_slot) noexcept;
-void TraceCalls(uint32_t count) noexcept;
-void TraceAllCalls(std::chrono::milliseconds duration) noexcept;
+// calls outside the command buffer builders for that long. Otherwise a call pays one test. libs.cpp
+// installs the counter at startup, so programs built from single libraries (their tests) link
+// without it and count nothing.
+using CountCallFunc = void (*)(const char* library, const char* function, void* return_slot);
+inline CountCallFunc g_count_call = nullptr;
+void                 TraceCalls(uint32_t count) noexcept;
+void                 TraceAllCalls(std::chrono::milliseconds duration) noexcept;
 
 // Keep the formatting path from inflating fiber functions' stack frames under LTO.
 [[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {

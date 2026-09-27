@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -112,7 +113,8 @@ void TraceAllCalls(std::chrono::milliseconds duration) noexcept {
 	g_trace_all_until = (std::chrono::steady_clock::now() + duration).time_since_epoch().count();
 }
 
-void CountCall(const char* library, const char* function, void* return_slot) noexcept {
+// PRINT_NAME's g_count_call when KYTY_DEBUG_CALL_COUNTS is set.
+static void CountCall(const char* library, const char* function, void* return_slot) {
 	static std::once_flag printer;
 	std::call_once(printer, [] { std::thread(PrintCallCounts).detach(); });
 	if (t_trace_calls != 0) [[unlikely]] {
@@ -144,6 +146,13 @@ void CountCall(const char* library, const char* function, void* return_slot) noe
 		}
 	}
 }
+
+[[maybe_unused]] static const bool g_count_call_installed = [] {
+	if (std::getenv("KYTY_DEBUG_CALL_COUNTS") != nullptr) {
+		g_count_call = CountCall;
+	}
+	return true;
+}();
 
 namespace LibContentDelete {
 LIB_DEFINE(InitContentDelete_1);
