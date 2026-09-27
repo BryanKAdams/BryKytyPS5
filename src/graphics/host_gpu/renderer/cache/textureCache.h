@@ -174,12 +174,12 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
+	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        FinishFind(ImageId id, const ImageDesc& desc,
 	                                       uint32_t metadata_base_layer);
-	// Applies clears found in GPU-written DCC metadata with conditional rendering. Returns false
-	// when the target needs the CPU readback path.
+	// Applies clears found in GPU-written color metadata (DCC or CMASK keys) with conditional
+	// rendering. Returns false when the target needs the CPU readback path.
 	[[nodiscard]] bool MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 	                                            uint64_t slices_address, uint64_t slice_size,
 	                                            uint32_t image_first, uint32_t count);
