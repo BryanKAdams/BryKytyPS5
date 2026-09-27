@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -275,7 +277,30 @@ private:
 		bool     atomic_only = false;
 	};
 
+	// What ResolveRenderColorTarget resolved for each target slot, so that a draw with the same
+	// target registers keeps it (see TextureCache::RefindImage).
+	struct ColorTargetSource {
+		HW::RenderTarget registers;
+		uint32_t         mask                = 0;
+		uint32_t         slice_offset        = 0;
+		bool             ignore_target_mask  = false;
+		bool             exact_format        = false;
+		uint64_t         generation          = 0; // 0: not reusable.
+		uint32_t         metadata_base_layer = 0;
+		RenderColorInfo  target;
+	};
+	// The same for the depth target: its description and image, keyed by its registers.
+	struct DepthTargetSource {
+		HW::DepthRenderTarget   registers;
+		uint64_t                generation          = 0; // 0: not reusable.
+		uint32_t                metadata_base_layer = 0;
+		TextureCache::ImageDesc desc;
+		ImageId                 image_id;
+	};
+
 	RenderContext&                        m_context;
+	std::array<ColorTargetSource, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_sources;
+	DepthTargetSource                     m_depth_target_source;
 	std::vector<PendingWrite>             m_pending_writes;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;

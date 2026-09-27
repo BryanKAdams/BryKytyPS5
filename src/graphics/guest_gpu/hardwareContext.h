@@ -9,12 +9,16 @@ namespace Libs::Graphics::HW {
 
 struct ColorBase {
 	uint64_t addr = 0;
+
+	bool operator==(const ColorBase&) const = default;
 };
 
 struct ColorView {
 	uint32_t base_array_slice_index = 0;
 	uint32_t last_array_slice_index = 0;
 	uint32_t current_mip_level      = 0;
+
+	bool operator==(const ColorView&) const = default;
 };
 
 struct ColorInfo {
@@ -30,18 +34,24 @@ struct ColorInfo {
 	Prospero::ChannelLayout format                         = Prospero::ChannelLayout::kInvalid;
 	Prospero::ChannelType   channel_type                   = Prospero::ChannelType::kUNorm;
 	Prospero::ChannelOrder  channel_order                  = Prospero::ChannelOrder::kStandard;
+
+	bool operator==(const ColorInfo&) const = default;
 };
 
 struct ColorAttrib {
 	bool     force_dest_alpha_to_one = false;
 	uint32_t num_samples             = 0;
 	uint32_t num_fragments           = 0;
+
+	bool operator==(const ColorAttrib&) const = default;
 };
 
 struct ColorAttrib2 {
 	uint32_t height         = 0;
 	uint32_t width          = 0;
 	uint32_t num_mip_levels = 0;
+
+	bool operator==(const ColorAttrib2&) const = default;
 };
 
 struct ColorAttrib3 {
@@ -50,6 +60,8 @@ struct ColorAttrib3 {
 	uint32_t           dimension                    = 0;
 	bool               metadata_pipe_aligned        = false;
 	bool               write_vrs_rate_hint_to_cmask = false;
+
+	bool operator==(const ColorAttrib3&) const = default;
 };
 
 struct ColorDccControl {
@@ -62,26 +74,38 @@ struct ColorDccControl {
 	bool                 overwrite_combiner_disable     = false;
 	IndependentBlockSize independent_block_size         = IndependentBlockSize::Disabled;
 	bool                 data_write_on_dcc_clear_to_reg = false;
+
+	bool operator==(const ColorDccControl&) const = default;
 };
 
 struct ColorCmask {
 	uint64_t addr = 0;
+
+	bool operator==(const ColorCmask&) const = default;
 };
 
 struct ColorFmask {
 	uint64_t addr = 0;
+
+	bool operator==(const ColorFmask&) const = default;
 };
 
 struct ColorClearWord0 {
 	uint32_t word0 = 0;
+
+	bool operator==(const ColorClearWord0&) const = default;
 };
 
 struct ColorClearWord1 {
 	uint32_t word1 = 0;
+
+	bool operator==(const ColorClearWord1&) const = default;
 };
 
 struct ColorDccAddr {
 	uint64_t addr = 0;
+
+	bool operator==(const ColorDccAddr&) const = default;
 };
 
 struct RenderTarget {
@@ -97,6 +121,8 @@ struct RenderTarget {
 	ColorClearWord0 clear_word0;
 	ColorClearWord1 clear_word1;
 	ColorDccAddr    dcc_addr;
+
+	bool operator==(const RenderTarget&) const = default;
 };
 
 struct DepthZInfo {
@@ -132,6 +158,8 @@ struct DepthZInfo {
 			default: return false;
 		}
 	}
+
+	bool operator==(const DepthZInfo&) const = default;
 };
 
 struct DepthStencilInfo {
@@ -160,6 +188,8 @@ struct DepthStencilInfo {
 			default: return false;
 		}
 	}
+
+	bool operator==(const DepthStencilInfo&) const = default;
 };
 
 struct DepthDepthView {
@@ -168,12 +198,16 @@ struct DepthDepthView {
 	uint8_t  current_mip_level     = 0;
 	bool     depth_write_disable   = false;
 	bool     stencil_write_disable = false;
+
+	bool operator==(const DepthDepthView&) const = default;
 };
 
 struct DepthDepthSizeXY {
 	uint16_t x_max = 0;
 	uint16_t y_max = 0;
 	bool     valid = false;
+
+	bool operator==(const DepthDepthSizeXY&) const = default;
 };
 
 struct DepthRenderTarget {
@@ -188,6 +222,8 @@ struct DepthRenderTarget {
 	uint64_t stencil_write_base_addr = 0;
 	uint64_t htile_data_base_addr    = 0;
 	uint8_t  shading_rate_encoding   = 0;
+
+	bool operator==(const DepthRenderTarget&) const = default;
 };
 
 struct RenderControl {

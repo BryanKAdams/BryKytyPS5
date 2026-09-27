@@ -25,6 +25,8 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -307,7 +309,23 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
 		DepthFatal("unsupported depth register state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	// Consecutive draws mostly keep their depth target: the same registers resolve to the same
+	// image while the image set is unchanged (see ResolveRenderColorTarget).
+	static const bool reuse_enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_TARGET_REUSE");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	auto&      cache  = m_context.GetTextureCache();
+	auto&      source = m_depth_target_source;
+	const bool reused = reuse_enabled && source.generation != 0 && source.registers == z &&
+	                    cache.RefindImage(source.image_id, source.generation, source.desc,
+	                                      source.metadata_base_layer);
+	if (reused) {
+		r.desc = source.desc;
+	} else {
+		source.generation = 0;
+		r.desc            = MakeDepthTargetDesc(buffer, z);
+	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
@@ -347,10 +365,22 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
-	{
-		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::TargetImage);
-		r.image_id = cache.FindImage(r.desc);
+	if (reused) {
+		r.image_id = source.image_id;
+	} else {
+		const auto metadata_base_layer = r.desc.view_info.base_layer;
+		uint64_t   generation          = 0;
+		{
+			DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::TargetImage);
+			r.image_id = cache.FindImage(r.desc, false, &generation);
+		}
+		if (generation != 0) {
+			source.registers           = z;
+			source.generation          = generation;
+			source.metadata_base_layer = metadata_base_layer;
+			source.desc                = r.desc;
+			source.image_id            = r.image_id;
+		}
 	}
 	BindRenderTarget(r.image_id);
 }
