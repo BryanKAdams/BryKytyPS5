@@ -348,7 +348,10 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 	}
 	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	{
+		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::TargetImage);
+		r.image_id = cache.FindImage(r.desc);
+	}
 	BindRenderTarget(r.image_id);
 }
 

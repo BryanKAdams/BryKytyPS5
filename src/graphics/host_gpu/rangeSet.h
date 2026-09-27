@@ -17,6 +17,10 @@ public:
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
 			it = std::prev(it);
 		}
+		// Draws add the same written range again and again: a covered range changes nothing.
+		if (it != m_ranges.end() && it->first <= address && it->second >= end) {
+			return;
+		}
 		uint64_t begin = address;
 		uint64_t last  = end;
 		while (it != m_ranges.end() && it->first <= last) {

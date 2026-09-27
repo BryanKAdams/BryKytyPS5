@@ -35,6 +35,7 @@
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -139,8 +140,12 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
+	std::optional<DrawPhaseTimer::ProbeScope> obtain_probe;
+	obtain_probe.emplace(g_draw_phases, resource.written ? DrawPhaseTimer::BufferWritten
+	                                                     : DrawPhaseTimer::BufferRead);
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                              resource.formatted, id);
+	obtain_probe.reset();
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -150,6 +155,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.written) {
+		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::BufferInvalidate);
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
 	const char* access = "Read";
@@ -733,10 +739,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 
 	thread_local TextureDescriptionCache descriptions;
+	std::optional<DrawPhaseTimer::ProbeScope> describe_probe;
+	describe_probe.emplace(g_draw_phases, DrawPhaseTimer::TextureDescribe);
 	const auto& described = descriptions.Get(resource, value, descriptor);
 	auto        desc      = described.desc;
+	describe_probe.reset();
 
-	auto       id                  = texture_cache.FindImage(desc, described.shader_conversion);
+	ImageId id;
+	{
+		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::TextureImage);
+		id = texture_cache.FindImage(desc, described.shader_conversion);
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -775,6 +788,7 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
                                              std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
+	DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::Upload);
 	auto& command_buffer = context.GetCommandScheduler().Current();
 	EXIT_IF(command_buffer.IsInvalid());
 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);

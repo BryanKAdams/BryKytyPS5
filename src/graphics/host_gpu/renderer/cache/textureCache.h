@@ -14,6 +14,8 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <type_traits>
@@ -223,6 +225,42 @@ private:
 	uint64_t                                          m_last_pressure_gc_tick  = UINT64_MAX;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+
+	// FindImage results where the lookup found exactly one image with the same backing, keyed by
+	// every request field SameBacking and the lookup's checks read. A lookup only sees registered
+	// images, whose fields SameBacking reads never change, so a result stays right until an image
+	// is registered or unregistered, which bumps m_image_set_generation. Caller holds m_lock.
+	struct ImageLookup {
+		uint64_t            generation = 0;
+		GuestRange          data;
+		vk::Extent3D        extent;
+		ImageSubresources   resources;
+		uint32_t            samples         = 0;
+		uint32_t            bytes_per_block = 0;
+		Prospero::TileMode  tile_mode       = Prospero::TileMode::kLinear;
+		vk::Format          pixel_format    = vk::Format::eUndefined;
+		Prospero::ImageType type            = Prospero::ImageType::kColor2D;
+		bool                exact_format    = false;
+		ImageId             id;
+
+		[[nodiscard]] bool Matches(const ImageInfo& info, bool exact) const noexcept {
+			return data == info.data && extent == info.extent && resources == info.resources &&
+			       samples == info.samples && bytes_per_block == info.bytes_per_block &&
+			       tile_mode == info.tile_mode && pixel_format == info.pixel_format &&
+			       type == info.type && exact_format == exact;
+		}
+	};
+	[[nodiscard]] static size_t ImageLookupSlot(const ImageInfo& info, bool exact) noexcept {
+		auto hash = info.data.address ^ (info.data.size * 0x9e3779b97f4a7c15ull) ^
+		            (static_cast<uint64_t>(info.pixel_format) << 1u) ^ (exact ? 1u : 0u);
+		hash ^= hash >> 29u;
+		hash *= 0xbf58476d1ce4e5b9ull;
+		hash ^= hash >> 32u;
+		return static_cast<size_t>(hash % ImageLookupCount);
+	}
+	static constexpr size_t              ImageLookupCount = 512;
+	std::array<ImageLookup, ImageLookupCount> m_image_lookups {};
+	uint64_t                             m_image_set_generation = 1;
 
 	friend struct TextureCacheTestAccess;
 	friend struct PerformanceMemoryTestAccess;

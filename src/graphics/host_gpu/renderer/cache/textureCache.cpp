@@ -25,6 +25,7 @@
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -319,6 +320,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_image_set_generation++;
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -340,6 +342,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	m_image_set_generation++;
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -1546,18 +1549,21 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::unique_lock lock {m_lock};
-		int32_t view_mip   = -1;
-		int32_t view_layer = -1;
+		int32_t view_mip        = -1;
+		int32_t view_layer      = -1;
+		int32_t backing_matches = 0;
 		const auto       lookup     = [&] {
-			result     = {};
-			view_mip   = -1;
-			view_layer = -1;
+			result          = {};
+			view_mip        = -1;
+			view_layer      = -1;
+			backing_matches = 0;
 			const auto candidates =
 			    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 			for (const auto id: candidates) {
 				const auto& image = m_slot_images[id];
 				if (SameBacking(image.info, desc.info, exact_format)) {
 					result = id;
+					backing_matches++;
 				}
 			}
 			if (!result) {
@@ -1583,24 +1589,48 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				}
 			}
 		};
-		lookup();
-		if (!result && m_last_pressure_gc_tick != m_gc_tick && m_graphics.CanReportMemoryUsage() &&
-		    m_graphics.GetDeviceMemoryUsage() >= m_pressure_gc_memory) {
-			// At most once per submission age: image misses must not age live resources or
-			// repeatedly drain a working set that cannot be reclaimed losslessly.
-			m_last_pressure_gc_tick = m_gc_tick;
-			lock.unlock();
-			(void)CollectGarbage(true);
-			lock.lock();
-			// Collection invalidates aliases and can retire the source of this lookup.
+		// Draws look up the same textures again and again; see ImageLookup.
+		static const bool memo_enabled = [] {
+			const char* text = std::getenv("KYTY_DEBUG_IMAGE_MEMO");
+			return text == nullptr || std::strcmp(text, "0") != 0;
+		}();
+		auto& remembered = m_image_lookups[ImageLookupSlot(desc.info, exact_format)];
+		if (memo_enabled && remembered.generation == m_image_set_generation &&
+		    remembered.Matches(desc.info, exact_format)) {
+			result = remembered.id;
+		} else {
 			lookup();
-		}
-		if (!result) {
-			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
-			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                    inserted.info.data.size)) {
-				inserted.MarkBufferModified();
+			if (!result && m_last_pressure_gc_tick != m_gc_tick &&
+			    m_graphics.CanReportMemoryUsage() &&
+			    m_graphics.GetDeviceMemoryUsage() >= m_pressure_gc_memory) {
+				// At most once per submission age: image misses must not age live resources or
+				// repeatedly drain a working set that cannot be reclaimed losslessly.
+				m_last_pressure_gc_tick = m_gc_tick;
+				lock.unlock();
+				(void)CollectGarbage(true);
+				lock.lock();
+				// Collection invalidates aliases and can retire the source of this lookup.
+				lookup();
+			}
+			if (!result) {
+				result         = InsertImage(desc.info);
+				auto& inserted = m_slot_images[result];
+				if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
+				                                    inserted.info.data.size)) {
+					inserted.MarkBufferModified();
+				}
+			} else if (backing_matches == 1 && view_mip < 0 && view_layer < 0) {
+				remembered = {.generation      = m_image_set_generation,
+				              .data            = desc.info.data,
+				              .extent          = desc.info.extent,
+				              .resources       = desc.info.resources,
+				              .samples         = desc.info.samples,
+				              .bytes_per_block = desc.info.bytes_per_block,
+				              .tile_mode       = desc.info.tile_mode,
+				              .pixel_format    = desc.info.pixel_format,
+				              .type            = desc.info.type,
+				              .exact_format    = exact_format,
+				              .id              = result};
 			}
 		}
 		auto& image = m_slot_images[result];

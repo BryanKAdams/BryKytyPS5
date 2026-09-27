@@ -22,9 +22,11 @@ struct RenderDebugCounters {
 inline RenderDebugCounters g_render_debug_counters;
 
 // KYTY_DEBUG_DRAW_PHASES=<pixel shader hash> times the render thread's CPU phases of that pixel
-// shader's draws and prints their average every 5 s. Each Mark charges the time since the previous
-// mark to its phase; marks outside a Begin/End pair (other threads, other work) do nothing.
+// shader's draws and prints their average every 5 s; =all times every draw. Each Mark charges the
+// time since the previous mark to its phase; marks outside a Begin/End pair (other threads, other
+// work) do nothing.
 struct DrawPhaseTimer {
+	static constexpr uint64_t AllDraws = ~uint64_t {0};
 	enum Phase : uint32_t {
 		Setup,            // Draw entry up to shader lookup.
 		VertexParams,     // Vertex stage registers and code hash.
@@ -47,11 +49,41 @@ struct DrawPhaseTimer {
 		Tail,             // After the draw.
 		Count
 	};
+	// Spans timed on their own inside the phases; a probe overlaps its phase's time.
+	enum Probe : uint32_t {
+		TargetImage,      // Render-target FindImage.
+		TextureImage,     // Texture FindImage.
+		TextureDescribe,  // Texture description lookup and copy.
+		BufferWritten,    // ObtainBuffer for written storage buffers.
+		BufferRead,       // ObtainBuffer for read-only storage buffers.
+		BufferInvalidate, // Texture invalidation behind written storage buffers.
+		Upload,           // Flattened SRT and shader data uploads.
+		ProbeCount
+	};
+	class ProbeScope {
+	public:
+		ProbeScope(DrawPhaseTimer& timer, Probe probe)
+		    : m_timer(timer.active ? &timer : nullptr), m_probe(probe),
+		      m_start(m_timer != nullptr ? Now() : 0) {}
+		~ProbeScope() {
+			if (m_timer != nullptr) [[unlikely]] {
+				m_timer->probes[m_probe] += Now() - m_start;
+			}
+		}
+		ProbeScope(const ProbeScope&)            = delete;
+		ProbeScope& operator=(const ProbeScope&) = delete;
+
+	private:
+		DrawPhaseTimer* m_timer;
+		Probe           m_probe;
+		uint64_t        m_start;
+	};
 	static uint64_t Hash();
 	void            Begin() {
 		if (Hash() != 0) [[unlikely]] {
 			active = true;
 			current.fill(0);
+			probes.fill(0);
 			last = Now();
 		}
 	}
@@ -68,9 +100,10 @@ struct DrawPhaseTimer {
 private:
 	static uint64_t Now();
 
-	bool                         active = false;
-	uint64_t                     last   = 0;
-	std::array<uint64_t, Count>  current {};
+	bool                             active = false;
+	uint64_t                         last   = 0;
+	std::array<uint64_t, Count>      current {};
+	std::array<uint64_t, ProbeCount> probes {};
 };
 inline thread_local DrawPhaseTimer g_draw_phases;
 

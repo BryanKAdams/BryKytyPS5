@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <intrin.h>
 #include <string>
@@ -621,7 +622,10 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 uint64_t DrawPhaseTimer::Hash() {
 	static const uint64_t hash = [] {
 		const char* text = std::getenv("KYTY_DEBUG_DRAW_PHASES");
-		return text != nullptr ? std::strtoull(text, nullptr, 16) : uint64_t {0};
+		if (text == nullptr) {
+			return uint64_t {0};
+		}
+		return std::strcmp(text, "all") == 0 ? AllDraws : std::strtoull(text, nullptr, 16);
 	}();
 	return hash;
 }
@@ -640,7 +644,11 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	    "setup",    "vs-params", "ps-params",  "ps-program", "vs-program", "targets",  "stage-tex",
 	    "stage-smp", "stage-bind", "find-buf", "rebind-img", "buf-views",  "gfx-bind", "rt-acquire",
 	    "pipeline", "records",   "commit",     "record",     "tail"};
-	static std::array<uint64_t, Count> totals {};
+	static constexpr std::array<const char*, ProbeCount> ProbeNames {
+	    "rt-image", "tex-image", "tex-describe", "buf-written", "buf-read", "buf-invalidate",
+	    "upload"};
+	static std::array<uint64_t, Count>      totals {};
+	static std::array<uint64_t, ProbeCount> probe_totals {};
 	static uint64_t draws        = 0;
 	static uint64_t other_draws  = 0;
 	static uint64_t other_ticks  = 0;
@@ -650,9 +658,12 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	for (const auto ticks: current) {
 		sum += ticks;
 	}
-	if (pixel_hash == Hash()) {
+	if (pixel_hash == Hash() || Hash() == AllDraws) {
 		for (uint32_t i = 0; i < Count; i++) {
 			totals[i] += current[i];
+		}
+		for (uint32_t i = 0; i < ProbeCount; i++) {
+			probe_totals[i] += probes[i];
 		}
 		draws++;
 	} else {
@@ -679,8 +690,14 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	for (uint32_t i = 0; i < Count; i++) {
 		line += fmt::format(" {}={:.2f}", Names[i], draws != 0 ? totals[i] * to_us / draws : 0.0);
 	}
+	line += " | probes:";
+	for (uint32_t i = 0; i < ProbeCount; i++) {
+		line += fmt::format(" {}={:.2f}", ProbeNames[i],
+		                    draws != 0 ? probe_totals[i] * to_us / draws : 0.0);
+	}
 	std::printf("%s\n", line.c_str());
 	totals.fill(0);
+	probe_totals.fill(0);
 	draws        = 0;
 	other_draws  = 0;
 	other_ticks  = 0;

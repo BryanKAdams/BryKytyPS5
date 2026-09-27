@@ -192,6 +192,13 @@ void TestRangeSet() {
   ranges.Add(0x1000, 0x80);
   ranges.Add(0x1080, 0x80);
   ranges.Add(0x1200, 0x40);
+  ranges.Add(0x1010, 0x20);
+  ranges.Add(0x1000, 0x100);
+  ranges.Add(0x1200, 0x40);
+  size_t range_count = 0;
+  ranges.ForEach([&](uint64_t, uint64_t) { range_count++; });
+  Check(range_count == 2 && ranges.Contains(0x1000, 0x100) && ranges.Contains(0x1200, 0x40),
+        "range set changed when adding already covered ranges");
   Check(ranges.Contains(0x1010, 0xe0) && !ranges.Contains(0x1010, 0x200),
         "range set containment did not require full coverage");
   Check(ranges.Intersects(0x0fff, 2) && ranges.Intersects(0x11ff, 2) &&
