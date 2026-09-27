@@ -471,6 +471,31 @@ about two seconds sooner (one run a side; earlier runs without the change all di
 fps). Screenshots show no difference. What remains is the per-draw cost of hundreds of tiny
 mesh-emulated draws.
 
+**The rest of the dip was the render thread's per-draw cost.** With the barriers gone the GPU is
+busy about 8 ms a frame in the dip while the render thread takes 14 ms to feed it: each trail
+draw cost about 20 us of CPU (`KYTY_DEBUG_DRAW_PHASES`, below), 1,000 of them a frame. The draws
+cannot be merged: every one has its own user data and buffers (only the pipeline, textures and
+samplers repeat). Three costs were redundant work repeated per draw:
+
+- Finding a shader's active resources walked its control-flow plan, 108-137 blocks for the trail
+  shaders, though only about 20 conditions decide the result. The walk's order is a function of
+  those outcomes, so the plan now keeps a tree of the walks seen, keyed by outcome; a refresh
+  evaluates the conditions along the tree and reuses the leaf's result (every trail refresh hits).
+  `KYTY_VERIFY_SRT=1` in the dip and `--srt-benchmark` found no mismatch with the reference walker.
+- Every draw rebuilt each texture's description (format, tiling, sizes, mip layout, view) from
+  its descriptor: 11 images, 1.9 us a trail draw. It is a pure function of the descriptor and the
+  shader's image resource, so a small cache keyed by both returns it; the texture cache lookup and
+  the checks against the image found still run every time.
+- Binding a buffer scanned its CPU-dirty pages and recomputed the region's write protection even
+  when nothing in the range was dirty (the trail binds 23 multi-megabyte buffers). A clean range
+  now returns early; every CPU-dirty change already updates the protection, so nothing is skipped.
+
+A trail draw now costs about 16.5 us (resources 4.5 + 2.3 us, textures 1.5 us), and every other
+draw gets the same savings. Ship route at the resolution floor, two runs a side alternating, each
+build warm in its own folder: the worst five seconds rose from 45.2 and 43.6 fps to 56.2 and
+56.2 (render-thread gap 14.4 to 10.4 ms a frame, GPU time unchanged), the worst second from 25.4
+and 39.9 to 43.9 and 41.9. Screenshots match.
+
 ## First-use stutter (pipeline compiles)
 
 `--drain-stats` prints a `hitch:` line for every game frame of 50 ms or more, listing what was
@@ -930,6 +955,15 @@ unset.
 barriers they caused, in total and for the six pixel shaders causing the most of each, to find
 draw patterns that stall the GPU (as the sand trail did) anywhere in a scene. Pair it with
 `KYTY_GPU_ZONES=1` for each shader's GPU time.
+
+`KYTY_DEBUG_DRAW_PHASES=<pixel shader hash>` times the render thread's CPU work for that pixel
+shader's draws and prints every 5 s their rate and average microseconds per draw in each phase:
+setup, shader parameters, each stage's program lookup and resource refresh, render targets,
+textures, samplers, buffer discovery and binding, image views, pipeline lookup, descriptor commit
+and command recording, plus the time spent on all other draws. It finds where a CPU-bound
+draw-heavy scene goes; the stack sampler's view of the same thread is distorted by suspending it.
+With `KYTY_DEBUG_DRAW_LOG`, a `draw-log keys:` line per draw also fingerprints each stage's user
+data, buffers, images, samplers and flattened SRT, to see what differs between draws.
 
 `KYTY_DEBUG_LOOP_HEAT=<hash>:<pc>[,<pc>[,<pc>]]` (hexadecimal) makes one pixel shader export, in
 place of its colour targets, how many times its wave ran each guest PC (red, green, blue), in

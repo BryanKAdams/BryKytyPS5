@@ -668,6 +668,23 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	mutable std::unique_ptr<CompiledResourcePlan> compiled;
+	// SrtEvaluator::FindActiveSources replay. A walk evaluates conditions in an order fixed by the
+	// outcomes so far, so the walks seen form a tree: a node names the block whose condition comes
+	// next and the node each outcome leads to; a leaf holds the sources that walk found active.
+	struct ActiveTraceStep {
+		uint32_t block   = 0;
+		uint8_t  outcome = 0; // 0 false, 1 true, 2 not evaluable (every successor followed).
+	};
+	struct ActiveTreeNode {
+		static constexpr uint32_t None = UINT32_MAX;
+		// A node with a block is a branch, one with sources a leaf, one with neither not filled in.
+		uint32_t                block   = None;
+		std::array<uint32_t, 3> next    = {None, None, None};
+		uint32_t                sources = None; // Offset in active_tree_sources.
+	};
+	mutable std::vector<ActiveTraceStep> active_trace;
+	mutable std::vector<ActiveTreeNode>  active_tree;
+	mutable std::vector<uint8_t>         active_tree_sources;
 };
 
 struct Program: ResourcePlan {

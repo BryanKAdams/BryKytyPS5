@@ -171,6 +171,14 @@ public:
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
 		RegionBits mask(bits, start, end);
+		if constexpr (source == DirtySource::Cpu) {
+			// Every CPU-dirty change updates the write protection, so with no dirty page in the
+			// range, clearing it and updating the protection would change nothing. Buffers are
+			// bound per draw, usually clean.
+			if (mask.None()) {
+				return;
+			}
+		}
 		if constexpr (clear) {
 			if constexpr (source == DirtySource::Gpu) {
 				Disarm(start, end);

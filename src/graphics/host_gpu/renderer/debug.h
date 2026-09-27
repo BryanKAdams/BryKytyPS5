@@ -32,8 +32,13 @@ struct DrawPhaseTimer {
 		PixelProgram,     // Pixel program lookup and resource materialization.
 		VertexProgram,    // Vertex program lookup and resource materialization.
 		Targets,          // Render target resolution.
-		StageBindings,    // PrepareBindings: textures, samplers, user data.
-		GraphicsBindings, // PrepareGraphicsBindings: buffers, uploads.
+		StageTextures,    // PrepareBindings: textures.
+		StageSamplers,    // PrepareBindings: samplers.
+		StageBindings,    // PrepareBindings: user data.
+		FindBuffers,      // PrepareGraphicsBindings: buffer discovery.
+		RebindImages,     // PrepareGraphicsBindings: image views.
+		BufferViews,      // PrepareGraphicsBindings: storage buffer binding.
+		GraphicsBindings, // PrepareGraphicsBindings: uploads and the rest.
 		RenderTargets,    // AcquireRenderTargets.
 		Pipeline,         // Pipeline lookup.
 		Records,          // Mesh draw records.

@@ -529,22 +529,20 @@ static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& descript
 	                  std::begin(view.mips));
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
+namespace {
 
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
-	}
+// Everything ResolveTexture derives from an image resource and its descriptor alone.
+struct TextureDescription {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size              = 0;
+	bool                    shader_conversion = false;
+};
 
+TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                   const ShaderTextureResource&               descriptor) {
+	const bool storage         = resource.written;
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -680,8 +678,65 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	return {std::move(desc), pixel_format, view_format, size.size, shader_conversion};
+}
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+// A texture description is a pure function of its inputs, and draws bind the same textures over
+// and over, so recent descriptions are kept. An entry holds copies of both inputs: a hit is exact.
+class TextureDescriptionCache {
+public:
+	const TextureDescription& Get(const ShaderRecompiler::IR::ImageResource&   resource,
+	                              const ShaderRecompiler::IR::DescriptorValue& value,
+	                              const ShaderTextureResource&                 descriptor) {
+		uint32_t hash = 2166136261u;
+		for (const auto dword: value.dwords) {
+			hash = (hash ^ dword) * 16777619u;
+		}
+		hash = (hash ^ resource.source) * 16777619u;
+		auto& entry = m_entries[(hash ^ (hash >> 15u)) % Size];
+		if (!entry.valid || !(entry.value == value) || !(entry.resource == resource)) {
+			entry.description = DescribeTexture(resource, descriptor);
+			entry.value       = value;
+			entry.resource    = resource;
+			entry.valid       = true;
+		}
+		return entry.description;
+	}
+
+private:
+	static constexpr size_t Size = 256;
+	struct Entry {
+		bool                                   valid = false;
+		ShaderRecompiler::IR::DescriptorValue  value;
+		ShaderRecompiler::IR::ImageResource    resource;
+		TextureDescription                     description;
+	};
+	std::vector<Entry> m_entries = std::vector<Entry>(Size);
+};
+
+} // namespace
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+
+	thread_local TextureDescriptionCache descriptions;
+	const auto& described = descriptions.Get(resource, value, descriptor);
+	auto        desc      = described.desc;
+
+	auto       id                  = texture_cache.FindImage(desc, described.shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -691,11 +746,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, described.pixel_format,
+		                            described.size);
 	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+		ValidateStorageColorView(image->info.pixel_format, described.view_format,
+		                         descriptor.DstSelXYZW());
 	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		(void)SelectSampledColorView(image->info.pixel_format, described.pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};
@@ -775,10 +832,12 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::StageTextures);
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::StageSamplers);
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
@@ -837,6 +896,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::BufferViews);
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -902,9 +962,11 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_dma) {
 		m_context.PrepareBda();
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::FindBuffers);
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
+	g_draw_phases.Mark(DrawPhaseTimer::RebindImages);
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);

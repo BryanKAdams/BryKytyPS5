@@ -1971,7 +1971,37 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
-	auto& active = m_program.active_sources;
+	auto&      active    = m_program.active_sources;
+	auto&      strict    = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	const bool evaluates = m_runtime.read_specialization_memory != nullptr;
+	const auto outcome   = [&](uint32_t index) -> uint8_t {
+		uint32_t condition = 0;
+		auto&    evaluator = m_compiled.direct_conditions[index] != 0u ? *this : strict;
+		if (!evaluator.Evaluate(m_compiled.conditions[index], condition)) {
+			return 2u;
+		}
+		return condition != 0u ? 1u : 0u;
+	};
+	// The walk below depends on the plan only through the outcomes of the conditions it
+	// evaluates, in an order those outcomes fix. Follow the tree of earlier walks (see
+	// ResourcePlan::ActiveTreeNode) with this refresh's outcomes; reaching a leaf means the walk
+	// would visit the same blocks and find the same sources.
+	using TreeNode = ResourcePlan::ActiveTreeNode;
+	auto& tree     = m_program.active_tree;
+	auto& trace    = m_program.active_trace;
+	if (evaluates && !tree.empty()) {
+		uint32_t node = 0;
+		while (node != TreeNode::None && tree[node].block != TreeNode::None) {
+			node = tree[node].next[outcome(tree[node].block)];
+		}
+		if (node != TreeNode::None && tree[node].sources != TreeNode::None) {
+			const auto first = m_program.active_tree_sources.begin() + tree[node].sources;
+			const auto count = static_cast<ptrdiff_t>(m_program.descriptor_sources.size());
+			active.assign(first, first + count);
+			return active;
+		}
+	}
+	trace.clear();
 	if (!m_compiled.initial_active.empty()) {
 		active.assign(m_compiled.initial_active.begin(), m_compiled.initial_active.end());
 	} else {
@@ -1982,7 +2012,6 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 			}
 		}
 	}
-	auto&      strict      = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 	auto&      visited     = m_program.visited_blocks;
 	auto&      pending     = m_program.pending_blocks;
 	const auto block_count = m_program.control_flow.size();
@@ -2018,15 +2047,52 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 		if (!m_compiled.inert_successors.empty() && m_compiled.inert_successors[index] != 0u) {
 			continue;
 		}
-		uint32_t   condition      = 0;
 		const auto condition_node = m_compiled.conditions[index];
-		auto&      evaluator      = m_compiled.direct_conditions[index] != 0u ? *this : strict;
-		if (condition_node != ResourceNode::NoNode &&
-		    m_runtime.read_specialization_memory != nullptr &&
-		    evaluator.Evaluate(condition_node, condition)) {
-			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+		const auto result =
+		    condition_node != ResourceNode::NoNode && evaluates ? outcome(index) : uint8_t {2};
+		if (condition_node != ResourceNode::NoNode && evaluates) {
+			trace.push_back({index, result});
+		}
+		if (result != 2u) {
+			pending.push_back(block.successors[result != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+		}
+	}
+	// Add this walk to the tree, up to a bound on its size.
+	constexpr size_t MaxTreeNodes = 4096;
+	auto&            sources      = m_program.active_tree_sources;
+	if (evaluates && active.size() == m_program.descriptor_sources.size() &&
+	    tree.size() + trace.size() + 1u <= MaxTreeNodes) {
+		if (tree.empty()) {
+			tree.emplace_back();
+		}
+		uint32_t node = 0;
+		bool     fits = true;
+		for (const auto& step: trace) {
+			// Earlier walks with the same outcomes so far evaluated the same condition here.
+			if (tree[node].block == TreeNode::None && tree[node].sources == TreeNode::None) {
+				tree[node].block = step.block;
+			} else if (tree[node].block != step.block) {
+				fits = false;
+				break;
+			}
+			auto next = tree[node].next[step.outcome];
+			if (next == TreeNode::None) {
+				next                          = static_cast<uint32_t>(tree.size());
+				tree[node].next[step.outcome] = next;
+				tree.emplace_back();
+			}
+			node = next;
+		}
+		fits = fits && tree[node].block == TreeNode::None;
+		if (fits && tree[node].sources == TreeNode::None) {
+			tree[node].sources = static_cast<uint32_t>(sources.size());
+			sources.insert(sources.end(), active.begin(), active.end());
+		} else if (!fits) {
+			// Not expected: the walk order is a function of the outcomes. Start over.
+			tree.clear();
+			sources.clear();
 		}
 	}
 	return active;

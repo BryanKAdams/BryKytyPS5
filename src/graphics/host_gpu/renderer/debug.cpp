@@ -637,8 +637,9 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	Mark(Tail);
 	active = false;
 	static constexpr std::array<const char*, Count> Names {
-	    "setup",  "vs-params", "ps-params", "ps-program", "vs-program", "targets", "stage-bind",
-	    "gfx-bind", "rt-acquire", "pipeline", "records", "commit", "record", "tail"};
+	    "setup",    "vs-params", "ps-params",  "ps-program", "vs-program", "targets",  "stage-tex",
+	    "stage-smp", "stage-bind", "find-buf", "rebind-img", "buf-views",  "gfx-bind", "rt-acquire",
+	    "pipeline", "records",   "commit",     "record",     "tail"};
 	static std::array<uint64_t, Count> totals {};
 	static uint64_t draws        = 0;
 	static uint64_t other_draws  = 0;
