@@ -287,7 +287,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program, const Roots& roots, u
 	} else {
 		return false;
 	}
-	auto& keys = program.material_keys;
+	auto& keys = program.ThreadScratch().material_keys;
 	keys.clear();
 	if (indirect.material_source == UINT32_MAX) {
 		uint32_t key_count = 0;
@@ -1188,7 +1188,7 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
                  const SrtRuntime& observed, bool capture_reads, typename Roots::Walker& clean,
                  typename Roots::Walker& walker, ResourceSnapshot& snapshot,
                  ResourceSpecialization& specialization, MaterializationMemo* memo) {
-	auto& reads = program.specialization_reads;
+	auto& reads = program.ThreadScratch().specialization_reads;
 	// The ordinary walker sends conditions that are not direct to its strict walker.
 	const auto active = walker.FindActiveSources();
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
@@ -1324,7 +1324,7 @@ bool MaterializeCompiled(const ResourcePlan& program, const SrtRuntime& runtime,
 		const bool         ordinary_blocks = !capture_reads && runtime.read_memory != nullptr &&
 		                             runtime.read_memory_block != nullptr;
 		const auto   source = ordinary_blocks ? ordinary.Runtime() : clean_source;
-		ReadCapture  capture {source, program.specialization_reads};
+		ReadCapture  capture {source, program.ThreadScratch().specialization_reads};
 		const auto   observed = ObservedRuntime(source, capture_reads, capture);
 		SrtEvaluator clean(program, compiled, CleanRuntime(observed));
 		SrtEvaluator walker(program, compiled, observed, true, &clean);
@@ -1377,6 +1377,115 @@ void VerifyMaterialization(const ResourcePlan& program, const SrtRuntime& runtim
 
 } // namespace
 
+namespace {
+
+// Forwards reads to a runtime's readers and logs them.
+class ReadLogger {
+public:
+	ReadLogger(const SrtRuntime& source, ReadLog& log): m_source(source), m_log(log) {}
+
+	SrtRuntime Runtime() {
+		auto runtime                    = m_source;
+		runtime.userdata                = this;
+		runtime.specialization_userdata = this;
+		if (m_source.read_memory != nullptr) {
+			runtime.read_memory = Ordinary;
+		}
+		if (m_source.read_memory_block != nullptr) {
+			runtime.read_memory_block = OrdinaryBlock;
+		}
+		if (m_source.read_specialization_memory != nullptr) {
+			runtime.read_specialization_memory = Specialization;
+		}
+		return runtime;
+	}
+
+private:
+	static bool Ordinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto&      self = *static_cast<ReadLogger*>(userdata);
+		const bool ok   = self.m_source.read_memory(self.m_source.userdata, address, values);
+		self.Log(ReadLog::Reader::Ordinary, address, values, ok);
+		return ok;
+	}
+	static bool OrdinaryBlock(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto&      self = *static_cast<ReadLogger*>(userdata);
+		const bool ok   = self.m_source.read_memory_block(self.m_source.userdata, address, values);
+		self.Log(ReadLog::Reader::OrdinaryBlock, address, values, ok);
+		return ok;
+	}
+	static bool Specialization(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto&      self = *static_cast<ReadLogger*>(userdata);
+		const bool ok   = self.m_source.read_specialization_memory(
+            SpecializationUserdata(self.m_source), address, values);
+		self.Log(ReadLog::Reader::Specialization, address, values, ok);
+		return ok;
+	}
+
+	void Log(ReadLog::Reader reader, uint64_t address, std::span<const uint32_t> values, bool ok) {
+		m_log.entries.push_back({.address = address,
+		                         .first   = static_cast<uint32_t>(m_log.words.size()),
+		                         .count   = static_cast<uint32_t>(values.size()),
+		                         .reader  = reader,
+		                         .ok      = ok});
+		// A failed read's values are not compared (see ReadsUnchanged).
+		if (ok) {
+			m_log.words.insert(m_log.words.end(), values.begin(), values.end());
+		}
+	}
+
+	SrtRuntime m_source;
+	ReadLog&   m_log;
+};
+
+} // namespace
+
+bool MaterializeResourcesLogged(const ResourcePlan& program, const SrtRuntime& runtime,
+                                ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                ReadLog& log) {
+	log.Clear();
+	bool capture_reads = false;
+	if (!MaterializationAllowed(program, runtime, capture_reads) || capture_reads) {
+		return false;
+	}
+	ReadLogger logger(runtime, log);
+	return MaterializeCompiled(program, logger.Runtime(), snapshot, specialization, nullptr);
+}
+
+bool ReadsUnchanged(const ReadLog& log, const SrtRuntime& runtime) {
+	std::array<uint32_t, 64> small {};
+	std::vector<uint32_t>    large;
+	for (const auto& entry: log.entries) {
+		std::span<uint32_t> values;
+		if (entry.count <= small.size()) {
+			values = std::span(small).first(entry.count);
+		} else {
+			large.resize(entry.count);
+			values = large;
+		}
+		bool ok = false;
+		switch (entry.reader) {
+			case ReadLog::Reader::Ordinary:
+				ok = runtime.read_memory != nullptr &&
+				     runtime.read_memory(runtime.userdata, entry.address, values);
+				break;
+			case ReadLog::Reader::OrdinaryBlock:
+				ok = runtime.read_memory_block != nullptr &&
+				     runtime.read_memory_block(runtime.userdata, entry.address, values);
+				break;
+			case ReadLog::Reader::Specialization:
+				ok = runtime.read_specialization_memory != nullptr &&
+				     runtime.read_specialization_memory(SpecializationUserdata(runtime),
+				                                        entry.address, values);
+				break;
+		}
+		if (ok != entry.ok ||
+		    (ok && !std::equal(values.begin(), values.end(), log.words.begin() + entry.first))) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
                                    ResourceSnapshot&       snapshot,
                                    ResourceSpecialization& specialization) {
@@ -1384,7 +1493,7 @@ bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime
 	if (!MaterializationAllowed(program, runtime, capture_reads)) {
 		return false;
 	}
-	ReadCapture capture {runtime, program.specialization_reads};
+	ReadCapture capture {runtime, program.ThreadScratch().specialization_reads};
 	const auto  observed = ObservedRuntime(runtime, capture_reads, capture);
 	SrtWalker   clean(program, CleanRuntime(observed));
 	SrtWalker   walker(program, observed, program.clean_flat_slots, &clean);
