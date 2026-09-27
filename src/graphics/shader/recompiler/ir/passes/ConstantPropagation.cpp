@@ -346,8 +346,96 @@ private:
 		}
 	}
 
+public:
+	// Bits that are zero in every value the U32 can take, when its value set is unknown or too
+	// large: a loop counter times 4 still has two low zero bits. Under-approximated: a
+	// loop-carried value is taken to have none.
+	uint32_t KnownZeros(Value value, uint32_t depth = 0) {
+		value = value.Resolve();
+		if (IsImmediate(value, Type::U32)) {
+			return ~value.U32();
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > 24 || inst->GetType() != Type::U32) {
+			return 0;
+		}
+		if (const auto found = m_zeros.find(inst); found != m_zeros.end()) {
+			return found->second;
+		}
+		if (std::ranges::find(m_zeros_visiting, inst) != m_zeros_visiting.end()) {
+			return 0;
+		}
+		m_zeros_visiting.push_back(inst);
+		const auto zeros = ComputeZeros(*inst, depth + 1);
+		m_zeros_visiting.pop_back();
+		m_zeros.emplace(inst, zeros);
+		return zeros;
+	}
+
+private:
+	uint32_t ComputeZeros(const Inst& inst, uint32_t depth) {
+		const auto low_mask = [](uint32_t bits) {
+			return bits >= 32u ? UINT32_MAX : (1u << bits) - 1u;
+		};
+		// Trailing bits known zero.
+		const auto trailing = [&](size_t index) {
+			return static_cast<uint32_t>(std::countr_one(KnownZeros(inst.Arg(index), depth)));
+		};
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::BitwiseAnd32:
+				return KnownZeros(inst.Arg(0), depth) | KnownZeros(inst.Arg(1), depth);
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+				return KnownZeros(inst.Arg(0), depth) & KnownZeros(inst.Arg(1), depth);
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto shift = inst.Arg(1).Resolve();
+				if (!IsImmediate(shift, Type::U32)) {
+					return 0;
+				}
+				const auto amount = shift.U32() & 31u;
+				const auto zeros  = KnownZeros(inst.Arg(0), depth);
+				return inst.GetOpcode() == ValueOpcode::ShiftLeftLogical32
+				           ? (zeros << amount) | low_mask(amount)
+				           : (zeros >> amount) | ~(UINT32_MAX >> amount);
+			}
+			// Modulo 2^32, a product has at least the sum of its factors' trailing zero bits, and
+			// a sum or difference at least the fewer of its operands'.
+			case ValueOpcode::IMul32: return low_mask(std::min(32u, trailing(0) + trailing(1)));
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::ISub32: return low_mask(std::min(trailing(0), trailing(1)));
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = inst.Arg(1).Resolve();
+				const auto count  = inst.Arg(2).Resolve();
+				if (!IsImmediate(offset, Type::U32) || !IsImmediate(count, Type::U32) ||
+				    offset.U32() > 32u || count.U32() > 32u - offset.U32()) {
+					return 0;
+				}
+				const auto field = low_mask(count.U32());
+				const auto source =
+				    offset.U32() == 32u ? UINT32_MAX : KnownZeros(inst.Arg(0), depth) >> offset.U32();
+				return ~field | (source & field);
+			}
+			// One lane's value (a waterfall loop's index): the source's known bits hold for it.
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadLane: return KnownZeros(inst.Arg(0), depth);
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::Phi: {
+				uint32_t zeros = UINT32_MAX;
+				for (size_t index = inst.GetOpcode() == ValueOpcode::Phi ? 0u : 1u;
+				     index < inst.NumArgs() && zeros != 0u; index++) {
+					zeros &= KnownZeros(inst.Arg(index), depth);
+				}
+				return zeros;
+			}
+			default: return 0;
+		}
+	}
+
 	std::unordered_map<const Inst*, std::vector<uint32_t>> m_known;
 	std::vector<const Inst*>                               m_visiting;
+	std::unordered_map<const Inst*, uint32_t>              m_zeros;
+	std::vector<const Inst*>                               m_zeros_visiting;
 };
 
 // Folds x == C (or x != C) when C is not among x's possible values, or is its only one.
@@ -362,6 +450,12 @@ bool FoldImpossibleEquality(Inst& inst, bool equal, PossibleValues& possible) {
 	}
 	std::vector<uint32_t> values;
 	if (!possible.Find(lhs, values)) {
+		// The value set is unknown, but a bit the constant sets and the value never can still
+		// rule the constant out (V_MOVRELS with M0 = loop counter * 4).
+		if ((rhs.U32() & possible.KnownZeros(lhs)) != 0u) {
+			Replace(inst, Value(!equal));
+			return true;
+		}
 		return false;
 	}
 	if (!std::ranges::binary_search(values, rhs.U32())) {

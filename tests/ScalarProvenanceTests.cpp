@@ -582,6 +582,82 @@ void TestImpossibleEqualitiesFold() {
         "compares against a value a select cannot produce were not folded");
 }
 
+void TestKnownZeroBitsFoldIndexedReads() {
+  // Astro Bot's foliage vertex shaders index a register array by a loop counter:
+  // M0 = (i << 2) & 0xff. Its values are unknown, but its two low bits are zero,
+  // so only every fourth register can be read.
+  Fixture fixture;
+  const auto counter = fixture.Emit(ValueOpcode::GetUserData,
+                                    {Value(static_cast<ScalarReg>(2))});
+  const auto shifted =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {counter, Value(2u)});
+  const auto m0 = fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(0xffu)});
+  Value selected = Value(100u);
+  for (uint32_t index = 1; index < 64u; index++) {
+    const auto match = fixture.Emit(ValueOpcode::IEqual32, {m0, Value(index)});
+    selected = fixture.Emit(ValueOpcode::SelectU32,
+                            {match, Value(100u + index), selected});
+  }
+  const auto chain = fixture.Emit(ValueOpcode::ReferenceU32, {selected});
+  // A sum keeps the fewer trailing zeros: 4 * i + 2 can be 6 but never 7.
+  const auto plus_two = fixture.Emit(ValueOpcode::IAdd32, {shifted, Value(2u)});
+  const auto compare = [&](uint32_t constant) {
+    return fixture.Emit(
+        ValueOpcode::ReferenceU32,
+        {fixture.Emit(ValueOpcode::SelectU32,
+                      {fixture.Emit(ValueOpcode::IEqual32, {plus_two, Value(constant)}),
+                       Value(1u), Value(2u)})});
+  };
+  const auto six = compare(6u);
+  const auto seven = compare(7u);
+  // A waterfall loop reads one lane's index; that lane's value keeps the bits.
+  const auto lane_index = fixture.Emit(
+      ValueOpcode::BitwiseAnd32,
+      {fixture.Emit(ValueOpcode::ReadFirstLane, {shifted, Value(true)}), Value(0xffu)});
+  const auto lane_compare = [&](uint32_t constant) {
+    return fixture.Emit(
+        ValueOpcode::ReferenceU32,
+        {fixture.Emit(ValueOpcode::SelectU32,
+                      {fixture.Emit(ValueOpcode::IEqual32, {lane_index, Value(constant)}),
+                       Value(1u), Value(2u)})});
+  };
+  const auto lane_eight = lane_compare(8u);
+  const auto lane_five = lane_compare(5u);
+
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+
+  std::vector<uint32_t> indices;
+  auto value = chain.ResolveInstruction()->Arg(0).Resolve();
+  while (const auto *select = value.TryInstruction()) {
+    Check(select->GetOpcode() == ValueOpcode::SelectU32, "chain lost its selects");
+    const auto *match = select->Arg(0).ResolveInstruction();
+    Check(match->GetOpcode() == ValueOpcode::IEqual32 &&
+              match->Arg(0).Resolve() == m0.Resolve(),
+          "chain select does not test M0");
+    const auto index = match->Arg(1).Resolve().U32();
+    Check(select->Arg(1).Resolve() == Value(100u + index),
+          "chain select picks the wrong register");
+    indices.push_back(index);
+    value = select->Arg(2).Resolve();
+  }
+  std::ranges::sort(indices);
+  std::vector<uint32_t> expected;
+  for (uint32_t index = 4; index < 64u; index += 4) {
+    expected.push_back(index);
+  }
+  Check(value == Value(100u) && indices == expected,
+        "compares with bits M0 never sets were kept, or reachable ones were dropped");
+  Check(six.ResolveInstruction()->Arg(0).Resolve().TryInstruction() != nullptr,
+        "a compare the known bits allow was folded");
+  Check(seven.ResolveInstruction()->Arg(0).Resolve() == Value(2u),
+        "a compare the known bits rule out was not folded");
+  Check(lane_eight.ResolveInstruction()->Arg(0).Resolve().TryInstruction() != nullptr &&
+            lane_five.ResolveInstruction()->Arg(0).Resolve() == Value(2u),
+        "known bits did not pass through ReadFirstLane");
+}
+
 void TestMaskedWriteChainsCollapse() {
   // Two EXEC-masked writes to one register: s1 = select(e, f, old) and
   // s2 = select(e, g(s1), s1). s2 only needs f where e holds and old elsewhere.
@@ -761,6 +837,7 @@ int main() {
     TestReadLaneElimination();
     TestOptimizationPipeline();
     TestImpossibleEqualitiesFold();
+    TestKnownZeroBitsFoldIndexedReads();
     TestMaskedWriteChainsCollapse();
     TestIndexedSelectRunsCollapse();
     TestControlFlowValueSurvivesReadLaneFolding();

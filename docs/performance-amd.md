@@ -575,6 +575,16 @@ cache. Same binary, GPU zones:
 zone 1 ms above the others. The foliage vertex stage still uses all 256 VGPRs and 96 bytes of
 scratch. `KYTY_DEBUG_INDEXED_SWITCH=0` keeps the selects for A/B runs.
 
+Most of the chain could never be taken. M0 is `(i << 2) & 0xff` for the loop counter, and
+`readfirstlane(v91 << 2)` in the waterfall loops, so its two low bits are always zero. Constant
+propagation now also tracks each value's known zero bits (`PossibleValues::KnownZeros`). It then
+folds any compare whose constant sets a bit M0 never sets, leaving every fourth register. The
+foliage vertex shader's SPIR-V shrank from 109,606 to 75,964 words (selects 3,916 to 1,823), and
+its pipeline compiles in 0.67-0.76 s. GPU per frame: 3cf24e1b 2.43 ms, c88ebedb 1.79 to 1.54 ms,
+db5cce1c 0.78 ms, and 26.0 ms in total. An unsafe experiment that kept only 16 registers per read
+ran 3cf24e1b in 1.94 ms and c88ebedb in 1.02 ms. A tighter bound on the index could be worth
+that much again.
+
 `scratchpad\flamingo.ps1` in the session that did this drives the route: a copy of the user's
 save (`C:\Games\_SaveFlamingo`, slot 1), the overworld up to the Gorilla Nebula, Sky Garden
 (hold cross to dive in), then samples standing still at the level start. Since 2026-09-27 some
