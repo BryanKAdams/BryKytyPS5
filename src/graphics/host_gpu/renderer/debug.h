@@ -21,6 +21,11 @@ struct RenderDebugCounters {
 };
 inline RenderDebugCounters g_render_debug_counters;
 
+// With KYTY_DEBUG_DRAW_PHASES set, KYTY_DEBUG_AB=1 turns the features that consult it (texture and
+// render-target reuse) off in every other 5 s window, so one run compares both under the same scene
+// and machine load; each draw-phases line reports its window's mode.
+[[nodiscard]] bool AbFeatureOff() noexcept;
+
 // KYTY_DEBUG_DRAW_PHASES=<pixel shader hash> times the render thread's CPU phases of that pixel
 // shader's draws and prints their average every 5 s; =all times every draw. Each Mark charges the
 // time since the previous mark to its phase; marks outside a Begin/End pair (other threads, other
@@ -58,6 +63,8 @@ struct DrawPhaseTimer {
 		BufferRead,       // ObtainBuffer for read-only storage buffers.
 		BufferInvalidate, // Texture invalidation behind written storage buffers.
 		Upload,           // Flattened SRT and shader data uploads.
+		FindFinish,       // FindImage and RefindImage after the lookup (DCC clear checks).
+		StreamCopy,       // ObtainBuffer's copies of small CPU-written buffers.
 		ProbeCount
 	};
 	class ProbeScope {

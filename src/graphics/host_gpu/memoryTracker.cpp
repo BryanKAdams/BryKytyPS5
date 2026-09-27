@@ -182,6 +182,21 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::IsRegionOnlyCpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	ValidateRange(vaddr, size);
+	// Buffers bound per draw lie in one existing region; anything else takes both passes, which
+	// may also create regions.
+	const auto offset  = vaddr % TRACKER_REGION_SIZE;
+	auto*      manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+	if (manager == nullptr || size > TRACKER_REGION_SIZE - offset) {
+		return !IsRegionGpuModified(vaddr, size) && IsRegionCpuModified(vaddr, size);
+	}
+	std::scoped_lock lock(manager->lock);
+	return !manager->IsModified<DirtySource::Gpu>(offset, size) &&
+	       manager->IsModified<DirtySource::Cpu>(offset, size);
+}
+
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

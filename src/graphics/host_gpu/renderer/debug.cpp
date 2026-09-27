@@ -634,6 +634,18 @@ uint64_t DrawPhaseTimer::Now() {
 	return __rdtsc();
 }
 
+static std::atomic<bool> g_ab_off {false};
+
+static bool AbEnabled() {
+	static const bool enabled =
+	    DrawPhaseTimer::Hash() != 0 && std::getenv("KYTY_DEBUG_AB") != nullptr;
+	return enabled;
+}
+
+bool AbFeatureOff() noexcept {
+	return g_ab_off.load(std::memory_order_relaxed);
+}
+
 void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	if (!active) {
 		return;
@@ -646,7 +658,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	    "pipeline", "records",   "commit",     "record",     "tail"};
 	static constexpr std::array<const char*, ProbeCount> ProbeNames {
 	    "rt-image", "tex-image", "tex-describe", "buf-written", "buf-read", "buf-invalidate",
-	    "upload"};
+	    "upload",   "find-finish", "stream-copy"};
 	static std::array<uint64_t, Count>      totals {};
 	static std::array<uint64_t, ProbeCount> probe_totals {};
 	static uint64_t draws        = 0;
@@ -683,10 +695,11 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 		all += ticks;
 	}
 	std::string line = fmt::format("draw-phases: {:.1f}s draws/s={:.0f} us/draw={:.2f} ms/s={:.1f} "
-	                               "other draws/s={:.0f} other ms/s={:.1f} |",
+	                               "other draws/s={:.0f} other ms/s={:.1f}{} |",
 	                               seconds, draws / seconds, draws != 0 ? all * to_us / draws : 0.0,
 	                               all * to_us / 1000.0 / seconds, other_draws / seconds,
-	                               other_ticks * to_us / 1000.0 / seconds);
+	                               other_ticks * to_us / 1000.0 / seconds,
+	                               !AbEnabled() ? "" : (AbFeatureOff() ? " ab=off" : " ab=on"));
 	for (uint32_t i = 0; i < Count; i++) {
 		line += fmt::format(" {}={:.2f}", Names[i], draws != 0 ? totals[i] * to_us / draws : 0.0);
 	}
@@ -696,6 +709,9 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 		                    draws != 0 ? probe_totals[i] * to_us / draws : 0.0);
 	}
 	std::printf("%s\n", line.c_str());
+	if (AbEnabled()) {
+		g_ab_off.store(!AbFeatureOff(), std::memory_order_relaxed);
+	}
 	totals.fill(0);
 	probe_totals.fill(0);
 	draws        = 0;

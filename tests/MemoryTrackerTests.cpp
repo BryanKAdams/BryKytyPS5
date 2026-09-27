@@ -361,6 +361,46 @@ void TestCpuCleanHint() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestOnlyCpuModified() {
+  constexpr uintptr_t base = 0x0000000205000000ull;
+  constexpr uint64_t region = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(base), region * 2,
+                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto separate = [&](uint64_t query_address, uint64_t query_size) {
+    return !tracker.IsRegionGpuModified(query_address, query_size) &&
+           tracker.IsRegionCpuModified(query_address, query_size);
+  };
+
+  Check(tracker.IsRegionOnlyCpuModified(address, 256),
+        "an untracked range was not only CPU modified");
+  tracker.ForEachUploadRange(
+      address, region * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(!tracker.IsRegionOnlyCpuModified(address, 256),
+        "an uploaded range counted as CPU modified");
+  tracker.MarkRegionAsCpuModified(address + 4096, 4);
+  Check(tracker.IsRegionOnlyCpuModified(address, 8192) &&
+            !tracker.IsRegionOnlyCpuModified(address + 8192, 256),
+        "a CPU write was missed or dirtied another page");
+  tracker.MarkRegionAsGpuModified(address + 16384, 4096);
+  Check(!tracker.IsRegionOnlyCpuModified(address + 4096, 16384) &&
+            !separate(address + 4096, 16384),
+        "a GPU-modified page did not exclude the range");
+  tracker.MarkRegionAsCpuModified(address + region + 64, 4);
+  Check(tracker.IsRegionOnlyCpuModified(address + region - 4096, 8192) &&
+            separate(address + region - 4096, 8192),
+        "a range across two regions disagreed with the separate queries");
+
+  tracker.UnmarkRegionAsGpuModified(address + 16384, 4096);
+  tracker.UntrackMemory(address, region * 2);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestRangeInvalidation() {
   constexpr uintptr_t base = 0x0000000201000000ull;
   TrackerHarness harness;
@@ -1340,6 +1380,7 @@ int main(int argc, char **argv) {
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
   TestCpuCleanHint();
+  TestOnlyCpuModified();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();

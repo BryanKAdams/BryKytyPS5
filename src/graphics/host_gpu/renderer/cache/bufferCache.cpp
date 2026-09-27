@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -638,10 +639,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// summary then answers what the locked tracker passes below would find (nothing to copy).
 	const bool cpu_clean = !is_written && m_memory_tracker.IsRegionCpuCleanHint(vaddr, size);
 	if (!is_written && !cpu_clean && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionOnlyCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::StreamCopy);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
 			m_stream_buffer.Commit();
