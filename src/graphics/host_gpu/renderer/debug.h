@@ -26,7 +26,8 @@ inline RenderDebugCounters g_render_debug_counters;
 // draw-phases line reports its window's mode. Features: reuse (texture and render-target reuse;
 // also KYTY_DEBUG_AB=1), pending (rate-limited GPU progress queries at draw entry), backing
 // (lock-free cached guest backing reads), bdaepoch (one BDA synchronization per epoch), scratch
-// (pooled tiler scratch buffers), cleanpages (remembered clean pages for GPU-write queries).
+// (pooled tiler scratch buffers), cleanpages (remembered clean pages for GPU-write queries),
+// cpwrite (BDA epochs started by the GPU thread's own guest memory writes).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 

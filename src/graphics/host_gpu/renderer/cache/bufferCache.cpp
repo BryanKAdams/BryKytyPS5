@@ -729,9 +729,11 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
-		// Access the guest mapping so write faults invalidate cached buffers and images.
+		// Access the guest mapping so write faults invalidate cached buffers and images. A page
+		// that is already CPU-dirty does not fault: start a BDA epoch either way.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		m_scheduler.Context().AdvanceBdaEpochForGpuWrite();
 		return;
 	}
 
@@ -758,6 +760,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
+		m_scheduler.Context().AdvanceBdaEpochForGpuWrite(); // As FillBuffer.
 		return;
 	}
 

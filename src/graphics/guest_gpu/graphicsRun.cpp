@@ -466,6 +466,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	} else {
 		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 	}
+	// Later draws of this submission must see the write, including through addresses.
+	m_renderer.AdvanceBdaEpochForGpuWrite();
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -476,6 +478,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = GuestGpuTimestamp();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.AdvanceBdaEpochForGpuWrite(); // As WriteData.
 	DrainStats::Record(DrainStats::Kind::GpuTimestamp, 1);
 	LogTimestampWrite("clock", num_bytes, dst_address, value);
 	static std::atomic<uint32_t> clock_log_count {0};

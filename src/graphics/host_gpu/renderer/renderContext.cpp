@@ -182,6 +182,14 @@ static bool BdaEpochEnabled() {
 	return enabled && !(ab && AbFeatureOff());
 }
 
+// KYTY_DEBUG_AB=cpwrite alternates.
+void RenderContext::AdvanceBdaEpochForGpuWrite() noexcept {
+	static const bool ab = AbSelected("cpwrite");
+	if (!(ab && AbFeatureOff())) {
+		AdvanceBdaEpoch();
+	}
+}
+
 // Draws reading memory through addresses must see the CPU writes made before their submission,
 // so the first such draw of each epoch uploads every CPU-dirty page. Meanwhile guest threads keep
 // writing later frames' data (Astro Bot's Sky Garden faults about 150k pages/s): uploading and
