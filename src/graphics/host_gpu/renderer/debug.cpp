@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 #include <intrin.h>
 #include <string>
+#include <string_view>
 
 namespace Libs::Graphics {
 
@@ -642,6 +643,24 @@ static bool AbEnabled() {
 	return enabled;
 }
 
+bool AbSelected(const char* feature) noexcept {
+	if (!AbEnabled()) {
+		return false;
+	}
+	const std::string_view features = std::getenv("KYTY_DEBUG_AB");
+	if (features == "1") {
+		return std::string_view(feature) == "reuse";
+	}
+	for (size_t begin = 0; begin <= features.size();) {
+		const auto end = std::min(features.find(',', begin), features.size());
+		if (features.substr(begin, end - begin) == feature) {
+			return true;
+		}
+		begin = end + 1;
+	}
+	return false;
+}
+
 bool AbFeatureOff() noexcept {
 	return g_ab_off.load(std::memory_order_relaxed);
 }
@@ -658,7 +677,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	    "pipeline", "records",   "commit",     "record",     "tail"};
 	static constexpr std::array<const char*, ProbeCount> ProbeNames {
 	    "rt-image", "tex-image", "tex-describe", "buf-written", "buf-read", "buf-invalidate",
-	    "upload",   "find-finish", "stream-copy"};
+	    "upload",   "find-finish", "stream-copy", "pending-ops", "bda"};
 	static std::array<uint64_t, Count>      totals {};
 	static std::array<uint64_t, ProbeCount> probe_totals {};
 	static uint64_t draws        = 0;

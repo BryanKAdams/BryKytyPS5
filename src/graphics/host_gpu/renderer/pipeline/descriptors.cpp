@@ -736,7 +736,8 @@ bool TextureReuseEnabled() {
 		const char* text = std::getenv("KYTY_DEBUG_TEXTURE_REUSE");
 		return text == nullptr || std::strcmp(text, "0") != 0;
 	}();
-	return enabled && !AbFeatureOff();
+	static const bool ab = AbSelected("reuse");
+	return enabled && !(ab && AbFeatureOff());
 }
 
 } // namespace
@@ -1077,6 +1078,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
 	if (uses_dma) {
+		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::Bda);
 		m_context.PrepareBda();
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::FindBuffers);

@@ -49,7 +49,8 @@ bool RenderExecutor::TargetReuseEnabled() {
 		const char* text = std::getenv("KYTY_DEBUG_TARGET_REUSE");
 		return text == nullptr || std::strcmp(text, "0") != 0;
 	}();
-	return enabled && !AbFeatureOff();
+	static const bool ab = AbSelected("reuse");
+	return enabled && !(ab && AbFeatureOff());
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

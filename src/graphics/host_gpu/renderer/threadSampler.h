@@ -10,6 +10,11 @@ namespace Libs::Graphics {
 // registers and the top of its stack are copied. Call it from the thread to sample.
 void StartThreadSampler(const char* name);
 
+// Debugging aid (Windows): with KYTY_DEBUG_DUMP_THREADS=<seconds>, a helper thread writes the call
+// stacks of all the process's threads to thread-dump-<n>.txt every <seconds>, one "# tid=... name=..."
+// line and one sampler-format stack per thread, to see what a stalled game waits on.
+void StartThreadDumper();
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_THREADSAMPLER_H_

@@ -567,6 +567,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	StartThreadSampler("gpu");
+	StartThreadDumper();
 
 	for (;;) {
 		Submission                   submission;

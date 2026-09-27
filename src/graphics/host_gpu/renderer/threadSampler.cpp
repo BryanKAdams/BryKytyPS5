@@ -23,6 +23,7 @@
 #endif
 #include <windows.h> // IWYU pragma: keep
 #include <psapi.h>
+#include <tlhelp32.h>
 #undef min
 #undef max
 
@@ -163,6 +164,7 @@ private:
 		return stack.count != 0;
 	}
 
+public:
 	struct Module {
 		uint64_t    base = 0;
 		uint64_t    size = 0;
@@ -191,6 +193,7 @@ private:
 		return modules;
 	}
 
+private:
 	void Dump(double seconds) {
 		const auto modules = Modules();
 		const auto frame   = [&](uint64_t address) {
@@ -245,6 +248,99 @@ private:
 	uint32_t                                     m_window  = 0;
 };
 
+// Writes the call stack of every other thread of the process to thread-dump-<index>.txt: a
+// "# tid=<id> name=<description>" line, then "1 <frames>" in the sampler's format. Guest code has
+// no unwind data, so a stack usually ends at the first guest frame after the emulator's own.
+void DumpThreads(uint32_t index) {
+	const auto process = GetCurrentProcessId();
+	const auto self    = GetCurrentThreadId();
+	std::vector<DWORD> ids;
+	if (HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	    snapshot != INVALID_HANDLE_VALUE) {
+		THREADENTRY32 entry {};
+		entry.dwSize = sizeof(entry);
+		for (BOOL more = Thread32First(snapshot, &entry); more;
+		     more      = Thread32Next(snapshot, &entry)) {
+			if (entry.th32OwnerProcessID == process && entry.th32ThreadID != self) {
+				ids.push_back(entry.th32ThreadID);
+			}
+		}
+		CloseHandle(snapshot);
+	}
+	char path[MAX_PATH];
+	std::snprintf(path, sizeof(path), "thread-dump-%03u.txt", index);
+	FILE* file = std::fopen(path, "w");
+	if (file == nullptr) {
+		return;
+	}
+	std::fprintf(file, "# window=%u seconds=0 samples=%zu lost=0 period_us=0\n", index, ids.size());
+	auto       copy    = std::make_unique<uint8_t[]>(StackCopyBytes);
+	const auto modules = ThreadSampler::Modules();
+	for (const auto id: ids) {
+		HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+		                               THREAD_QUERY_LIMITED_INFORMATION,
+		                           FALSE, id);
+		if (thread == nullptr) {
+			continue;
+		}
+		std::string name;
+		PWSTR       description = nullptr;
+		if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+			for (const auto* c = description; *c != 0; c++) {
+				name.push_back(*c < 128 ? static_cast<char>(*c) : '?');
+			}
+			LocalFree(description);
+		}
+		// Nothing may allocate or lock while the thread is suspended: it may hold those locks.
+		CONTEXT context {};
+		context.ContextFlags = CONTEXT_FULL;
+		uint64_t live        = 0;
+		uint64_t size        = 0;
+		if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+			if (GetThreadContext(thread, &context) != 0) {
+				live = context.Rsp;
+				MEMORY_BASIC_INFORMATION region {};
+				if (VirtualQuery(reinterpret_cast<const void*>(live), &region, sizeof(region)) != 0 &&
+				    region.State == MEM_COMMIT) {
+					const auto end = reinterpret_cast<uint64_t>(region.BaseAddress) + region.RegionSize;
+					size           = std::min<uint64_t>(end - live, StackCopyBytes);
+					std::memcpy(copy.get(), reinterpret_cast<const void*>(live), size);
+				}
+			}
+			ResumeThread(thread);
+		}
+		CloseHandle(thread);
+		std::fprintf(file, "# tid=%lu name=%s\n", id, name.empty() ? "-" : name.c_str());
+		if (size == 0) {
+			continue;
+		}
+		Stack      stack;
+		const auto base = reinterpret_cast<uint64_t>(copy.get());
+		RebaseRegisters(context, live, base, size);
+		stack.count = UnwindCopy(&context, live, base, size, stack.frames.data());
+		std::fprintf(file, "1");
+		for (uint32_t i = 0; i < stack.count; i++) {
+			const auto address = stack.frames[i];
+			const ThreadSampler::Module* owner = nullptr;
+			for (const auto& module: modules) {
+				if (address >= module.base && address < module.base + module.size) {
+					owner = &module;
+					break;
+				}
+			}
+			if (owner != nullptr) {
+				std::fprintf(file, "%c%s+0x%llx", i == 0 ? ' ' : ';', owner->name.c_str(),
+				             static_cast<unsigned long long>(address - owner->base));
+			} else {
+				std::fprintf(file, "%c?+0x%llx", i == 0 ? ' ' : ';',
+				             static_cast<unsigned long long>(address));
+			}
+		}
+		std::fputc('\n', file);
+	}
+	std::fclose(file);
+}
+
 } // namespace
 
 void StartThreadSampler(const char* name) {
@@ -272,6 +368,21 @@ void StartThreadSampler(const char* name) {
 	std::printf("thread-sampler: sampling %s every %u us\n", name, period_us);
 }
 
+void StartThreadDumper() {
+	const char* value = std::getenv("KYTY_DEBUG_DUMP_THREADS");
+	if (value == nullptr) {
+		return;
+	}
+	const auto period = std::max(1ul, std::strtoul(value, nullptr, 10));
+	std::thread([period] {
+		for (uint32_t index = 0;; index++) {
+			std::this_thread::sleep_for(std::chrono::seconds(period));
+			DumpThreads(index);
+		}
+	}).detach();
+	std::printf("thread-dumper: dumping all threads every %lu s\n", period);
+}
+
 } // namespace Libs::Graphics
 
 #else
@@ -279,6 +390,7 @@ void StartThreadSampler(const char* name) {
 namespace Libs::Graphics {
 
 void StartThreadSampler(const char* /*name*/) {}
+void StartThreadDumper() {}
 
 } // namespace Libs::Graphics
 
