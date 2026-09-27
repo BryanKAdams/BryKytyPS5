@@ -138,20 +138,19 @@ public:
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		const auto& bits        = GetBits<source>();
-		return RegionBits(bits, start, end).Any();
+		return GetBits<source>().AnyInRange(start, end);
 	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
@@ -186,15 +185,15 @@ public:
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
-		RegionBits mask(bits, start, end);
 		if constexpr (source == DirtySource::Cpu) {
 			// Every CPU-dirty change updates the write protection, so with no dirty page in the
 			// range, clearing it and updating the protection would change nothing. Buffers are
 			// bound per draw, usually clean.
-			if (mask.None()) {
+			if (!bits.AnyInRange(start, end)) {
 				return;
 			}
 		}
+		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			if constexpr (source == DirtySource::Gpu) {
 				Disarm(start, end);
@@ -335,7 +334,7 @@ public:
 			return false;
 		}
 		const auto [start, end] = GetPageRange(vaddr, size);
-		return RegionBits(m_arms->armed, start, end).Any();
+		return m_arms->armed.AnyInRange(start, end);
 	}
 
 	TrackingSpinLock lock;

@@ -66,6 +66,17 @@ void TestMaskedConstructionAndBitwiseOperations() {
   Check(Bits(source, 12, 12).None(), "empty masked constructor produced bits");
   Check(Bits(source, 0, 129).None(),
         "invalid masked constructor produced bits");
+  Check(source.AnyInRange(31, 97) && source.AnyInRange(0, 128) &&
+            source.AnyInRange(127, 128),
+        "AnyInRange missed set bits");
+  Check(!source.AnyInRange(12, 12) && !source.AnyInRange(0, 129) &&
+            !source.AnyInRange(64, 63),
+        "AnyInRange accepted an empty or invalid range");
+  Bits single;
+  single.Set(64);
+  Check(single.AnyInRange(64, 65) && single.AnyInRange(0, 128) &&
+            !single.AnyInRange(0, 64) && !single.AnyInRange(65, 128),
+        "AnyInRange read bits outside its range");
 
   Bits left;
   left.SetRange(0, 80);
@@ -192,11 +203,16 @@ void TestRandomizedDifferential() {
         masked_start +
         static_cast<size_t>(next_random() % (129 - masked_start));
     const Bits masked(bits, masked_start, masked_end);
+    bool masked_any = false;
     for (size_t index = 0; index < reference.size(); index++) {
       Check(masked.Get(index) == (index >= masked_start && index < masked_end &&
                                   reference[index]),
             "randomized masked constructor diverged");
+      masked_any |= masked.Get(index);
     }
+    Check(bits.AnyInRange(masked_start, masked_end) == masked_any &&
+              masked.Any() == masked_any,
+          "randomized AnyInRange diverged from the masked copy");
 
     size_t first_begin = 0;
     while (first_begin < reference.size() && !reference[first_begin]) {
@@ -276,6 +292,23 @@ void TestTrackerSizedRandomizedDifferential() {
     for (size_t index = 0; index < reference.size(); index++) {
       Check(bits.Get(index) == reference[index],
             "tracker-sized randomized bit state diverged");
+    }
+
+    // AnyInRange against the reference, including ranges spanning several words, a single
+    // word's boundaries, and invalid ranges.
+    for (size_t probe = 0; probe < 8; probe++) {
+      const auto begin = static_cast<size_t>(next_random() % (reference.size() + 1));
+      const auto end =
+          begin + static_cast<size_t>(next_random() % (reference.size() + 2 - begin));
+      bool any = false;
+      for (auto index = begin; index < end && index < reference.size(); index++) {
+        any |= reference[index];
+      }
+      const bool valid = begin < end && end <= reference.size();
+      Check(bits.AnyInRange(begin, end) == (valid && any),
+            "tracker-sized AnyInRange diverged");
+      Check(bits.AnyInRange(begin, end) == TrackerBits(bits, begin, end).Any(),
+            "tracker-sized AnyInRange diverged from the masked copy");
     }
 
     size_t expected = 0;
