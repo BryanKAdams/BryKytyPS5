@@ -1059,6 +1059,81 @@ private:
 	uint32_t                     m_next  = 0;
 };
 
+// Ordinary reads by 64-byte block: descriptors and tables are runs of dwords, so a refresh reads
+// each block once. A block the runtime cannot read whole is read dword by dword.
+class OrdinaryBlockCache {
+public:
+	static constexpr uint64_t BlockBytes = 64;
+
+	explicit OrdinaryBlockCache(const SrtRuntime& source): m_source(source) {}
+
+	// Specialization reads keep their reader and userdata.
+	SrtRuntime Runtime() {
+		auto runtime                    = m_source;
+		runtime.specialization_userdata = SpecializationUserdata(m_source);
+		runtime.userdata                = this;
+		runtime.read_memory             = Read;
+		runtime.read_memory_block       = nullptr;
+		return runtime;
+	}
+
+private:
+	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		return static_cast<OrdinaryBlockCache*>(userdata)->Read(address, values);
+	}
+
+	static constexpr uint32_t BlockWords = BlockBytes / sizeof(uint32_t);
+	static constexpr uint32_t Capacity   = 8;
+
+	struct Block {
+		uint64_t                         address = 0;
+		std::array<uint32_t, BlockWords> words;
+		bool                             whole = false;
+	};
+
+	bool Exact(uint64_t address, std::span<uint32_t> values) const {
+		return m_source.read_memory(m_source.userdata, address, values);
+	}
+
+	bool Read(uint64_t address, std::span<uint32_t> values) {
+		const auto block_address = address & ~(BlockBytes - 1u);
+		const auto offset        = address - block_address;
+		if (block_address == 0 || (address & 3u) != 0u || values.empty() ||
+		    values.size_bytes() > BlockBytes - offset) {
+			return Exact(address, values);
+		}
+		Block* block = nullptr;
+		for (uint32_t index = 0; index < m_count; index++) {
+			if (m_blocks[index].address == block_address) {
+				block = &m_blocks[index];
+				break;
+			}
+		}
+		if (block == nullptr) {
+			block  = &m_blocks[m_next];
+			m_next = (m_next + 1u) % Capacity;
+			if (m_count < Capacity) {
+				m_count++;
+			}
+			block->address = block_address;
+			block->whole   = m_source.read_memory_block(m_source.userdata, block_address, block->words);
+		}
+		if (!block->whole) {
+			return Exact(address, values);
+		}
+		const auto* words = block->words.data() + offset / sizeof(uint32_t);
+		for (size_t index = 0; index < values.size(); index++) {
+			values[index] = words[index];
+		}
+		return true;
+	}
+
+	SrtRuntime                  m_source;
+	std::array<Block, Capacity> m_blocks;
+	uint32_t                    m_count = 0;
+	uint32_t                    m_next  = 0;
+};
+
 SrtRuntime ObservedRuntime(const SrtRuntime& runtime, bool capture_reads, ReadCapture& capture) {
 	SrtRuntime observed = runtime;
 	if (capture_reads) {
@@ -1244,7 +1319,11 @@ bool MaterializeCompiled(const ResourcePlan& program, const SrtRuntime& runtime,
 		CleanBlockCache blocks(runtime);
 		const bool      use_blocks = runtime.specialization_block_reads && !capture_reads &&
 		                        runtime.read_specialization_memory != nullptr;
-		const auto   source = use_blocks ? blocks.Runtime() : runtime;
+		const auto         clean_source = use_blocks ? blocks.Runtime() : runtime;
+		OrdinaryBlockCache ordinary(clean_source);
+		const bool         ordinary_blocks = !capture_reads && runtime.read_memory != nullptr &&
+		                             runtime.read_memory_block != nullptr;
+		const auto   source = ordinary_blocks ? ordinary.Runtime() : clean_source;
 		ReadCapture  capture {source, program.specialization_reads};
 		const auto   observed = ObservedRuntime(source, capture_reads, capture);
 		SrtEvaluator clean(program, compiled, CleanRuntime(observed));

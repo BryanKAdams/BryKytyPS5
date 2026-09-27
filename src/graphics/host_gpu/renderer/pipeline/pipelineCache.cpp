@@ -136,6 +136,12 @@ bool ReadShaderGuestMemoryOnGpuThread(void*, uint64_t address, std::span<uint32_
 	return true;
 }
 
+// A whole 64-byte block for the reads above, when each of them would be a plain copy.
+bool ReadShaderGuestBlockOnGpuThread(void*, uint64_t address, std::span<uint32_t> values) {
+	return Libs::LibKernel::Memory::TryReadGuestPlainOnGpuThread(address, values.data(),
+	                                                             values.size_bytes());
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -618,6 +624,7 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    // TryReadGpuCleanBacking fails for a range when any byte is GPU-dirty or unbacked.
 		    .specialization_block_reads = true,
+		    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,
 		};
 		if (entry != programs.end()) {
 			auto& source = entry->second;

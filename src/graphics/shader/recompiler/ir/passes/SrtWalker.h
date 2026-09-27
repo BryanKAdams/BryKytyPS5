@@ -23,6 +23,9 @@ struct SrtRuntime {
 	bool                      specialization_block_reads = false;
 	// Userdata for read_specialization_memory; null means userdata.
 	void*                     specialization_userdata    = nullptr;
+	// Optional: reads an aligned, nonzero 64-byte block for read_memory (with userdata) only when
+	// reading each of its dwords with read_memory would give the same values; false otherwise.
+	SrtMemoryReader           read_memory_block          = nullptr;
 };
 
 [[nodiscard]] inline void* SpecializationUserdata(const SrtRuntime& runtime) {

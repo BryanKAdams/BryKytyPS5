@@ -947,6 +947,17 @@ void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
 	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
 }
 
+bool TryReadGuestPlainOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
+	if (size != 0 && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread()) {
+		const auto& buffers = GetGpuResources().GetBufferCache();
+		if (buffers.IsPageGpuDirtyHint(vaddr) || buffers.IsPageGpuDirtyHint(vaddr + size - 1)) {
+			return false;
+		}
+	}
+	std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+	return true;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
