@@ -21,6 +21,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <span>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -2137,6 +2138,46 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
+}
+
+bool IndirectRegistersKnown(uint32_t opcode, std::span<const uint32_t> pairs) {
+	// As CpOpIndirectCxRegs, CpOpIndirectShRegs and CpOpIndirectUcRegs skip or dispatch each pair.
+	for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+		const auto raw_cmd_offset = pairs[i];
+		const auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
+		const auto value          = pairs[i + 1];
+		switch (opcode) {
+			case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+				if (HwCtxIsFakeRegister(cmd_offset) || raw_cmd_offset == 0xffffffffu ||
+				    cmd_offset >= Pm4::CX_NUM) {
+					continue;
+				}
+				if (g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)] == nullptr &&
+				    !(raw_cmd_offset == 0x24au && value == 0u)) {
+					return false;
+				}
+				break;
+			case Pm4::IT_SET_SH_REG_INDIRECT:
+				if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
+					continue;
+				}
+				if (cmd_offset >= Pm4::SH_NUM || g_hw_sh_indirect_func[cmd_offset] == nullptr) {
+					return false;
+				}
+				break;
+			case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+				if (cmd_offset == Pm4::UC_NOP) {
+					continue;
+				}
+				if (cmd_offset >= Pm4::UC_NUM ||
+				    g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)] == nullptr) {
+					return false;
+				}
+				break;
+			default: return false;
+		}
+	}
+	return true;
 }
 
 KYTY_CP_OP_PARSER(CpOpMarker) {

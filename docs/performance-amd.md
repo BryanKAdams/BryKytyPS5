@@ -593,6 +593,52 @@ for the level's own frame rate (three seconds under 40 fps). A 60.0 fps sample i
 the level. Game runs share one
 GPU and window: sessions take `C:\Games\runs\RUN.lock` before launching or building.
 
+### Preparing draws ahead
+
+The per-draw shader resource refresh (`ps-program` and `vs-program`, about 2.3 µs of 9 µs a draw)
+now mostly runs on a second thread. `DrawSpeculator` copies the GPU thread's register state
+when a submission starts or resumes. It then walks the draw stream ahead of the GPU thread,
+replaying register writes as the pipeline look-ahead does, and refreshes each draw's vertex and
+pixel resources (`PipelineCache::SpeculateGraphicsPrograms`). It reads guest memory only
+through the backing, and it logs every read.
+
+When the GPU thread reaches the draw, it adopts the prepared resources only under two
+conditions:
+- The program source, user data and shader base are the same.
+- Every logged read, made again through the GPU thread's own readers, gives the same result
+  (`ReadsUnchanged`).
+
+A refresh depends on nothing else, so an adopted refresh is exactly what the GPU thread would
+have produced itself. Anything that changed in between (CPU writes, GPU writes, a wrong
+register replay) only makes the GPU thread refresh inline, as before.
+
+The walk handles these cases:
+- It stops at predicated packets, branches, COND_EXEC and REWIND.
+- It replays SET_*_REG_INDIRECT tables from copies (`IndirectRegistersKnown` rejects any table
+  the handlers would exit on).
+- For a table not written yet, it waits until the GPU thread has run past it.
+
+Sky Garden level start, separate runs of one build:
+
+| | inline | prepared ahead |
+| --- | --- | --- |
+| fps | 20.1 | 23.5 |
+| µs per draw | 9.04 | 7.59 |
+| ps-program / vs-program (µs) | 1.51 / 0.78 | 0.47 / 0.31 |
+
+About 98% of stages are adopted. `KYTY_VERIFY_SPEC=1` refreshes every adopted stage inline too
+and exits on any difference. It checked 17 million adoptions from boot through the overworld
+and Sky Garden, and 5.5 million in a cold new game at the crash site, without one.
+
+Waking the worker after every draw cost the GPU thread about 60 ms a second in kernel calls,
+so it now sleeps until half its 32-draw ring is free.
+
+The switch is "Prepare draws ahead" in the settings panel (`speculative-draws` in the settings
+file, `--speculative-draws`), and it is on by default. Other switches:
+- `KYTY_SPECULATE_DRAWS=0` or `1` overrides it for A/B runs.
+- `KYTY_DEBUG_AB=specprep` alternates adoption within one run.
+- `KYTY_DEBUG_SPEC_STATS=1` prints the walk's and adoption's counters.
+
 ## First-use stutter (pipeline compiles)
 
 `--drain-stats` prints a `hitch:` line for every game frame of 50 ms or more, listing what was

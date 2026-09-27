@@ -473,7 +473,7 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
       m_context(AcquireContext(program)) {}
 
-SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
+SrtWalker::~SrtWalker() { --m_program.ThreadScratch().evaluation_depth; }
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	uint64_t wide = 0;
@@ -485,10 +485,11 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 }
 
 ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& program) {
-	if (program.evaluation_depth == program.evaluation_contexts.size()) {
-		program.evaluation_contexts.emplace_back();
+	auto& scratch = program.ThreadScratch();
+	if (scratch.evaluation_depth == scratch.evaluation_contexts.size()) {
+		scratch.evaluation_contexts.emplace_back();
 	}
-	auto& context = program.evaluation_contexts[program.evaluation_depth++];
+	auto& context = scratch.evaluation_contexts[scratch.evaluation_depth++];
 	context.generation += 2;
 	return context;
 }
@@ -1013,15 +1014,15 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	// Conditions over flat SRT slots use this walker; see CompiledResourcePlan.
 	const auto& direct = CompileResourcePlan(m_program).direct_conditions;
 	auto&       strict = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-	auto&       active = m_program.active_sources;
+	auto&       active = m_program.ThreadScratch().active_sources;
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow) {
 		for (const auto source: block.sources) {
 			active.at(source) = 0u;
 		}
 	}
-	auto& visited = m_program.visited_blocks;
-	auto& pending = m_program.pending_blocks;
+	auto& visited = m_program.ThreadScratch().visited_blocks;
+	auto& pending = m_program.ThreadScratch().pending_blocks;
 	visited.assign(m_program.control_flow.size(), 0u);
 	pending.clear();
 	pending.push_back(0u);
@@ -1668,7 +1669,7 @@ SrtEvaluator::SrtEvaluator(const ResourcePlan& program, const CompiledResourcePl
 	m_generation = m_context.generation;
 }
 
-SrtEvaluator::~SrtEvaluator() { --m_program.evaluation_depth; }
+SrtEvaluator::~SrtEvaluator() { --m_program.ThreadScratch().evaluation_depth; }
 
 bool SrtEvaluator::Evaluate(uint32_t node, uint32_t& result) {
 	uint64_t wide = 0;
@@ -2061,7 +2062,7 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
-	auto&      active    = m_program.active_sources;
+	auto&      active    = m_program.ThreadScratch().active_sources;
 	auto&      strict    = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 	const bool evaluates = m_runtime.read_specialization_memory != nullptr;
 	const auto outcome   = [&](uint32_t index) -> uint8_t {
@@ -2077,15 +2078,15 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 	// ResourcePlan::ActiveTreeNode) with this refresh's outcomes; reaching a leaf means the walk
 	// would visit the same blocks and find the same sources.
 	using TreeNode = ResourcePlan::ActiveTreeNode;
-	auto& tree     = m_program.active_tree;
-	auto& trace    = m_program.active_trace;
+	auto& tree     = m_program.ThreadScratch().active_tree;
+	auto& trace    = m_program.ThreadScratch().active_trace;
 	if (evaluates && !tree.empty()) {
 		uint32_t node = 0;
 		while (node != TreeNode::None && tree[node].block != TreeNode::None) {
 			node = tree[node].next[outcome(tree[node].block)];
 		}
 		if (node != TreeNode::None && tree[node].sources != TreeNode::None) {
-			const auto first = m_program.active_tree_sources.begin() + tree[node].sources;
+			const auto first = m_program.ThreadScratch().active_tree_sources.begin() + tree[node].sources;
 			const auto count = static_cast<ptrdiff_t>(m_program.descriptor_sources.size());
 			active.assign(first, first + count);
 			return active;
@@ -2102,8 +2103,8 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 			}
 		}
 	}
-	auto&      visited     = m_program.visited_blocks;
-	auto&      pending     = m_program.pending_blocks;
+	auto&      visited     = m_program.ThreadScratch().visited_blocks;
+	auto&      pending     = m_program.ThreadScratch().pending_blocks;
 	const auto block_count = m_program.control_flow.size();
 	// Most plans have at most 64 blocks; track those in a mask instead of clearing a vector.
 	const bool small       = block_count <= 64u;
@@ -2151,7 +2152,7 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 	}
 	// Add this walk to the tree, up to a bound on its size.
 	constexpr size_t MaxTreeNodes = 4096;
-	auto&            sources      = m_program.active_tree_sources;
+	auto&            sources      = m_program.ThreadScratch().active_tree_sources;
 	if (evaluates && active.size() == m_program.descriptor_sources.size() &&
 	    tree.size() + trace.size() + 1u <= MaxTreeNodes) {
 		if (tree.empty()) {

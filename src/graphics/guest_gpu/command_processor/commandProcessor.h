@@ -9,10 +9,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+class DrawSpeculator;
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
@@ -72,9 +75,8 @@ public:
 		int64_t flip_arg  = 0;
 	};
 
-	CommandProcessor(RenderContext& renderer, int interrupt_event_id)
-	    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
-	~CommandProcessor() = default;
+	CommandProcessor(RenderContext& renderer, int interrupt_event_id);
+	~CommandProcessor();
 
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
@@ -172,8 +174,12 @@ public:
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	// Process is about to run the constant engine's stream (no draws to speculate) or not.
+	void SetConstantStream(bool constant) { m_constant_stream = constant; }
 
 private:
+	friend class DrawSpeculator;
+
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
@@ -192,6 +198,8 @@ private:
 	void LookaheadPass(const Pm4Execution& execution, ProgramWait wait, uint32_t& draws,
 	                   uint32_t& parts, bool& pending);
 	void SuspendPm4();
+	// Starts the draw speculation walk at the current packet (see DrawSpeculator).
+	void RestartSpeculation(const Pm4Execution& execution);
 	void SynchronizePredicate(uint64_t address, uint64_t size);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
@@ -234,6 +242,10 @@ private:
 	// Pipelines created while processing the current and the previous submission.
 	uint64_t  m_submission_created_start    = 0;
 	uint64_t  m_last_submission_created     = 0;
+	// Speculates the resources of this queue's draws ahead of it (KYTY_SPECULATE_DRAWS=1).
+	std::unique_ptr<DrawSpeculator> m_speculator;
+	// Process is running the constant engine's stream, which has no draws to speculate.
+	bool                            m_constant_stream = false;
 };
 
 } // namespace Libs::Graphics

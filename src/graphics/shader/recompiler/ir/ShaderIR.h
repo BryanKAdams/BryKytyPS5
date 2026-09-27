@@ -676,15 +676,8 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
-	mutable std::deque<EvaluationContext> evaluation_contexts;
+	// Reference walker instruction indices (GPU thread only; see Inst::EvaluationIndex).
 	mutable uint32_t                       evaluation_value_count = 0;
-	mutable uint32_t                       evaluation_depth       = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
-	mutable std::vector<uint32_t>           material_keys;
-	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	mutable std::unique_ptr<CompiledResourcePlan> compiled;
 	// SrtEvaluator::FindActiveSources replay. A walk evaluates conditions in an order fixed by the
 	// outcomes so far, so the walks seen form a tree: a node names the block whose condition comes
@@ -700,10 +693,31 @@ struct ResourcePlan {
 		std::array<uint32_t, 3> next    = {None, None, None};
 		uint32_t                sources = None; // Offset in active_tree_sources.
 	};
-	mutable std::vector<ActiveTraceStep> active_trace;
-	mutable std::vector<ActiveTreeNode>  active_tree;
-	mutable std::vector<uint8_t>         active_tree_sources;
+	// Evaluation scratch: nested clean/EXEC memos, activity, material keys and the learned walk
+	// tree. Each thread that refreshes plans uses its own slot (see ResourceScratchSlot).
+	struct Scratch {
+		std::deque<EvaluationContext>                 evaluation_contexts;
+		uint32_t                                      evaluation_depth = 0;
+		std::vector<uint8_t>                          active_sources;
+		std::vector<uint8_t>                          visited_blocks;
+		std::vector<uint32_t>                         pending_blocks;
+		std::vector<uint32_t>                         material_keys;
+		std::vector<std::pair<uint64_t, uint64_t>>    specialization_reads;
+		std::vector<ActiveTraceStep>                  active_trace;
+		std::vector<ActiveTreeNode>                   active_tree;
+		std::vector<uint8_t>                          active_tree_sources;
+	};
+	static constexpr uint32_t ScratchSlots = 2;
+	mutable std::array<Scratch, ScratchSlots> scratch;
+	[[nodiscard]] Scratch& ThreadScratch() const;
 };
+
+// The calling thread's ResourcePlan::Scratch slot: 0 for the GPU thread (and tests), others for
+// threads that refresh plans ahead of it. A slot must be used by one thread at a time.
+inline thread_local uint32_t t_resource_scratch_slot = 0;
+inline ResourcePlan::Scratch& ResourcePlan::ThreadScratch() const {
+	return scratch[t_resource_scratch_slot];
+}
 
 struct Program: ResourcePlan {
 	Program() = default;

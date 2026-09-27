@@ -1063,6 +1063,8 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
     // reference walker exactly, including which plans fail.
     std::vector<uint8_t> usable(plans.size(), 0);
     uint32_t usable_count = 0, mismatches = 0, memo_hits = 0;
+    uint32_t logged_refused = 0, replay_failures = 0, replays_kept = 0,
+             replays_rejected = 0, replay_unsound = 0;
     uint64_t reference_direct = 0, reference_clean = 0, compiled_direct = 0,
              compiled_clean = 0;
     for (size_t i = 0; i < plans.size(); ++i) {
@@ -1097,6 +1099,37 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
           match = match && memo_ok == ok &&
                   (!ok || same(expected, expected_spec, memo_snapshot, memo_spec));
         }
+        // Logged refresh (speculative preparation): the same result, reads that
+        // replay unchanged on the same memory, and no replay that passes while
+        // a refresh on changed memory would differ.
+        if (ok) {
+          IR::ReadLog log;
+          IR::ResourceSnapshot logged;
+          IR::ResourceSpecialization logged_spec;
+          const bool logged_ok = IR::MaterializeResourcesLogged(
+              plans[i].plan, runtime_for(plans[i], set), logged, logged_spec,
+              log);
+          if (!logged_ok) {
+            logged_refused++;
+          } else {
+            match = match && same(expected, expected_spec, logged, logged_spec);
+            replay_failures +=
+                !IR::ReadsUnchanged(log, runtime_for(plans[i], set));
+            memory.pattern = pattern + 7u;
+            if (IR::ReadsUnchanged(log, runtime_for(plans[i], set))) {
+              replays_kept++;
+              IR::ResourceSnapshot fresh;
+              IR::ResourceSpecialization fresh_spec;
+              const bool fresh_ok = IR::MaterializeResources(
+                  plans[i].plan, runtime_for(plans[i], set), fresh, fresh_spec);
+              replay_unsound +=
+                  !fresh_ok || !same(logged, logged_spec, fresh, fresh_spec);
+            } else {
+              replays_rejected++;
+            }
+            memory.pattern = pattern;
+          }
+        }
         if (!match && mismatches++ < 8) {
           std::printf("[host]    %s: pattern %u set %u: MISMATCH for %s "
                       "hash=0x%016llx (reference %s)\n",
@@ -1123,6 +1156,61 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
                 static_cast<unsigned long long>(compiled_clean / 2));
     Require(name, "compiled evaluator", mismatches == 0,
             "compiled materialization differs from the reference walker");
+    std::printf("[host]    %s: pattern %u: logged refresh refused=%u; replay "
+                "same memory failed=%u, changed memory kept=%u rejected=%u "
+                "unsound=%u\n",
+                name, pattern, logged_refused, replay_failures, replays_kept,
+                replays_rejected, replay_unsound);
+    Require(name, "read replay", replay_failures == 0 && replay_unsound == 0,
+            "a logged refresh's reads did not replay exactly");
+
+    // A second thread refreshes every plan through its own scratch slot while
+    // this one does too; both must match single-threaded results.
+    if (pattern == 1u) {
+      std::vector<IR::ResourceSnapshot> worker_snapshots(plans.size());
+      std::vector<IR::ResourceSpecialization> worker_specs(plans.size());
+      std::vector<uint8_t> worker_ok(plans.size(), 0);
+      std::thread worker([&] {
+        IR::t_resource_scratch_slot = 1;
+        SrtFakeMemory worker_memory;
+        worker_memory.pattern = pattern;
+        for (int round = 0; round < 20; ++round) {
+          for (size_t i = 0; i < plans.size(); ++i) {
+            auto runtime = runtime_for(plans[i], 0);
+            runtime.userdata = &worker_memory;
+            IR::ReadLog log;
+            worker_ok[i] = IR::MaterializeResourcesLogged(
+                plans[i].plan, runtime, worker_snapshots[i], worker_specs[i],
+                log);
+          }
+        }
+      });
+      uint32_t local_mismatches = 0;
+      for (int round = 0; round < 20; ++round) {
+        for (size_t i = 0; i < plans.size(); ++i) {
+          IR::ResourceSnapshot snapshot;
+          IR::ResourceSpecialization spec;
+          (void)IR::MaterializeResources(plans[i].plan, runtime_for(plans[i], 0),
+                                         snapshot, spec);
+        }
+      }
+      worker.join();
+      for (size_t i = 0; i < plans.size(); ++i) {
+        if (!worker_ok[i]) {
+          continue;
+        }
+        IR::ResourceSnapshot snapshot;
+        IR::ResourceSpecialization spec;
+        const bool ok = IR::MaterializeResources(
+            plans[i].plan, runtime_for(plans[i], 0), snapshot, spec);
+        local_mismatches +=
+            !ok || !same(snapshot, spec, worker_snapshots[i], worker_specs[i]);
+      }
+      std::printf("[host]    %s: two-thread refresh mismatches=%u\n", name,
+                  local_mismatches);
+      Require(name, "scratch slots", local_mismatches == 0,
+              "a refresh on a second scratch slot differs");
+    }
 
     // Timing: each pass refreshes every usable plan once, like one stage of
     // each distinct shader per frame. Batches rotate the variant order.

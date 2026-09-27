@@ -26,8 +26,10 @@ namespace Libs::Graphics {
 struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
+class BufferCache;
 class CommandBuffer;
 class PipelineLibraryCache;
+struct SpeculatedDraw;
 
 namespace ShaderPrecompile {
 struct PermutationRecord;
@@ -206,6 +208,17 @@ public:
 	uint32_t PrefetchGraphicsPipeline(const HW::Context& ctx, const HW::Shader& sh,
 	                                  const HW::UserConfig& user_config, ProgramWait wait,
 	                                  bool* pending);
+	// On the draw speculation thread (see DrawSpeculator): refreshes the resources of the vertex
+	// (or mesh) and pixel stages a non-tessellated draw with these registers will look up, for the
+	// GPU thread to adopt (see SpeculatedDraw). Reads guest memory through the backing only,
+	// skipping pages `buffers` hints are GPU-dirty. Stages of program sources not seen yet are
+	// left out. Returns whether any stage was refreshed.
+	bool SpeculateGraphicsPrograms(const HW::Context& ctx, const HW::Shader& sh,
+	                               const HW::UserConfig& user_config, const BufferCache& buffers,
+	                               SpeculatedDraw& draw);
+	// Why speculated stages failed so far: the draw looks no programs up, the stage's source was
+	// never seen, its first refresh is still pending, or the refresh failed.
+	[[nodiscard]] std::array<uint64_t, 4> SpeculationFailures() const noexcept;
 	// Compute pipelines created so far, for the same purpose.
 	[[nodiscard]] uint64_t ComputePipelinesCreated() const noexcept {
 		return m_compute_pipelines_created;

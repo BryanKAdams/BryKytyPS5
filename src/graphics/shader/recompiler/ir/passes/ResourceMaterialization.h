@@ -57,6 +57,38 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           MaterializationMemo* memo = nullptr);
 
+// The guest reads one refresh made through its runtime's readers, in order, with their results.
+struct ReadLog {
+	enum class Reader : uint8_t { Ordinary, OrdinaryBlock, Specialization };
+	struct Entry {
+		uint64_t address = 0;
+		uint32_t first   = 0; // Into words.
+		uint32_t count   = 0; // Dwords.
+		Reader   reader  = Reader::Ordinary;
+		bool     ok      = false;
+	};
+
+	std::vector<Entry>    entries;
+	std::vector<uint32_t> words;
+
+	void Clear() {
+		entries.clear();
+		words.clear();
+	}
+};
+
+// MaterializeResources without a memo, logging every read it makes through runtime's readers.
+// Plans that capture their reads (masked indirect images beside written buffers) are refused.
+bool MaterializeResourcesLogged(const ResourcePlan& program, const SrtRuntime& runtime,
+                                ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                                ReadLog& log);
+
+// Whether every logged read, made again through runtime's readers, fails as it failed or reads
+// the same dwords. A refresh is a function of its plan, user data, shader base and read results,
+// so a refresh with this runtime (the same plan, user data and shader base) would then produce
+// the logged refresh's snapshot and specialization.
+bool ReadsUnchanged(const ReadLog& log, const SrtRuntime& runtime);
+
 // The SrtWalker implementation that MaterializeResources must match.
 bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
                                    ResourceSnapshot&       snapshot,

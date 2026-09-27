@@ -12,7 +12,9 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/drawSpeculation.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -38,6 +40,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -140,6 +143,19 @@ bool ReadShaderGuestMemoryOnGpuThread(void*, uint64_t address, std::span<uint32_
 bool ReadShaderGuestBlockOnGpuThread(void*, uint64_t address, std::span<uint32_t> values) {
 	return Libs::LibKernel::Memory::TryReadGuestPlainOnGpuThread(address, values.data(),
 	                                                             values.size_bytes());
+}
+
+// The draw speculation thread's reader for all three kinds of read (userdata: the BufferCache).
+// It reads the backing only, since a guest address can fault, and fails on pages the lock-free
+// hint calls GPU-dirty. Its results only matter when adoption on the GPU thread repeats the read
+// through the readers above and gets the same result.
+bool ReadShaderGuestMemoryAhead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const auto* buffers = static_cast<const BufferCache*>(userdata);
+	if (values.empty() || buffers->IsPageGpuDirtyHint(address) ||
+	    buffers->IsPageGpuDirtyHint(address + values.size_bytes() - 1u)) {
+		return false;
+	}
+	return Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes());
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -325,6 +341,9 @@ struct PipelineCache::ProgramCache {
 		uint32_t                                    last_push_cursor = 0;
 		bool                                        skip_dispatch = false;
 		std::vector<PendingPermutation>             pending;
+		// Set once a GPU-thread refresh succeeded (its plan is compiled): only then may the draw
+		// speculation thread refresh this plan (see Speculate).
+		std::atomic<bool>                           speculable {false};
 	};
 
 	struct ProgramKeyHash {
@@ -628,9 +647,15 @@ struct PipelineCache::ProgramCache {
 		};
 		if (entry != programs.end()) {
 			auto& source = entry->second;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    source.resource_plan, runtime, source.resources, source.specialization,
-			    &source.memo));
+			if (!AdoptSpeculation(source, stage, user_data, params.Base(), runtime, wait)) {
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    source.resource_plan, runtime, source.resources, source.specialization,
+				    &source.memo));
+				// Sources the precompile replay inserted get here for their first refresh.
+				if (!source.speculable.load(std::memory_order_relaxed)) {
+					source.speculable.store(true, std::memory_order_release);
+				}
+			}
 			if (stats_enabled) {
 				CountRefresh(source);
 			}
@@ -701,15 +726,20 @@ struct PipelineCache::ProgramCache {
 				translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			}
 			if (translated->skip_dispatch) {
+				std::unique_lock lock(programs_mutex);
 				entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
 				entry->second.skip_dispatch = true;
 				return {};
 			}
-			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated->program)).first;
+			{
+				std::unique_lock lock(programs_mutex);
+				entry = programs.try_emplace(lookup_key,
+				    ShaderRecompiler::IR::ExtractResourcePlan(translated->program)).first;
+			}
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization, &entry->second.memo));
+			entry->second.speculable.store(true, std::memory_order_release);
 		}
 		auto& source = entry->second;
 
@@ -784,6 +814,139 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// On the draw speculation thread: refreshes a known source's resources for a future draw
+	// into `out`, logging its reads (see SpeculatedStage). Insertions into programs (the GPU
+	// thread's and the precompile replay's) hold programs_mutex. A source is refreshed only once
+	// a GPU-thread refresh succeeded (its plan is compiled), through the caller's plan scratch slot.
+	template <typename InputInfo>
+	bool Speculate(const ShaderParams& params, const InputInfo& input_info, ShaderType stage,
+	               const BufferCache& buffers, SpeculatedStage& out) {
+		thread_local ProgramKey key;
+		key.stage           = stage;
+		key.hash            = params.hash;
+		key.user_data_count = params.user_data_count;
+		key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, key.static_state);
+		SourceEntry* source = nullptr;
+		{
+			std::shared_lock lock(programs_mutex);
+			if (auto entry = programs.find(key); entry != programs.end()) {
+				source = &entry->second;
+			}
+		}
+		if (source == nullptr || !source->speculable.load(std::memory_order_acquire)) {
+			speculation_failures[source == nullptr ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+			return false;
+		}
+		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		const ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = user_data,
+		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryAhead,
+		    .userdata                   = const_cast<BufferCache*>(&buffers),
+		    .read_specialization_memory = ReadShaderGuestMemoryAhead,
+		    .specialization_block_reads = true,
+		    .read_memory_block          = ReadShaderGuestMemoryAhead,
+		};
+		if (!ShaderRecompiler::IR::MaterializeResourcesLogged(source->resource_plan, runtime,
+		                                                      out.snapshot, out.specialization,
+		                                                      out.reads)) {
+			speculation_failures[3].fetch_add(1, std::memory_order_relaxed);
+			return false;
+		}
+		out.user_data.assign(user_data.begin(), user_data.end());
+		out.shader_base = params.Base();
+		out.source      = source;
+		return true;
+	}
+
+	// The GPU thread's current draw was speculated: takes the stage's resources instead of
+	// refreshing when they are what a refresh would produce now. That holds when the source, user
+	// data and shader base are the same and every read the speculation made gives the same result
+	// again. KYTY_DEBUG_AB=specprep refreshes instead in every other window.
+	bool AdoptSpeculation(SourceEntry& source, ShaderType stage, std::span<const uint32_t> user_data,
+	                      uint64_t shader_base, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                      ProgramWait wait) {
+		if (wait == ProgramWait::Prefetch || stage == ShaderType::Compute) {
+			return false;
+		}
+		auto* draw         = t_speculated_draw;
+		auto* stage_result = draw == nullptr ? nullptr
+		                     : &draw->stages[stage == ShaderType::Pixel ? SpeculatedDraw::Pixel
+		                                                                : SpeculatedDraw::Vertex];
+		static const bool ab      = AbSelected("specprep");
+		bool              adopted = false;
+		if (stage_result == nullptr || stage_result->source == nullptr) {
+			speculation.unspeculated++;
+		} else {
+			const bool same_inputs = stage_result->source == &source &&
+			                         stage_result->shader_base == shader_base &&
+			                         std::ranges::equal(stage_result->user_data, user_data);
+			// One adoption per stage: a second lookup of this stage in the draw refreshes.
+			stage_result->source = nullptr;
+			if (!same_inputs) {
+				speculation.mismatched++;
+			} else if (ab && AbFeatureOff()) {
+				speculation.skipped++;
+			} else if (!ShaderRecompiler::IR::ReadsUnchanged(stage_result->reads, runtime)) {
+				speculation.changed++;
+			} else {
+				std::swap(source.resources, stage_result->snapshot);
+				std::swap(source.specialization, stage_result->specialization);
+				source.memo.valid  = false;
+				source.memo.reused = false;
+				speculation.adopted++;
+				adopted = true;
+				if (verify_speculation) {
+					VerifyAdoption(source, runtime);
+				}
+			}
+		}
+		if (speculation_stats && (++speculation.stages % 100000u) == 0) {
+			std::printf("draw-speculation: stages=%llu adopted=%llu changed=%llu mismatched=%llu "
+			            "unspeculated=%llu skipped=%llu\n",
+			            static_cast<unsigned long long>(speculation.stages),
+			            static_cast<unsigned long long>(speculation.adopted),
+			            static_cast<unsigned long long>(speculation.changed),
+			            static_cast<unsigned long long>(speculation.mismatched),
+			            static_cast<unsigned long long>(speculation.unspeculated),
+			            static_cast<unsigned long long>(speculation.skipped));
+		}
+		return adopted;
+	}
+
+	// KYTY_VERIFY_SPEC=1: an adopted refresh must equal a refresh made now.
+	static void VerifyAdoption(const SourceEntry&                      source,
+	                           const ShaderRecompiler::IR::SrtRuntime& runtime) {
+		ShaderRecompiler::IR::ResourceSnapshot       snapshot;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		const bool ok = ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime,
+		                                                           snapshot, specialization);
+		const auto& adopted = source.resources;
+		const char* field   = nullptr;
+		if (!ok) {
+			field = "result";
+		} else if (snapshot.buffers != adopted.buffers) {
+			field = "buffers";
+		} else if (snapshot.images != adopted.images) {
+			field = "images";
+		} else if (snapshot.samplers != adopted.samplers) {
+			field = "samplers";
+		} else if (snapshot.flattened_srt != adopted.flattened_srt) {
+			field = "flattened SRT";
+		} else if (snapshot.user_data != adopted.user_data) {
+			field = "user data";
+		} else if (snapshot.uniform_fill != adopted.uniform_fill) {
+			field = "uniform fill";
+		} else if (specialization != source.specialization) {
+			field = "specialization";
+		}
+		if (field != nullptr) {
+			EXIT("draw speculation adopted a stale refresh: hash=0x%016llx field=%s\n",
+			     static_cast<unsigned long long>(source.resource_plan.shader_hash), field);
+		}
+	}
+
 	// KYTY_PERMUTATION_LOG: why this lookup compiles: a new shader, a new static state of a
 	// known one (and which static words differ), or a new specialization of a known source.
 	template <typename Iterator>
@@ -850,7 +1013,9 @@ struct PipelineCache::ProgramCache {
 		if (enabled("KYTY_VERIFY_SRT")) {
 			ShaderRecompiler::IR::SetResourceMaterializationVerification(true);
 		}
-		stats_enabled = enabled("KYTY_SRT_STATS");
+		stats_enabled      = enabled("KYTY_SRT_STATS");
+		speculation_stats  = enabled("KYTY_DEBUG_SPEC_STATS");
+		verify_speculation = enabled("KYTY_VERIFY_SPEC");
 		if (const char* runs = std::getenv("KYTY_DEBUG_SRT_RUNS");
 		    runs != nullptr && std::strcmp(runs, "0") == 0) {
 			ShaderRecompiler::IR::SetFlatRunReads(false);
@@ -886,6 +1051,22 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	// The GPU thread inserts into programs under this lock, and the draw speculation thread looks
+	// up under it. Entries are never removed while both run.
+	std::shared_mutex                                             programs_mutex;
+	// Adoption counts (GPU thread), printed every 100000 stages with KYTY_DEBUG_SPEC_STATS=1.
+	struct {
+		uint64_t stages       = 0;
+		uint64_t adopted      = 0;
+		uint64_t changed      = 0;
+		uint64_t mismatched   = 0;
+		uint64_t unspeculated = 0;
+		uint64_t skipped      = 0;
+	} speculation;
+	bool speculation_stats  = false;
+	bool verify_speculation = false;
+	// See PipelineCache::SpeculationFailures (index 0 is counted there).
+	std::array<std::atomic<uint64_t>, 4> speculation_failures {};
 	// New sources translating on worker threads.
 	std::unordered_map<ProgramKey, std::future<ShaderRecompiler::TranslateResult>, ProgramKeyHash>
 	    pending_sources;
@@ -1161,6 +1342,7 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 			continue;
 		}
 		if (entry == m_program_cache->programs.end()) {
+			std::unique_lock insert_lock(m_program_cache->programs_mutex);
 			entry = m_program_cache->programs.try_emplace(std::move(key), std::move(*result.plan))
 			            .first;
 		}
@@ -1239,13 +1421,14 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
-PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
-    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
-    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+// GetGraphicsPrograms' stage inputs and lookup parameters for these registers.
+static std::array<ShaderParams, 3> PrepareGraphicsStages(
+    const GraphicContext& graphics, const HW::VertexShaderInfo& vertex_regs,
+    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+    const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
-    ProgramWait wait) {
-	WaitForPrecompile();
+    ShaderParams& pixel_params) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -1255,10 +1438,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		EXIT_NOT_IMPLEMENTED(!graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
-		mesh.host_subgroup_size = m_graphics.subgroup_size;
-		const auto& limits      = m_graphics.mesh_shader_properties;
+		mesh.host_subgroup_size = graphics.subgroup_size;
+		const auto& limits      = graphics.mesh_shader_properties;
 		const auto  logical_threads =
 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
 		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
@@ -1273,7 +1456,6 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::VertexParams);
-	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		const auto& blend          = context.GetBlendControl(0);
@@ -1294,7 +1476,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
-		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
+		const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;
 		auto&       clip     = vertex_info[tess_active ? 2u : 0u].clip_space;
 		clip.scale[0]        = viewport.xscale;
 		clip.scale[1]        = viewport.yscale;
@@ -1307,6 +1489,23 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.enabled = true;
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::PixelParams);
+	return vertex_params;
+}
+
+PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    ProgramWait wait) {
+	WaitForPrecompile();
+	const bool   tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	ShaderParams pixel_params;
+	const auto   vertex_params =
+	    PrepareGraphicsStages(m_graphics, vertex_regs, pixel_regs, sh, context, user_config,
+	                          target_export_mapping, pixel_active, vertex_info, pixel_info,
+	                          pixel_params);
+	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
@@ -1597,21 +1796,19 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	return iter->second.get();
 }
 
-uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const HW::Shader& sh,
-                                                 const HW::UserConfig& user_config,
-                                                 ProgramWait wait, bool* pending) {
-	KYTY_PROFILER_FUNCTION();
-	if (m_libraries == nullptr || !Config::PipelineLibrariesEnabled()) {
-		return 0;
-	}
+// Whether a draw with these registers looks its programs up (GetGraphicsPrograms), as the draw
+// path decides, and with which pixel stage activity and render target export mappings.
+static bool PredictGraphicsDraw(
+    const HW::Context& ctx, const HW::Shader& sh, const HW::UserConfig& user_config,
+    bool&                                                                       ps_active,
+    std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>& export_mapping) {
 	const auto& vs = sh.GetVs();
 	const auto& ps = sh.GetPs();
 	if (vs.es_regs.data_addr == 0) {
-		return 0;
+		return false;
 	}
 	// Only primitive types the draw path accepts; RectList pipelines stay monolithic.
-	const auto prim_type = user_config.GetPrimType();
-	switch (prim_type) {
+	switch (user_config.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
 		case Prospero::PrimitiveType::kLineStrip:
@@ -1621,17 +1818,17 @@ uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const H
 		case Prospero::PrimitiveType::kQuadListLegacy: break;
 		case Prospero::PrimitiveType::kPatch:
 			if (!Config::TessellationEnabled()) {
-				return 0;
+				return false;
 			}
 			break;
-		default: return 0;
+		default: return false;
 	}
 	// The draw path turns metadata color modes, resolves and depth/stencil copies into other
 	// operations without translating their shaders, and a translation must not run that the real
 	// draw never would.
 	const auto color_mode = ctx.GetColorControl().mode;
 	if (color_mode > 1) {
-		return 0;
+		return false;
 	}
 	const auto& override    = ctx.GetDepthRenderOverride();
 	const auto& depth_regs  = ctx.GetDepthRenderTarget();
@@ -1645,7 +1842,7 @@ uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const H
 	    depth_regs.stencil_read_base_addr != 0 && depth_regs.stencil_write_base_addr != 0 &&
 	    depth_regs.stencil_read_base_addr != depth_regs.stencil_write_base_addr;
 	if (color_mode == 0 && (depth_copy || stencil_copy)) {
-		return 0;
+		return false;
 	}
 
 	// The draw path's decisions, made from the same registers.
@@ -1655,9 +1852,9 @@ uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const H
 	                         db.shader_mask_export_enable || db.shader_dual_export_enable ||
 	                         db.shader_execute_on_noop;
 	const auto target_mask = ctx.GetRenderTargetMask();
-	const bool ps_active   = ps.ps_regs.data_addr != 0 &&
-	                       ((target_mask & sh_regs.m_cbShaderMask) != 0 || side_effect);
-	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> export_mapping {};
+	ps_active              = ps.ps_regs.data_addr != 0 &&
+	            ((target_mask & sh_regs.m_cbShaderMask) != 0 || side_effect);
+	export_mapping = {};
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		const auto& rt = ctx.GetRenderTarget(slot);
 		if (rt.base.addr != 0 && render_target_mask_slot(target_mask, slot) != 0) {
@@ -1666,6 +1863,66 @@ uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const H
 			                           .export_mapping;
 		}
 	}
+	return true;
+}
+
+bool PipelineCache::SpeculateGraphicsPrograms(const HW::Context& ctx, const HW::Shader& sh,
+                                              const HW::UserConfig& user_config,
+                                              const BufferCache& buffers, SpeculatedDraw& draw) {
+	for (auto& stage: draw.stages) {
+		stage.source = nullptr;
+	}
+	bool ps_active = false;
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> export_mapping {};
+	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch ||
+	    !PredictGraphicsDraw(ctx, sh, user_config, ps_active, export_mapping)) {
+		m_program_cache->speculation_failures[0].fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	// The draw path's stage inputs, prepared as GetGraphicsPrograms prepares them.
+	thread_local std::array<ShaderVertexInputInfo, 3> vertex_info;
+	thread_local ShaderPixelInputInfo                 pixel_info;
+	pixel_info = {};
+	ShaderParams pixel_params;
+	const auto   vertex_params =
+	    PrepareGraphicsStages(m_graphics, sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
+	                          user_config, export_mapping, ps_active, vertex_info, pixel_info,
+	                          pixel_params);
+	bool speculated = m_program_cache->Speculate(vertex_params[0], vertex_info[0],
+	                                             vertex_info[0].logical_stage, buffers,
+	                                             draw.stages[SpeculatedDraw::Vertex]);
+	if (ps_active) {
+		speculated |= m_program_cache->Speculate(pixel_params, pixel_info, ShaderType::Pixel,
+		                                          buffers, draw.stages[SpeculatedDraw::Pixel]);
+	}
+	return speculated;
+}
+
+std::array<uint64_t, 4> PipelineCache::SpeculationFailures() const noexcept {
+	std::array<uint64_t, 4> counts {};
+	for (size_t i = 0; i < counts.size(); i++) {
+		counts[i] = m_program_cache->speculation_failures[i].load(std::memory_order_relaxed);
+	}
+	return counts;
+}
+
+uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const HW::Shader& sh,
+                                                 const HW::UserConfig& user_config,
+                                                 ProgramWait wait, bool* pending) {
+	KYTY_PROFILER_FUNCTION();
+	if (m_libraries == nullptr || !Config::PipelineLibrariesEnabled()) {
+		return 0;
+	}
+	const auto& vs = sh.GetVs();
+	const auto& ps = sh.GetPs();
+	bool        ps_active = false;
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> export_mapping {};
+	if (!PredictGraphicsDraw(ctx, sh, user_config, ps_active, export_mapping)) {
+		return 0;
+	}
+	const auto  prim_type   = user_config.GetPrimType();
+	const auto& sh_regs     = ctx.GetShaderRegisters();
+	const auto  target_mask = ctx.GetRenderTargetMask();
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo                 pixel_info;
 	const auto programs = GetGraphicsPrograms(vs, ps, sh_regs, ctx, user_config, export_mapping,

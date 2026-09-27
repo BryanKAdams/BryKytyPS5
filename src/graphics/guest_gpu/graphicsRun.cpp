@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/drawSpeculator.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -282,6 +283,20 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 		processor = std::make_unique<CommandProcessor>(m_renderer, ComputeQueueBase + queue_id - 1);
 	}
 	return *processor;
+}
+
+CommandProcessor::CommandProcessor(RenderContext& renderer, int interrupt_event_id)
+    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
+
+CommandProcessor::~CommandProcessor() = default;
+
+void CommandProcessor::RestartSpeculation(const Pm4Execution& execution) {
+	thread_local std::vector<DrawSpeculator::Cursor> stack;
+	stack.clear();
+	for (const auto& cursor: execution.m_buffer_stack) {
+		stack.push_back({cursor.commands, cursor.offset_dw});
+	}
+	m_speculator->Restart(*this, stack);
 }
 
 void CommandProcessor::Reset() {
@@ -768,9 +783,11 @@ bool GuestGpu::Process(Submission& submission) {
 			for (;;) {
 				bool round_progress = false;
 				if (!submission.constant_complete) {
+					cp.SetConstantStream(true);
 					submission.constant_complete =
 					    cp.Process(submission.constant_execution, submission.constant_commands) ==
 					    Pm4ProcessResult::Complete;
+					cp.SetConstantStream(false);
 					round_progress |= submission.constant_execution.MadeProgress();
 				}
 				cp.SetCeComplete(submission.constant_complete);
@@ -843,6 +860,13 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	execution.m_made_progress = false;
 	// A submission starting or resuming: its draws must see the CPU writes made before it.
 	AdvanceBdaEpoch();
+	if (DrawSpeculator::Enabled() && !IsAsyncComputeQueue() && !m_constant_stream &&
+	    !execution.m_buffer_stack.empty()) {
+		if (m_speculator == nullptr) {
+			m_speculator = std::make_unique<DrawSpeculator>(m_renderer, m_interrupt_event_id);
+		}
+		RestartSpeculation(execution);
+	}
 
 	struct ExecutionScope {
 		ExecutionScope(CommandProcessor& processor, Pm4Execution& execution)
@@ -999,8 +1023,18 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto&    pipelines = m_renderer.GetPipelineCache();
 		const uint64_t pipelines_before =
 		    draw ? pipelines.GraphicsPipelinesCreated() + pipelines.ComputePipelinesCreated() : 0;
+		// Draws are numbered as the speculation walk numbers them; each takes its speculation.
+		const bool speculated =
+		    m_speculator != nullptr && IsDrawOpcode(opcode) && DrawSpeculator::Enabled();
+		if (speculated) {
+			t_speculated_draw = m_speculator->Take(packet);
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		if (speculated) {
+			m_speculator->Release(t_speculated_draw);
+			t_speculated_draw = nullptr;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1015,6 +1049,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				execution.m_buffer_stack.push_back({execution.m_next_buffer});
 			}
 			execution.m_next_buffer = {};
+		}
+		if (speculated && m_speculator->RestartDue()) {
+			RestartSpeculation(execution);
 		}
 		if (draw) {
 			if (m_lookahead_rewalk && LookaheadWorkFinished()) {

@@ -105,6 +105,8 @@ static void PrintUsage() {
 	         "compiling instead of stalling; they appear a few frames late. Default: false.\n");
 	::printf("  --relaxed-readback <true|false>      Let game threads read memory the GPU is still "
 	         "writing without waiting; a value can be a frame old. Default: false.\n");
+	::printf("  --speculative-draws <true|false>     Prepare draws' shader resources on a second "
+	         "thread ahead of the GPU thread. Default: true.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -449,6 +451,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--async-pipelines") {
 			if (!ParseBool(value, options.config.async_pipelines_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--speculative-draws") {
+			if (!ParseBool(value, options.config.speculative_draws_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
