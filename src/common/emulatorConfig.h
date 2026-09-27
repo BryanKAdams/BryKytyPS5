@@ -82,6 +82,7 @@ struct ConfigOptions {
 	bool                   pipeline_libraries_enabled  = true;
 	bool                   async_pipelines_enabled     = false;
 	bool                   relaxed_readback_enabled    = false;
+	bool                   speculative_draws_enabled   = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -163,6 +164,12 @@ void SetAsyncPipelinesEnabled(bool enabled);
 bool RelaxedReadbackEnabled();
 // Changes it while running (the settings panel).
 void SetRelaxedReadbackEnabled(bool enabled);
+// A second thread prepares draws' shader resources ahead of the GPU thread, which takes them
+// when they are still what it would prepare itself. Faster in scenes with many draws; uses one
+// more CPU core.
+bool SpeculativeDrawsEnabled();
+// Changes it while running (the settings panel).
+void SetSpeculativeDrawsEnabled(bool enabled);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

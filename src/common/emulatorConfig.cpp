@@ -213,6 +213,17 @@ void SetAsyncPipelinesEnabled(bool enabled) {
 	g_async_pipelines_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
+static std::atomic<int> g_speculative_draws_override {-1};
+
+bool SpeculativeDrawsEnabled() {
+	const auto enabled = g_speculative_draws_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->speculative_draws_enabled;
+}
+
+void SetSpeculativeDrawsEnabled(bool enabled) {
+	g_speculative_draws_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 static std::atomic<int> g_relaxed_readback_override {-1};
 
 bool RelaxedReadbackEnabled() {

@@ -1117,6 +1117,20 @@ struct SystemOverlay::Impl {
 		    "reads can then be one frame old.");
 		ImGui::PopTextWrapPos();
 		ImGui::Separator();
+
+		bool speculative_draws = Config::SpeculativeDrawsEnabled();
+		if (ImGui::Checkbox("Prepare draws ahead", &speculative_draws)) {
+			Config::SetSpeculativeDrawsEnabled(speculative_draws);
+			settings_save_failed = !Common::SettingsFile::Save(
+			    "speculative-draws", speculative_draws ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "A second CPU thread prepares upcoming draws' shader resources while the render thread "
+		    "works, so scenes with many draws run faster. The render thread checks each prepared "
+		    "draw and prepares it itself when anything changed. Uses one more CPU core.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
 		if (settings_save_failed) {
 			ImGui::TextColored({1.0f, 0.5f, 0.4f, 1.0f}, "Could not save %s",
 			                   Common::SettingsFile::FileName);
