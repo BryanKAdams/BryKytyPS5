@@ -150,6 +150,9 @@ public:
 	ImageId          depth_id {};
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// The GC tick the LRU entry last received, so that touching it again in the same tick,
+	// which the LRU ignores, skips the LRU lookup.
+	uint64_t         lru_tick           = 0;
 
 private:
 	friend struct ImageTestAccess;

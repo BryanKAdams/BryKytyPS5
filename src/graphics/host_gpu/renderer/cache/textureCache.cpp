@@ -323,6 +323,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	m_image_set_generation++;
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -424,7 +425,9 @@ void TextureCache::FreeImage(ImageId id, std::vector<ImageId>* retired) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
+	// Draws touch the same images many times per GC tick: the LRU holds this tick already.
+	if (image.registered && image.lru_tick != m_gc_tick) {
+		image.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
 }
