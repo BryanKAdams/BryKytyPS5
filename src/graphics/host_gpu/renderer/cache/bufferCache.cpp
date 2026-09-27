@@ -631,7 +631,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
+	// Draws bind most buffers read-only and unchanged since their last upload: the lock-free
+	// summary then answers what the locked tracker passes below would find (nothing to copy).
+	const bool cpu_clean = !is_written && m_memory_tracker.IsRegionCpuCleanHint(vaddr, size);
+	if (!is_written && !cpu_clean && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
@@ -648,7 +651,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	if (!cpu_clean) {
+		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	} else if (is_texel_buffer) {
+		// SynchronizeBuffer's image half: the CPU upload has nothing to copy.
+		(void)SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		m_texture_cache.OnBufferGpuWrite(vaddr, size);

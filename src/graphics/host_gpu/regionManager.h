@@ -115,6 +115,19 @@ public:
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
+	// The region split into 64 slices of this many pages (64 KiB); see CpuDirtySlices.
+	static constexpr size_t CPU_DIRTY_SLICE_PAGES = TRACKER_REGION_PAGES / 64;
+	static_assert(TRACKER_REGION_PAGES % 64 == 0 && CPU_DIRTY_SLICE_PAGES != 0);
+
+	// Lock-free: bit s is set while a page of slice s may be CPU-dirty. Every change to the
+	// CPU-dirty bits publishes this under the lock before the pages' write protection changes, so
+	// a clear bit means that nothing written there by the CPU still needs uploading. A reader
+	// that sees a clear bit just before a write is published is ordered as if it had taken the
+	// lock before that write.
+	[[nodiscard]] uint64_t CpuDirtySlices() const noexcept {
+		return m_cpu_dirty_slices.load(std::memory_order_acquire);
+	}
+
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
 	void                   PublishBdaHint() const noexcept {
 		PublishBdaHintBits(m_bda_hint_word, m_bda_hint_mask, m_bda_summary_word,
@@ -154,6 +167,9 @@ public:
 		} else {
 			bits.UnsetRange(start, end);
 		}
+		if constexpr (source == DirtySource::Cpu) {
+			PublishCpuDirtySlices();
+		}
 		if constexpr (source == DirtySource::Cpu && enable) {
 			// Publish every write, even if already dirty: a selective pass may have consumed
 			// the previous hint. The caller still holds the region lock while publishing.
@@ -186,6 +202,7 @@ public:
 			}
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				PublishCpuDirtySlices();
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -344,6 +361,11 @@ private:
 		}
 	}
 
+	// Caller holds lock, after changing the CPU-dirty bits and before changing the protection.
+	void PublishCpuDirtySlices() noexcept {
+		m_cpu_dirty_slices.store(m_cpu_dirty.SliceSummary(), std::memory_order_release);
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty | m_stale_readable : m_cpu_dirty;
@@ -387,6 +409,8 @@ private:
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
+	// See CpuDirtySlices. A new region starts fully CPU-dirty.
+	std::atomic<uint64_t> m_cpu_dirty_slices {~uint64_t {0}};
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;

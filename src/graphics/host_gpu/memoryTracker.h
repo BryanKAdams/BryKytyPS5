@@ -71,6 +71,36 @@ public:
 		return manager != nullptr && manager->GpuDirtyHint(vaddr);
 	}
 
+	// Lock-free: true when every tracker region the range touches exists and none of the 64 KiB
+	// slices it touches holds a CPU-dirty page (see RegionManager::CpuDirtySlices). Then a locked
+	// upload pass over the range would find nothing to copy and change nothing. False when unsure.
+	[[nodiscard]] bool IsRegionCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept {
+		if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+			return false;
+		}
+		constexpr uint64_t SLICE_SIZE = RegionManager::CPU_DIRTY_SLICE_PAGES * TRACKER_PAGE_SIZE;
+		const uint64_t     end        = vaddr + size;
+		for (uint64_t address = vaddr; address < end;) {
+			const auto  index   = address / TRACKER_REGION_SIZE;
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				return false;
+			}
+			const auto region_start = index * TRACKER_REGION_SIZE;
+			const auto region_end   = region_start + TRACKER_REGION_SIZE;
+			const auto first_slice  = (address - region_start) / SLICE_SIZE;
+			const auto last_slice   = (std::min(end, region_end) - 1 - region_start) / SLICE_SIZE;
+			const auto slices =
+			    (last_slice == 63 ? ~uint64_t {0} : (uint64_t {1} << (last_slice + 1)) - 1) &
+			    (~uint64_t {0} << first_slice);
+			if ((manager->CpuDirtySlices() & slices) != 0) {
+				return false;
+			}
+			address = region_end;
+		}
+		return true;
+	}
+
 	// One conservative hint per tracker region. CPU-dirty bits remain authoritative.
 	// Dirty transitions, region creation, buffer registration and mapping publish hints.
 	// A pass exchanges each word once before inspecting it; publications after that exchange

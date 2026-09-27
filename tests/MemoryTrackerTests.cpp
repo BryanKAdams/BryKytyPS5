@@ -313,6 +313,47 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+// IsRegionCpuCleanHint follows the CPU-dirty bits per 64 KiB slice: an untracked region is not
+// clean, an uploaded range is, and a CPU write only affects the slice it lands in.
+void TestCpuCleanHint() {
+  constexpr uintptr_t base = 0x0000000203000000ull;
+  constexpr uint64_t slice = uint64_t{64} * 1024;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(base), slice * 3,
+                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto upload = [&](uint64_t upload_address, uint64_t upload_size) {
+    tracker.ForEachUploadRange(
+        upload_address, upload_size, false,
+        [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  };
+
+  Check(!tracker.IsRegionCpuCleanHint(address, 64),
+        "an untracked region counted as CPU clean");
+  upload(address, slice * 3);
+  Check(tracker.IsRegionCpuCleanHint(address, slice * 3),
+        "an uploaded range was not CPU clean");
+  Check(!tracker.IsRegionCpuCleanHint(address + slice * 3, 64),
+        "a never-uploaded slice counted as CPU clean");
+
+  tracker.MarkRegionAsCpuModified(address + slice + 100, 4);
+  Check(tracker.IsRegionCpuCleanHint(address, slice) &&
+            tracker.IsRegionCpuCleanHint(address + slice * 2, slice),
+        "a CPU write dirtied another slice");
+  Check(!tracker.IsRegionCpuCleanHint(address + slice, 64) &&
+            !tracker.IsRegionCpuCleanHint(address, slice * 3),
+        "a written slice counted as CPU clean");
+  upload(address + slice, slice);
+  Check(tracker.IsRegionCpuCleanHint(address, slice * 3),
+        "uploading the written slice did not make it CPU clean");
+
+  tracker.UntrackMemory(address, slice * 3);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestRangeInvalidation() {
   constexpr uintptr_t base = 0x0000000201000000ull;
   TrackerHarness harness;
@@ -1291,6 +1332,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuCleanHint();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();

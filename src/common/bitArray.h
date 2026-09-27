@@ -164,6 +164,39 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	// Splits the bits into 64 equal slices; bit s of the result is set when any bit of slice s
+	// is set.
+	[[nodiscard]] constexpr uint64_t SliceSummary() const {
+		static_assert(N % 64 == 0, "BitArray slices need a multiple of 64 bits");
+		constexpr size_t SLICE_BITS = N / 64;
+		uint64_t         summary    = 0;
+		if constexpr (SLICE_BITS >= BITS_PER_WORD) {
+			constexpr size_t WORDS_PER_SLICE = SLICE_BITS / BITS_PER_WORD;
+			for (size_t slice = 0; slice < 64; slice++) {
+				uint64_t any = 0;
+				for (size_t word = 0; word < WORDS_PER_SLICE; word++) {
+					any |= m_data[slice * WORDS_PER_SLICE + word];
+				}
+				summary |= static_cast<uint64_t>(any != 0) << slice;
+			}
+		} else {
+			constexpr size_t   SLICES_PER_WORD = BITS_PER_WORD / SLICE_BITS;
+			constexpr uint64_t SLICE_MASK      = (uint64_t {1} << SLICE_BITS) - 1;
+			for (size_t word = 0; word < WORD_COUNT; word++) {
+				const auto bits = m_data[word];
+				if (bits == 0) {
+					continue;
+				}
+				for (size_t slice = 0; slice < SLICES_PER_WORD; slice++) {
+					if (((bits >> (slice * SLICE_BITS)) & SLICE_MASK) != 0) {
+						summary |= uint64_t {1} << (word * SLICES_PER_WORD + slice);
+					}
+				}
+			}
+		}
+		return summary;
+	}
+
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};

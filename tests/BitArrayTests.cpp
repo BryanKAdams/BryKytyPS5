@@ -297,6 +297,49 @@ void TestTrackerSizedRandomizedDifferential() {
   }
 }
 
+// SliceSummary against a bit-by-bit reference: slices narrower than a word (1024 bits, the
+// tracker's size, has 16-bit slices), a word wide (4096) and single bits (64).
+template <size_t N> void TestSliceSummary() {
+  using SummaryBits = Common::BitArray<N>;
+  constexpr size_t slice_bits = N / 64;
+  SummaryBits bits;
+  Check(bits.SliceSummary() == 0, "empty array has a nonzero slice summary");
+  bits.Fill();
+  Check(bits.SliceSummary() == ~uint64_t{0},
+        "full array's slice summary is not all ones");
+  bits.Clear();
+  bits.Set(0);
+  bits.Set(N - 1);
+  Check(bits.SliceSummary() == ((uint64_t{1} << 63) | 1u),
+        "boundary bits map to the wrong slices");
+
+  uint64_t random = 0x2545'f491'4f6c'dd1dull;
+  const auto next_random = [&random] {
+    random ^= random << 13;
+    random ^= random >> 7;
+    random ^= random << 17;
+    return random;
+  };
+  for (size_t operation = 0; operation < 2048; operation++) {
+    const auto first = static_cast<size_t>(next_random() % N);
+    const auto last =
+        first + 1 + static_cast<size_t>(next_random() % (N - first) % 40);
+    if ((next_random() & 1) != 0) {
+      bits.SetRange(first, last);
+    } else {
+      bits.UnsetRange(first, last);
+    }
+    uint64_t expected = 0;
+    for (size_t index = 0; index < N; index++) {
+      if (bits.Get(index)) {
+        expected |= uint64_t{1} << (index / slice_bits);
+      }
+    }
+    Check(bits.SliceSummary() == expected,
+          "randomized slice summary diverged from its bits");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -305,6 +348,9 @@ int main() {
   TestRangeDiscoveryAndIteration();
   TestRandomizedDifferential();
   TestTrackerSizedRandomizedDifferential();
+  TestSliceSummary<64>();
+  TestSliceSummary<1024>();
+  TestSliceSummary<4096>();
   std::puts("BitArrayTests: all cases passed");
   return 0;
 }
