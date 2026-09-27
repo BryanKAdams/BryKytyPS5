@@ -446,6 +446,15 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
+// KYTY_DEBUG_STATE_FILTER=0 records every draw's full graphics state, for A/B runs.
+static bool GraphicsStateFilterEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_STATE_FILTER");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
+}
+
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering) {
@@ -492,8 +501,26 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	// Consecutive draws mostly repeat their state: only changed values are recorded (see
+	// CommandBuffer::GraphicsState).
+	auto& known = buffer.GetGraphicsState();
+	if (!GraphicsStateFilterEnabled()) {
+		buffer.InvalidateGraphicsState();
+	}
+	static_assert(CommandBuffer::GraphicsState::ViewportSlots == viewport_slots);
+	if (known.viewport_count != viewport_count ||
+	    !std::equal(viewports.begin(), viewports.begin() + viewport_count,
+	                known.viewports.begin())) {
+		vk_buffer.setViewportWithCount(viewport_count, viewports.data());
+		known.viewport_count = viewport_count;
+		known.viewports      = viewports;
+	}
+	if (known.scissor_count != viewport_count ||
+	    !std::equal(scissors.begin(), scissors.begin() + viewport_count, known.scissors.begin())) {
+		vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+		known.scissor_count = viewport_count;
+		known.scissors      = scissors;
+	}
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -506,20 +533,50 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	const vk::Bool32 depth_test  = depth.depth_test_enable ? VK_TRUE : VK_FALSE;
+	const vk::Bool32 depth_write = depth.depth_write_enable ? VK_TRUE : VK_FALSE;
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	const vk::Bool32 depth_bias   = depth_bias_enable ? VK_TRUE : VK_FALSE;
+	const vk::Bool32 stencil_test = depth.stencil_test_enable ? VK_TRUE : VK_FALSE;
+
+	const bool fixed_valid = known.fixed_valid;
+	if (!fixed_valid || known.line_width != line_width) {
+		vk_buffer.setLineWidth(line_width);
+	}
+	if (!fixed_valid || known.blend_constants != blend_constants) {
+		vk_buffer.setBlendConstants(blend_constants.data());
+	}
+	if (!fixed_valid || known.depth_test != depth_test) {
+		vk_buffer.setDepthTestEnable(depth_test);
+	}
+	if (!fixed_valid || known.depth_write != depth_write) {
+		vk_buffer.setDepthWriteEnable(depth_write);
+	}
+	if (!fixed_valid || known.depth_compare != depth.depth_compare_op) {
+		vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	}
+	if (!fixed_valid || known.depth_bias != depth_bias) {
+		vk_buffer.setDepthBiasEnable(depth_bias);
+	}
+	if (!fixed_valid || known.stencil_test != stencil_test) {
+		vk_buffer.setStencilTestEnable(stencil_test);
+	}
+	known.fixed_valid     = true;
+	known.line_width      = line_width;
+	known.blend_constants = blend_constants;
+	known.depth_test      = depth_test;
+	known.depth_write     = depth_write;
+	known.depth_compare   = depth.depth_compare_op;
+	known.depth_bias      = depth_bias;
+	known.stencil_test    = stencil_test;
+
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -528,31 +585,51 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		const std::array bias {constant_factor, poly_offset.clamp, slope_factor};
+		if (!known.bias_valid || known.bias != bias) {
+			vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+			known.bias_valid = true;
+			known.bias       = bias;
+		}
 	}
 
-	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
 	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
+		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state,
+		                             vk::StencilOpState& recorded) {
+			if (known.stencil_valid && recorded == state) {
+				return;
+			}
 			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
 			vk_buffer.setStencilCompareMask(face, state.compareMask);
 			vk_buffer.setStencilWriteMask(face, state.writeMask);
 			vk_buffer.setStencilReference(face, state.reference);
+			recorded = state;
 		};
-		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
-		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front, known.stencil[0]);
+		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back, known.stencil[1]);
+		known.stencil_valid = true;
 	}
 
 #if defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
 #else
-	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> enable {};
 	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
 		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
 	}
 	if (rendering.num_color_attachments != 0) {
-		vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, enable);
+		if (known.color_write_count != rendering.num_color_attachments ||
+		    !std::equal(enable.begin(), enable.begin() + rendering.num_color_attachments,
+		                known.color_write.begin())) {
+			vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, enable.data());
+			known.color_write_count = rendering.num_color_attachments;
+			known.color_write       = enable;
+		}
+	} else {
+		// A pipeline without color attachments keeps color write enables static; binding it
+		// replaces the recorded ones.
+		known.color_write_count = 0;
 	}
 #endif
 }
@@ -1493,8 +1570,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	g_draw_phases.Mark(DrawPhaseTimer::Commit);
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
-	if (m_context.GetGraphics().attachment_feedback_loop_dynamic_enabled) {
+	auto& recorded_state = buffer.GetGraphicsState();
+	if (m_context.GetGraphics().attachment_feedback_loop_dynamic_enabled &&
+	    (!recorded_state.feedback_valid || recorded_state.feedback != feedback_aspects)) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+		recorded_state.feedback_valid = true;
+		recorded_state.feedback       = feedback_aspects;
 	}
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
@@ -1511,7 +1592,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		               program != nullptr ? program->shader_hash : 0,
 		               uint64_t {rendering.width} * rendering.height * rendering.num_layers);
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	if (recorded_state.pipeline != pipeline.pipeline) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		recorded_state.pipeline = pipeline.pipeline;
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

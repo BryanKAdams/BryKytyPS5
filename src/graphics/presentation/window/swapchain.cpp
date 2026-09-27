@@ -789,6 +789,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
+	// The overlays bind their own graphics pipelines and dynamic state.
+	command.InvalidateGraphicsState();
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = draw_overlay || draw_system_overlay;
 	if (source != nullptr) {

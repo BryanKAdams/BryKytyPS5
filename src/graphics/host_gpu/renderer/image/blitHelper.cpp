@@ -195,6 +195,8 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
+	// The blit replaced the pipeline and dynamic state the game's draws recorded.
+	command_buffer.InvalidateGraphicsState();
 }
 
 } // namespace Libs::Graphics

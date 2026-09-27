@@ -40,6 +40,8 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// A new command buffer starts without any pipeline or dynamic state.
+	InvalidateGraphicsState();
 }
 
 void CommandBuffer::End() const {

@@ -129,6 +129,39 @@ public:
 		return static_cast<bool>(m_pending_shader_writes);
 	}
 
+	// The graphics pipeline and dynamic state draws last recorded into this command buffer, so
+	// that a draw skips commands that would set the same values again. Every graphics pipeline a
+	// draw binds keeps this state dynamic, except color write enables without color attachments.
+	// Anything else that binds a graphics pipeline or sets dynamic state here must call
+	// InvalidateGraphicsState.
+	struct GraphicsState {
+		static constexpr uint32_t ViewportSlots = 16;
+
+		vk::Pipeline                                pipeline;
+		uint32_t                                    viewport_count = 0; // 0: unknown.
+		std::array<vk::Viewport, ViewportSlots>     viewports {};
+		uint32_t                                    scissor_count = 0; // 0: unknown.
+		std::array<vk::Rect2D, ViewportSlots>       scissors {};
+		bool                                        fixed_valid   = false;
+		float                                       line_width    = 1.0f;
+		std::array<float, 4>                        blend_constants {};
+		vk::Bool32                                  depth_test    = VK_FALSE;
+		vk::Bool32                                  depth_write   = VK_FALSE;
+		vk::CompareOp                               depth_compare = vk::CompareOp::eNever;
+		vk::Bool32                                  depth_bias    = VK_FALSE;
+		vk::Bool32                                  stencil_test  = VK_FALSE;
+		bool                                        bias_valid    = false;
+		std::array<float, 3>                        bias {};
+		bool                                        stencil_valid = false;
+		std::array<vk::StencilOpState, 2>           stencil {};
+		uint32_t                                    color_write_count = 0; // 0: unknown.
+		std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write {};
+		bool                                        feedback_valid = false;
+		vk::ImageAspectFlags                        feedback;
+	};
+	[[nodiscard]] GraphicsState& GetGraphicsState() const noexcept { return m_graphics_state; }
+	void InvalidateGraphicsState() const noexcept { m_graphics_state = {}; }
+
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
@@ -160,6 +193,7 @@ private:
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	mutable vk::PipelineStageFlags m_pending_shader_writes;
+	mutable GraphicsState          m_graphics_state;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
