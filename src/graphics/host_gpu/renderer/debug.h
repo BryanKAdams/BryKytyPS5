@@ -27,7 +27,8 @@ inline RenderDebugCounters g_render_debug_counters;
 // also KYTY_DEBUG_AB=1), pending (rate-limited GPU progress queries at draw entry), backing
 // (lock-free cached guest backing reads), bdaepoch (one BDA synchronization per epoch), scratch
 // (pooled tiler scratch buffers), cleanpages (remembered clean pages for GPU-write queries),
-// cpwrite (BDA epochs started by the GPU thread's own guest memory writes).
+// cpwrite (BDA epochs started by the GPU thread's own guest memory writes), streamhost (the stream
+// ring in cached host memory rather than device memory).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.

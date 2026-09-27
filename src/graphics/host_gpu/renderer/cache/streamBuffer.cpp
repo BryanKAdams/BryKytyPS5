@@ -58,7 +58,7 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool host_cached)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -72,12 +72,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	const VmaAllocationCreateFlags bda_flag =
 	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
+	// `host_cached`: cached host memory, where CPU writes stay in the CPU's caches and the GPU reads
+	// them over the bus, instead of write-combined device memory.
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
-	allocation_info.usage = AllocationUsage(usage);
-	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
-	                                     ? VkMemoryPropertyFlags {}
-	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag |
+	    (host_cached ? VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+	                 : AllocationFlags(usage));
+	allocation_info.usage = host_cached ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : AllocationUsage(usage);
+	allocation_info.preferredFlags =
+	    usage == MemoryUsage::DeviceLocal ? VkMemoryPropertyFlags {}
+	    : host_cached ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT
+	                  : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -110,6 +115,14 @@ Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
+}
+
+uint32_t Buffer::MemoryProperties() const noexcept {
+	VkMemoryPropertyFlags properties = 0;
+	if (m_allocation != nullptr) {
+		vmaGetAllocationMemoryProperties(m_graphics->allocator, m_allocation, &properties);
+	}
+	return properties;
 }
 
 vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
@@ -220,8 +233,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size, vk::BufferUsageFlags extra_flags)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags | extra_flags, size),
+                           uint64_t size, vk::BufferUsageFlags extra_flags, bool host_cached)
+    : Buffer(graphics, scheduler, usage, 0, AllFlags | extra_flags, size, host_cached),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

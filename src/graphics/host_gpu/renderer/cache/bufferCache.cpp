@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -237,6 +239,16 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+// The stream ring takes the render thread's per-draw copies: small CPU-written buffers, flattened
+// SRTs, shader data and index data. In cached host memory the copies stay in the CPU's caches. In
+// write-combined device memory (ReBAR) they cost Sky Garden 0.32 us a draw and the overworld 0.26,
+// mostly by stalling the memory accesses after them; the GPU reads host copies about as fast (1%
+// more GPU time in the overworld, none measurable in Sky Garden). KYTY_DEBUG_STREAM_DEVICE=1
+// keeps the ring in device memory.
+static bool StreamRingInHostMemory() {
+	return std::getenv("KYTY_DEBUG_STREAM_DEVICE") == nullptr;
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -245,7 +257,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, {},
+                      StreamRingInHostMemory()),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_draw_record_buffer(graphics, scheduler, MemoryUsage::Stream, 4 * MiB,
@@ -259,6 +272,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	if (AbSelected("streamhost")) {
+		m_stream_device = std::make_unique<StreamBuffer>(graphics, scheduler, MemoryUsage::Stream,
+		                                                 64 * MiB, vk::BufferUsageFlags {}, false);
+		// Vulkan memory property bits: 1 device-local, 2 host-visible, 4 coherent, 8 cached.
+		std::printf("streamhost A/B: ring memory 0x%x, device ring memory 0x%x\n",
+		            m_stream_buffer.MemoryProperties(), m_stream_device->MemoryProperties());
+		std::fflush(stdout);
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -632,6 +653,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+// KYTY_DEBUG_AB=streamhost: 'off' windows copy into a second ring in device memory. The tiler keeps
+// the ring it got at startup.
+StreamBuffer& BufferCache::ActiveStream() noexcept {
+	return m_stream_device != nullptr && AbFeatureOff() ? *m_stream_device : m_stream_buffer;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -648,11 +675,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::StreamCopy);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		auto& stream          = ActiveStream();
+		auto [mapped, offset] = stream.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
-			m_stream_buffer.Commit();
+			stream.Commit();
 			RecordUpload(UploadSource::Stream, vaddr, size);
-			return {&m_stream_buffer, offset};
+			return {&stream, offset};
 		}
 	}
 
