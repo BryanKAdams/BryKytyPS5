@@ -163,8 +163,7 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 
 	if (!save_name.empty()) {
-		rt->SaveProgram(program, Libs::LibKernel::FileSystem::GetRealFilename(
-		                             Common::PathToGenericString(save_name)));
+		rt->SaveProgram(program, save_name);
 	}
 }
 
@@ -216,7 +215,11 @@ void Run(const RunOptions& options) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 
-	LoadElf(options.elf);
+	// KYTY_DEBUG_SAVE_ELF=<host path> also writes the executable as a plain ELF, to disassemble the
+	// guest code that KYTY_DEBUG_CALL_COUNTS traces point at.
+	const char* save_elf = std::getenv("KYTY_DEBUG_SAVE_ELF");
+	LoadElf(options.elf, false,
+	        save_elf != nullptr ? std::filesystem::path(save_elf) : std::filesystem::path());
 
 	Execute(options.game_patch);
 }

@@ -25,14 +25,17 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <fmt/format.h>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -582,6 +585,18 @@ void GuestGpu::ThreadRun(void* data) {
 	StartThreadSampler("gpu");
 	StartThreadDumper();
 
+	// KYTY_DEBUG_QUEUES=1: every 5 s, for each queue with work, the submissions completed and the
+	// blocked passes in the window, the submissions pending, and the packet the last blocked pass
+	// stopped at (for WAIT_REG_MEM, its address, reference and the memory's current value).
+	static const bool debug_queues = std::getenv("KYTY_DEBUG_QUEUES") != nullptr;
+	struct QueueStats {
+		uint64_t                completed = 0;
+		uint64_t                blocked   = 0;
+		std::array<uint32_t, 8> packet {};
+	};
+	std::array<QueueStats, QueueCount> queue_stats {};
+	auto next_queue_print = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -657,8 +672,52 @@ void GuestGpu::ThreadRun(void* data) {
 
 		EXIT_IF(!has_submission);
 		const bool complete = gpu->Process(submission);
+		if (debug_queues) {
+			auto& stats = queue_stats[submission.queue_id];
+			if (complete) {
+				stats.completed++;
+			} else {
+				stats.blocked++;
+				auto commands = submission.command_execution.RemainingCommands();
+				if (commands.empty()) {
+					commands = submission.constant_execution.RemainingCommands();
+				}
+				stats.packet = {};
+				std::copy_n(commands.begin(), std::min<size_t>(commands.size(), stats.packet.size()),
+				            stats.packet.begin());
+			}
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (debug_queues && std::chrono::steady_clock::now() >= next_queue_print) {
+			next_queue_print = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			std::string line = "queues:";
+			for (uint32_t id = 0; id < QueueCount; id++) {
+				auto&      stats   = queue_stats[id];
+				const auto pending = gpu->m_queues[id].size();
+				if (stats.completed == 0 && stats.blocked == 0 && pending == 0) {
+					continue;
+				}
+				line += fmt::format(" q{}: done={} blocked={} pending={}", id, stats.completed,
+				                    stats.blocked, pending);
+				const auto& p      = stats.packet;
+				const auto  opcode = (p[0] >> 8u) & 0xffu;
+				if (stats.blocked != 0 &&
+				    (opcode == Pm4::IT_WAIT_REG_MEM || opcode == Pm4::IT_WAIT_REG_MEM_64)) {
+					const auto address =
+					    (p[2] & ~3u) | (static_cast<uint64_t>(p[3] & 0x3ffffu) << 32u);
+					line += fmt::format(" wait@0x{:x} func={} ref=0x{:x} mask=0x{:x} value=0x{:x}",
+					                    address, p[1] & 7u, p[4], p[5],
+					                    *reinterpret_cast<const volatile uint32_t*>(address));
+				} else if (stats.blocked != 0) {
+					line += fmt::format(" op=0x{:02x} [{:08x} {:08x} {:08x} {:08x} {:08x}]", opcode,
+					                    p[0], p[1], p[2], p[3], p[4]);
+				}
+				stats = {};
+			}
+			std::printf("%s\n", line.c_str());
+			std::fflush(stdout);
+		}
 		if (!complete) {
 			submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));

@@ -598,13 +598,21 @@ void Elf64::Save(const std::filesystem::path& file_name) {
 			EXIT("Can't create %s\n", Common::PathToString(file_name).c_str());
 		}
 
-		SaveEhdr64(f, m_ehdr.get());
+		// Section headers are not loaded from a SELF: save the segments only.
+		auto ehdr = *m_ehdr;
+		if (m_shdr == nullptr) {
+			ehdr.e_shoff    = 0;
+			ehdr.e_shnum    = 0;
+			ehdr.e_shstrndx = 0;
+		}
+		SaveEhdr64(f, &ehdr);
 
-		SavePhdr64(f, m_ehdr->e_phoff, m_ehdr->e_phnum, m_phdr.get());
-		SaveShdr64(f, m_ehdr->e_shoff, m_ehdr->e_shnum, m_shdr.get());
+		SavePhdr64(f, ehdr.e_phoff, ehdr.e_phnum, m_phdr.get());
+		SaveShdr64(f, ehdr.e_shoff, ehdr.e_shnum, m_shdr.get());
 
 		for (uint16_t i = 0; i < m_ehdr->e_phnum; i++) {
-			if (m_phdr[i].p_filesz == 0u) {
+			// A SELF keeps the loadable segments; the others lie within them or are not kept.
+			if (m_phdr[i].p_filesz == 0u || (IsSelf() && m_phdr[i].p_type != PT_LOAD)) {
 				continue;
 			}
 
@@ -621,7 +629,7 @@ void Elf64::Save(const std::filesystem::path& file_name) {
 			EXIT_IF(bytes_written == 0);
 		}
 
-		for (uint16_t i = 0; i < m_ehdr->e_shnum; i++) {
+		for (uint16_t i = 0; i < ehdr.e_shnum; i++) {
 			if (m_shdr[i].sh_size == 0u) {
 				continue;
 			}

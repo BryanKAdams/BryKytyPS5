@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <span>
@@ -38,6 +39,14 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// The innermost buffer's commands from the packet the execution stopped at (for debugging).
+	[[nodiscard]] std::span<const uint32_t> RemainingCommands() const noexcept {
+		if (m_buffer_stack.empty()) {
+			return {};
+		}
+		const auto& cursor = m_buffer_stack.back();
+		return cursor.commands.subspan(std::min<size_t>(cursor.offset_dw, cursor.commands.size()));
+	}
 
 private:
 	friend class CommandProcessor;

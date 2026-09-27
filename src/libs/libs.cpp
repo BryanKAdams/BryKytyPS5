@@ -1,10 +1,149 @@
 #include "libs/libs.h"
 
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "libs/errno.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#endif
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
 namespace Libs {
+
+namespace {
+
+// KYTY_DEBUG_CALL_COUNTS: one slot per function, claimed by its __func__ pointer.
+struct CallCounter {
+	std::atomic<const char*> function {nullptr};
+	std::atomic<const char*> library {nullptr};
+	std::atomic<uint64_t>    count {0};
+};
+constexpr size_t                          CallCounterCount = 4096;
+std::array<CallCounter, CallCounterCount> g_call_counters;
+
+void PrintCallCounts() {
+	for (uint64_t window = 1;; window++) {
+		std::this_thread::sleep_for(std::chrono::seconds(5));
+		std::vector<std::pair<uint64_t, const CallCounter*>> calls;
+		uint64_t                                             total = 0;
+		for (auto& counter: g_call_counters) {
+			const auto count = counter.count.exchange(0);
+			if (count != 0) {
+				calls.emplace_back(count, &counter);
+				total += count;
+			}
+		}
+		std::sort(calls.begin(), calls.end(),
+		          [](const auto& a, const auto& b) { return a.first > b.first; });
+		std::string line = fmt::format("call-counts: t={}s total={}", window * 5, total);
+		for (size_t i = 0; i < std::min<size_t>(calls.size(), 60); i++) {
+			const char* library  = calls[i].second->library.load();
+			const char* function = calls[i].second->function.load();
+			line += fmt::format(" {}::{}={}", library != nullptr ? library : "?",
+			                    function != nullptr ? function : "?", calls[i].first);
+		}
+		std::printf("%s\n", line.c_str());
+		std::fflush(stdout);
+	}
+}
+
+thread_local uint32_t t_trace_calls = 0;
+
+// Guest code addresses among the stack qwords from the return address up, within the stack
+// region: the return address, then the callers (and whatever else on the stack points into code).
+void PrintTracedCall(const char* library, const char* function, void* return_slot) {
+	const auto begin = reinterpret_cast<uint64_t>(return_slot);
+	uint64_t   end   = begin + 64 * sizeof(uint64_t);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(return_slot, &info, sizeof(info)) != 0) {
+		end = std::min(begin + 256 * sizeof(uint64_t),
+		               reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+	}
+#endif
+	auto*       linker = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	std::string line   = fmt::format("call-trace tid={} {}::{}", Common::Thread::GetThreadIdUnique(),
+	                                 library, function);
+	int         found  = 0;
+	for (uint64_t slot = begin; slot + sizeof(uint64_t) <= end && found < 12;
+	     slot += sizeof(uint64_t)) {
+		const auto value   = *reinterpret_cast<const uint64_t*>(slot);
+		auto*      program = linker->FindProgramByAddr(value);
+		if (program == nullptr) {
+			continue;
+		}
+		line += fmt::format(" {}+0x{:x}@{:x}", Common::PathToString(program->file_name.filename()),
+		                    value - program->base_vaddr, slot - begin);
+		found++;
+	}
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+}
+
+// End of the all-threads trace window, in steady_clock ticks; 0 when none is open.
+std::atomic<int64_t> g_trace_all_until {0};
+
+} // namespace
+
+void TraceCalls(uint32_t count) noexcept {
+	t_trace_calls = count;
+}
+
+void TraceAllCalls(std::chrono::milliseconds duration) noexcept {
+	g_trace_all_until = (std::chrono::steady_clock::now() + duration).time_since_epoch().count();
+}
+
+void CountCall(const char* library, const char* function, void* return_slot) noexcept {
+	static std::once_flag printer;
+	std::call_once(printer, [] { std::thread(PrintCallCounts).detach(); });
+	if (t_trace_calls != 0) [[unlikely]] {
+		t_trace_calls--;
+		PrintTracedCall(library, function, return_slot);
+	} else if (const auto until = g_trace_all_until.load(std::memory_order_relaxed); until != 0)
+	    [[unlikely]] {
+		// The command buffer builders would drown out the other threads.
+		if (std::chrono::steady_clock::now().time_since_epoch().count() >= until) {
+			auto expected = until;
+			g_trace_all_until.compare_exchange_strong(expected, 0);
+		} else if (std::strncmp(library, "Graphics5", 9) != 0) {
+			PrintTracedCall(library, function, return_slot);
+		}
+	}
+	const auto first = (reinterpret_cast<uintptr_t>(function) >> 4u) % CallCounterCount;
+	for (size_t probe = 0; probe < CallCounterCount; probe++) {
+		auto&       counter = g_call_counters[(first + probe) % CallCounterCount];
+		const char* owner   = counter.function.load(std::memory_order_acquire);
+		if (owner == nullptr) {
+			if (counter.function.compare_exchange_strong(owner, function)) {
+				counter.library.store(library);
+				owner = function;
+			}
+		}
+		if (owner == function) {
+			counter.count.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	}
+}
 
 namespace LibContentDelete {
 LIB_DEFINE(InitContentDelete_1);
