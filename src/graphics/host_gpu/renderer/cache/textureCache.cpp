@@ -1665,13 +1665,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 
 bool TextureCache::RefindImage(ImageId id, uint64_t generation, const ImageDesc& desc,
                                uint32_t metadata_base_layer) {
-	{
+	// Only Thread_Gpu (the caller) registers, frees and touches images, so when this tick and GC
+	// tick already saw the image, the bookkeeping below would change nothing: skip the lock.
+	if (generation == 0 || generation != m_image_set_generation.load(std::memory_order_acquire)) {
+		return false;
+	}
+	const auto tick  = m_scheduler.CurrentTick();
+	auto&      image = m_slot_images[id];
+	if (image.tick_accessed_last != tick || (image.registered && image.lru_tick != m_gc_tick)) {
 		std::scoped_lock lock {m_lock};
-		if (generation == 0 || generation != m_image_set_generation) {
+		if (generation != m_image_set_generation) {
 			return false;
 		}
-		auto& image              = m_slot_images[id];
-		image.tick_accessed_last = m_scheduler.CurrentTick();
+		image.tick_accessed_last = tick;
 		TouchImage(image);
 	}
 	FinishFind(id, desc, metadata_base_layer);
