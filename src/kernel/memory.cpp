@@ -220,6 +220,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -250,6 +251,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -281,6 +283,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -296,6 +299,7 @@ public:
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -343,6 +347,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -355,12 +360,14 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
 		Common::LockGuard lock(m_mutex);
+		BeginChange();
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
@@ -426,11 +433,20 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
+
+		// The GPU thread clamps every buffer a draw binds. A range inside a committed range found
+		// earlier is returned whole without the lock while no range has changed since.
+		auto& cached = t_committed[(virtual_addr >> 21u) % t_committed.size()];
+		if (cached.generation == m_generation.load(std::memory_order_acquire) &&
+		    virtual_addr >= cached.start && virtual_addr < cached.end &&
+		    size <= cached.end - virtual_addr) {
+			return size;
+		}
+
+		Common::LockGuard lock(m_mutex);
 
 		auto vma = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), virtual_addr,
@@ -445,6 +461,7 @@ public:
 		    !IsCommittedRangeType(vma->type)) {
 			return 0;
 		}
+		cached = {m_generation.load(std::memory_order_relaxed), vma->start, vma_end};
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
@@ -649,9 +666,30 @@ private:
 		return nullptr;
 	}
 
-	std::vector<Range> m_ranges;
-	Common::Mutex      m_mutex;
+	// Caller holds m_mutex and is about to change m_ranges: cached committed ranges no longer
+	// apply (see ClampRangeSize).
+	void BeginChange() { m_generation.fetch_add(1, std::memory_order_release); }
+
+	// Each instance counts from its own base, so no thread's cache matches another instance.
+	static uint64_t NextGenerationBase() {
+		static std::atomic<uint64_t> next {0};
+		return (next.fetch_add(1, std::memory_order_relaxed) + 1) << 40u;
+	}
+
+	struct CommittedRange {
+		uint64_t generation = 0;
+		uint64_t start      = 0;
+		uint64_t end        = 0;
+	};
+
+	std::vector<Range>    m_ranges;
+	Common::Mutex         m_mutex;
+	std::atomic<uint64_t> m_generation {NextGenerationBase()};
+	// Per thread: committed ranges ClampRangeSize found recently, by 2 MiB address bucket.
+	static thread_local std::array<CommittedRange, 16> t_committed;
 };
+
+thread_local std::array<VirtualRanges::CommittedRange, 16> VirtualRanges::t_committed {};
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;

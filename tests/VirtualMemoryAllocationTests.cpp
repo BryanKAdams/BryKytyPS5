@@ -1306,6 +1306,13 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	            "prospero_direct", phys);
 	Check(test, info.memory_type == SceKernelMtypeC, "unexpected direct memory type");
 
+	// This thread now caches the committed range; the unmap below must invalidate it (the
+	// clamp after the unmap checks that).
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0xf30, 0x1560) ==
+	          0x1560,
+	      "ClampRangeSize clamped a range inside one mapping");
+
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
 	        "KernelMunmap(direct middle page)");
