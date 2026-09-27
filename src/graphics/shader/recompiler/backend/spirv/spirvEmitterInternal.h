@@ -20,6 +20,7 @@
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -129,6 +130,11 @@ struct EmitterState {
 	std::vector<OutputBinding>                       outputs;
 	std::vector<uint32_t>                            interface_variables;
 	std::unordered_map<const IR::Block*, uint32_t>   labels;
+	// Long select(index == constant, ...) chains (V_MOVRELS reads) become one OpSwitch at their
+	// outermost select; their inner selects emit nothing (see EmitIndexedSelect).
+	bool                                             indexed_selects_found = false;
+	std::unordered_set<const IR::Inst*>              indexed_select_heads;
+	std::unordered_set<const IR::Inst*>              indexed_select_members;
 };
 
 uint32_t TypeVoid(EmitterState& state);

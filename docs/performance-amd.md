@@ -546,6 +546,35 @@ The frame rate went from 15.3 to 17.0 fps. The level's grass differs between run
 some runs draw dense ferns in the left field and run about 1.8 fps slower. Compare runs only
 after checking their screenshots.
 
+On the GPU side, the foliage vertex shaders (3a12b9a5 and five siblings) index a register array
+by a loop counter: `V_MOVRELS_B32` with M0 = 4 × i. The translation compares M0 with every
+register above the source, so each read was a chain of about 127 selects. The constant-propagation
+pass removes compares only where it knows M0's possible values, and a loop counter's are
+unknown. The shader's SPIR-V held 3,920 selects and 2,999 compares against about 2,000
+floating-point operations. The SPIR-V emitter now writes an indexed select chain of 16 or more
+links as an `OpSwitch` on the index divided by 16 (`EmitIndexedSelect`). Each case block holds the
+select chain for its 16 index values. M0 is uniform, so the driver branches on it with scalar
+compares and runs one chain of at most 16 selects.
+
+A switch with one case per index value ran almost as fast but doubled the driver's compile time.
+That version put one block per register (about 2,900 blocks) in the foliage vertex shader, and its
+pipeline took 2.24 s to compile instead of 0.9-1.0 s. The bucketed switch compiles in 0.8-0.9 s.
+`KYTY_DEBUG_PIPELINE_STATS` measured this: its capturing compile bypasses the driver's shader
+cache. Same binary, GPU zones:
+
+| zone | selects (ms/frame) | one case per value | buckets of 16 |
+| --- | --- | --- | --- |
+| GPU total | 29.1-30.0 | 26.6 | 27.3 |
+| 3cf24e1b | 3.9 | 2.72 | 2.44 |
+| c88ebedb | 2.95 | 1.95 | 1.79 |
+| db5cce1c | 1.15 | 0.83 | 0.80 |
+| b046164f | 1.22 | 1.0 | 0.99 |
+| ca11de66 | 0.97 | 0.81 | 0.80 |
+
+13495e6e has no `V_MOVRELS` and stayed at 1.86 ms. The bucketed run's GPU total includes a tiler
+zone 1 ms above the others. The foliage vertex stage still uses all 256 VGPRs and 96 bytes of
+scratch. `KYTY_DEBUG_INDEXED_SWITCH=0` keeps the selects for A/B runs.
+
 `scratchpad\flamingo.ps1` in the session that did this drives the route: a copy of the user's
 save (`C:\Games\_SaveFlamingo`, slot 1), the overworld up to the Gorilla Nebula, Sky Garden
 (hold cross to dive in), then samples standing still at the level start. Since 2026-09-27 some

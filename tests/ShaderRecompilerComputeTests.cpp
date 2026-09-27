@@ -21943,6 +21943,42 @@ TestCase Vop1MoveRelSourceBoundedIndex() {
            O::V_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// M0 comes from memory whole, so nothing bounds it: every register above the source is a
+// candidate, like Astro Bot's foliage vertex shader indexing a register array by a loop
+// counter. The emitter turns that long select chain into a switch on M0.
+TestCase Vop1MoveRelSourceUnboundedIndexCase(const char *name, u32 m0, u32 expected) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSmemLoadOpcode(&code, 0x08, 4, 0);         // s_buffer_load_dword s4
+  code.push_back(EncodeSMovB32(124, 4));           // s_mov_b32 m0, s4
+  for (u32 index = 0; index < 40u; index++) {
+    AppendVMovLiteral(&code, 12 + index, 0x1000u + index);
+  }
+  code.push_back(0x7e6e870cu);                     // v_movrels_b32 v55, v12
+  AppendStoreVgpr(&code, 55, 0);
+  AppendEnd(&code);
+
+  return {name,
+          code,
+          {m0},
+          {expected},
+          {O::S_BUFFER_LOAD_DWORD, O::S_MOV_B32, O::V_MOV_B32, O::V_MOVRELS_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase Vop1MoveRelSourceUnboundedIndex() {
+  return Vop1MoveRelSourceUnboundedIndexCase("Vop1MoveRelSourceUnboundedIndex", 30u,
+                                             0x1000u + 30u);
+}
+
+// Only M0's low 8 bits count, and the translation reads the source register for an index past
+// the last register (the switch's default, as the select chain's).
+TestCase Vop1MoveRelSourceIndexPastRegisters() {
+  return Vop1MoveRelSourceUnboundedIndexCase("Vop1MoveRelSourceIndexPastRegisters",
+                                             0xabcd01ffu, 0x1000u);
+}
+
 TestCase Vop1MoveRelDestination() {
   using O = ShaderOpcode;
 
@@ -30120,6 +30156,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelSourceBoundedIndex);
+  AddCase(Vop1MoveRelSourceUnboundedIndex);
+  AddCase(Vop1MoveRelSourceIndexPastRegisters);
   AddCase(Vop1MoveRelDestination);
   AddCase(VectorFloatSpecialOps);
   AddCase(CubeIdCapturedNegationAndOutputScale);

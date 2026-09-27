@@ -265,7 +265,187 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+// A link select(index == constant, value, rest) of an indexed select chain. V_MOVRELS reads
+// become one: a chain over every register above the source, on a uniform index (M0).
+struct IndexedSelectLink {
+	IR::Value index;
+	uint32_t  constant = 0;
+	IR::Value value;
+	IR::Value rest;
+};
+
+bool IndexedSelectLinkOf(const IR::Inst& inst, IndexedSelectLink& link) {
+	if (inst.GetOpcode() != IR::ValueOpcode::SelectU32 || inst.NumArgs() != 3) {
+		return false;
+	}
+	const auto* compare = inst.Arg(0).Resolve().TryInstruction();
+	if (compare == nullptr || compare->GetOpcode() != IR::ValueOpcode::IEqual32) {
+		return false;
+	}
+	auto index    = compare->Arg(0).Resolve();
+	auto constant = compare->Arg(1).Resolve();
+	if (index.IsImmediate()) {
+		std::swap(index, constant);
+	}
+	if (index.IsImmediate() || !constant.IsImmediate() || constant.GetType() != IR::Type::U32) {
+		return false;
+	}
+	link = {index, constant.U32(), inst.Arg(1), inst.Arg(2)};
+	return true;
+}
+
+// The link below `inst` on the same index, when only `inst` uses it and it is in the same block.
+const IR::Inst* NextIndexedSelect(const IR::Inst& inst, const IndexedSelectLink& link,
+                                  IndexedSelectLink& next) {
+	const auto* rest = link.rest.Resolve().TryInstruction();
+	if (rest == nullptr || rest->Parent() != inst.Parent() || rest->UseCount() != 1 ||
+	    !IndexedSelectLinkOf(*rest, next) || !(next.index == link.index)) {
+		return nullptr;
+	}
+	return rest;
+}
+
+// Shorter chains stay selects.
+constexpr size_t MinIndexedSelects = 16;
+
+// KYTY_DEBUG_INDEXED_SWITCH=0 keeps every chain as selects (A/B runs).
+bool IndexedSwitchEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEBUG_INDEXED_SWITCH");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void FindIndexedSelects(EmitterState& state) {
+	state.indexed_selects_found = true;
+	if (!IndexedSwitchEnabled()) {
+		return;
+	}
+	std::unordered_set<const IR::Inst*> inner;
+	IndexedSelectLink                   link;
+	IndexedSelectLink                   next;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IndexedSelectLinkOf(inst, link)) {
+				if (const auto* rest = NextIndexedSelect(inst, link, next)) {
+					inner.insert(rest);
+				}
+			}
+		}
+	}
+	std::vector<const IR::Inst*> members;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (inner.contains(&inst) || !IndexedSelectLinkOf(inst, link)) {
+				continue;
+			}
+			members.clear();
+			for (const auto* current = &inst;;) {
+				const auto* rest = NextIndexedSelect(*current, link, next);
+				if (rest == nullptr) {
+					break;
+				}
+				members.push_back(rest);
+				current = rest;
+				link    = next;
+			}
+			if (members.size() + 1u >= MinIndexedSelects) {
+				state.indexed_select_heads.insert(&inst);
+				state.indexed_select_members.insert(members.begin(), members.end());
+			}
+		}
+	}
+}
+
+// Emits a long indexed select chain at its outermost select as an OpSwitch on the index, which
+// the driver lowers to a few scalar branches on a uniform index, into short select chains.
+// Returns false for other instructions.
+bool EmitIndexedSelect(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	if (!state.indexed_selects_found) {
+		FindIndexedSelects(state);
+	}
+	if (state.indexed_select_members.contains(&inst)) {
+		return true;
+	}
+	if (!state.indexed_select_heads.contains(&inst)) {
+		return false;
+	}
+	IndexedSelectLink link;
+	IndexedSelectLinkOf(inst, link);
+	const auto selector = ctx.Def(link.index);
+	// Outer links take precedence over inner ones with the same constant, as in the chain.
+	std::vector<std::pair<uint32_t, uint32_t>> cases; // Constant, value.
+	std::unordered_set<uint32_t>               constants;
+	for (const auto* current = &inst;;) {
+		if (constants.insert(link.constant).second) {
+			cases.emplace_back(link.constant, ctx.Def(link.value));
+		}
+		IndexedSelectLink next;
+		const auto*       rest = NextIndexedSelect(*current, link, next);
+		if (rest == nullptr) {
+			break;
+		}
+		current = rest;
+		link    = next;
+	}
+	const auto fallback = ctx.Def(link.rest);
+	// A switch on index / 16 into short select chains: the driver runs one chain of at most 16
+	// selects, and the code stays about as large as the whole chain. One case per index value
+	// compiled twice as slowly (a block per register), for little more speed.
+	constexpr uint32_t BucketBits = 4;
+	std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> buckets;
+	for (const auto& [constant, value]: cases) {
+		if (value != fallback) {
+			buckets[constant >> BucketBits].emplace_back(constant, value);
+		}
+	}
+	const auto bucket_selector =
+	    EmitBinaryU32(state, spv::OpShiftRightLogical, selector, ConstantU32(state, BucketBits));
+	const auto            default_label = state.builder.AllocateId();
+	const auto            merge_label   = state.builder.AllocateId();
+	std::vector<uint32_t> labels;
+	std::vector<uint32_t> switch_words {spv::OpSwitch, bucket_selector, default_label};
+	for (const auto& [bucket, entries]: buckets) {
+		labels.push_back(state.builder.AllocateId());
+		switch_words.push_back(bucket);
+		switch_words.push_back(labels.back());
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(switch_words);
+	std::vector<uint32_t> phi_words {spv::OpPhi, TypeU32(state), state.builder.AllocateId(),
+	                                 fallback, default_label};
+	EmitLabel(state, default_label);
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	size_t label_index = 0;
+	for (const auto& [bucket, entries]: buckets) {
+		const auto label = labels[label_index++];
+		EmitLabel(state, label);
+		// The constants are distinct, so the order of the selects does not matter.
+		auto selected = fallback;
+		for (const auto& [constant, value]: entries) {
+			const auto match = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpIEqual, TypeBool(state), match, selector,
+			                          ConstantU32(state, constant));
+			const auto next = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), next, match, value, selected);
+			selected = next;
+		}
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		phi_words.push_back(selected);
+		phi_words.push_back(label);
+	}
+	EmitLabel(state, merge_label);
+	state.builder.AddFunction(phi_words);
+	ctx.Define(inst, phi_words[2]);
+	return true;
+}
+
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (inst.GetOpcode() == IR::ValueOpcode::SelectU32 && EmitIndexedSelect(ctx, inst)) {
+		return;
+	}
 	switch (inst.GetOpcode()) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
