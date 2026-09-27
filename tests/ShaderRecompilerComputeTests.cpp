@@ -30665,7 +30665,7 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,
                               ShaderType::TessellationEvaluation};
   for (u32 stage = 0; stage < stages.size(); stage++) {
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.logical_stage = stages[stage];
     vertex.tess = tess;
     CompileOptions options;
@@ -30800,7 +30800,7 @@ void CheckEmbeddedFetchVertexOffset() {
                            Prospero::BufferFormat format = Prospero::BufferFormat::k32_32_32_32Float) {
     std::array<u32, 11> user_data{};
     user_data[10] = slot10;
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.logical_stage = stage;
     vertex.tess = {.input_control_points = 3, .output_control_points = 3,
                    .ls_stride = 124, .hs_stride = 128, .domain = 1,
@@ -30844,7 +30844,7 @@ void CheckEmbeddedFetchVertexOffset() {
 
   const auto Resolve = [](const CompiledShader &result,
                           u32 index_offset) {
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.fetch_embedded = true;
     ShaderRecompiler::IR::CompiledShaderInfo program{};
     program.user_data_base = result.program.user_data_base;
@@ -30855,7 +30855,7 @@ void CheckEmbeddedFetchVertexOffset() {
   };
 
   const auto ResolveInstance = [](const CompiledShader &result) {
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.fetch_embedded = true;
     ShaderRecompiler::IR::CompiledShaderInfo program{};
     program.user_data_base = result.program.user_data_base;
@@ -33502,7 +33502,7 @@ void CheckEmbeddedFetchLaneSpill() {
   AppendEnd(&code);
 
   std::array<u32, 11> user_data{};
-  ShaderVertexInputInfo vertex;
+  ShaderVertexInputInfo vertex{};
   vertex.fetch_embedded = true;
   vertex.fetch_buffer_reg = 0;
   vertex.resources_num = 1;

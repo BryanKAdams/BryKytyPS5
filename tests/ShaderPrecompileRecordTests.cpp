@@ -83,7 +83,7 @@ PermutationRecord MakeRecord(ShaderType stage) {
     i.dispatch_threads_num[0] = 12345;
     r.info = i;
   } else {
-    ShaderVertexInputInfo i;
+    ShaderVertexInputInfo i{};
     i.logical_stage = stage;
     i.resources_num = 1;
     i.resources[0].fields[0] = 0x12345678u;

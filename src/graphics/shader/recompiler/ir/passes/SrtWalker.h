@@ -78,6 +78,9 @@ private:
 	ResourcePlan::EvaluationContext& m_context;
 };
 
+// Whether plans compiled from now on read consecutive flat SRT slots as runs (the default).
+void SetFlatRunReads(bool enabled);
+
 // Resolves a plan's descriptor, SRT, condition and fill values into index-based nodes. The plan
 // must not be modified afterwards.
 const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program);
@@ -104,6 +107,8 @@ private:
 	bool EvaluateWide(uint32_t node, uint64_t& result);
 	bool EvaluateInst(const ResourceNode& node, uint64_t& result);
 	bool EvaluateRawRead(const ResourceNode& node, uint64_t& result);
+	// Reads a run's dwords into their flat slots and memos; false leaves both unchanged.
+	bool ReadFlatRun(const CompiledResourcePlan::FlatRun& run, std::vector<uint32_t>& flat);
 
 	const ResourcePlan&              m_program;
 	const CompiledResourcePlan&      m_compiled;

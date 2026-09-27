@@ -593,9 +593,25 @@ struct ResourceNode {
 
 // Index-based form of a ResourcePlan, built once on the GPU thread before its first refresh.
 struct CompiledResourcePlan {
+	// Ordinary slots whose RawAddress nodes differ only in their immediate offset, at
+	// consecutive dwords: a refresh reads the run with one call per 64-byte block.
+	struct FlatRun {
+		uint32_t first  = 0; // Into run_entries; the first entry reads dword 0.
+		uint32_t count  = 0; // Entries.
+		uint32_t dwords = 0;
+	};
+	struct FlatRunEntry {
+		uint32_t slot  = 0; // srt_reads index.
+		uint32_t dword = 0; // Within the run.
+	};
+	static constexpr uint32_t MaxRunDwords = 64;
+
 	std::vector<ResourceNode>            nodes;
 	std::vector<uint32_t>                slots;       // Node per srt_reads entry.
 	std::vector<uint8_t>                 clean_slots; // Copy of ResourcePlan::clean_flat_slots.
+	std::vector<FlatRun>                 flat_runs;
+	std::vector<FlatRunEntry>            run_entries;
+	std::vector<uint8_t>                 in_run; // Per srt_reads entry; empty without runs.
 	std::vector<std::array<uint32_t, 8>> descriptors; // Nodes per descriptor source dword.
 	// Per descriptor source dword: the flat SRT offset when the dword is exactly a slot that the
 	// ordinary walker reads (so its value is already in the refreshed flat buffer), else NoNode.

@@ -842,7 +842,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 		// Debugging aids: KYTY_VERIFY_SRT=1 checks every cached resource refresh against the
 		// reference SRT walker and aborts on a difference; KYTY_SRT_STATS=1 logs how often
-		// refreshes reuse descriptors.
+		// refreshes reuse descriptors; KYTY_DEBUG_SRT_RUNS=0 reads flat SRT slots one by one (A/B).
 		const auto enabled = [](const char* name) {
 			const char* value = std::getenv(name);
 			return value != nullptr && std::strcmp(value, "1") == 0;
@@ -851,6 +851,10 @@ struct PipelineCache::ProgramCache {
 			ShaderRecompiler::IR::SetResourceMaterializationVerification(true);
 		}
 		stats_enabled = enabled("KYTY_SRT_STATS");
+		if (const char* runs = std::getenv("KYTY_DEBUG_SRT_RUNS");
+		    runs != nullptr && std::strcmp(runs, "0") == 0) {
+			ShaderRecompiler::IR::SetFlatRunReads(false);
+		}
 	}
 
 	void CountRefresh(const SourceEntry& source) {

@@ -517,9 +517,41 @@ Restarts fell from about 10,000 to 2,100 a second and GPU busy from 44 to 34 ms 
 frame rate stayed at 13.3 fps, because Thread_Gpu (about 14 us a draw) is now the limit. The
 desert's sand dip gained from the same change: its worst second rose to 51 fps.
 
+`KYTY_DEBUG_SAMPLE_GPU=250` samples Thread_Gpu's call stacks (see `threadSampler.h`). On Sky
+Garden it put resource materialization at 24% of the thread. Most of that was
+`RefreshFlatBuffer`, which read every flat SRT slot through its own read callback and 64-byte
+block lookup, about 30 dwords per stage. The compiled plan now groups the slots that read
+consecutive dwords through one handle into runs (`CompiledResourcePlan::flat_runs`), and a
+refresh reads each run once per 64-byte block. The Sky Garden journal's benchmark pass made
+14,344 reads before and 999 after, with no mismatch against the reference walker.
+`KYTY_DEBUG_SRT_RUNS=0` reads slot by slot for A/B runs.
+
+The profile also showed each draw zeroing 36 KB of `DrawRenderState`, mostly three 10 KB
+`ShaderVertexInputInfo`s, and then zeroing the vertex stage's again while preparing it. Their
+attribute lists (8 KB) are now left uninitialized: only the first `attr_num` entries are ever read.
+The draw state is default-initialized, and `GetGraphicsPrograms` prepares each stage it uses
+before anything reads it.
+
+With `KYTY_DEBUG_DRAW_PHASES=all` on the level start with dense grass, base 11.83 us and new
+10.57 us per draw:
+
+| phase | base (us/draw) | new (us/draw) |
+| --- | --- | --- |
+| ps-program | 2.49 | 1.74 |
+| vs-program | 0.92 | 0.84 |
+| vs-params | 0.66 | 0.39 |
+| setup | 0.84 | 0.66 |
+
+The frame rate went from 15.3 to 17.0 fps. The level's grass differs between runs of one build:
+some runs draw dense ferns in the left field and run about 1.8 fps slower. Compare runs only
+after checking their screenshots.
+
 `scratchpad\flamingo.ps1` in the session that did this drives the route: a copy of the user's
 save (`C:\Games\_SaveFlamingo`, slot 1), the overworld up to the Gorilla Nebula, Sky Garden
-(hold cross to dive in), then samples standing still at the level start. Game runs share one
+(hold cross to dive in), then samples standing still at the level start. Since 2026-09-27 some
+runs' warp tunnel runs at 60 fps for longer than the route's frame count, so the route also waits
+for the level's own frame rate (three seconds under 40 fps). A 60.0 fps sample is the warp, not
+the level. Game runs share one
 GPU and window: sessions take `C:\Games\runs\RUN.lock` before launching or building.
 
 ## First-use stutter (pipeline compiles)

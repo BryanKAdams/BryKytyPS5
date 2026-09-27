@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <map>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1508,7 +1509,88 @@ void AnalyzeMemo(const ResourcePlan& program, CompiledResourcePlan& compiled) {
 	compiled.memoizable = true;
 }
 
+bool g_flat_run_reads = true; // See SetFlatRunReads.
+
+// Groups the ordinary slots that read consecutive dwords through one handle and offset (a
+// scalar load of several dwords becomes one LoadAddressU32 per dword) into runs.
+void BuildFlatRuns(const ResourcePlan& program, CompiledResourcePlan& compiled) {
+	if (!g_flat_run_reads) {
+		return;
+	}
+	struct Candidate {
+		uint32_t low    = 0;
+		uint32_t high   = 0;
+		uint32_t offset = 0;
+		int64_t  imm    = 0;
+		uint32_t slot   = 0;
+
+		[[nodiscard]] bool SameBase(const Candidate& other) const {
+			return low == other.low && high == other.high && offset == other.offset;
+		}
+	};
+	std::vector<Candidate> candidates;
+	for (uint32_t slot = 0; slot < compiled.slots.size(); slot++) {
+		const auto flat_offset = program.srt_reads[slot].flat_offset;
+		if (flat_offset >= program.srt_reads.size() ||
+		    (flat_offset < compiled.clean_slots.size() && compiled.clean_slots[flat_offset] != 0u)) {
+			continue;
+		}
+		const auto& node = compiled.nodes[compiled.slots[slot]];
+		const auto  imm  = static_cast<int64_t>(node.imm);
+		if (node.op != NodeOp::RawAddress || (imm & 3) != 0) {
+			continue;
+		}
+		candidates.push_back({node.args[0], node.args[1], node.args[2], imm, slot});
+	}
+	std::ranges::sort(candidates, [](const Candidate& a, const Candidate& b) {
+		return std::tie(a.low, a.high, a.offset, a.imm, a.slot) <
+		       std::tie(b.low, b.high, b.offset, b.imm, b.slot);
+	});
+	std::vector<CompiledResourcePlan::FlatRunEntry> entries;
+	const auto flush = [&](int64_t first_imm, int64_t last_imm) {
+		// A single dword gains nothing from a run.
+		if (entries.size() >= 2u && last_imm > first_imm) {
+			compiled.flat_runs.push_back({
+			    .first  = static_cast<uint32_t>(compiled.run_entries.size()),
+			    .count  = static_cast<uint32_t>(entries.size()),
+			    .dwords = static_cast<uint32_t>((last_imm - first_imm) / 4 + 1),
+			});
+			compiled.run_entries.insert(compiled.run_entries.end(), entries.begin(), entries.end());
+		}
+		entries.clear();
+	};
+	int64_t first_imm = 0;
+	int64_t last_imm  = 0;
+	for (size_t index = 0; index < candidates.size(); index++) {
+		const auto& candidate = candidates[index];
+		const bool  extends   = index != 0 && candidate.SameBase(candidates[index - 1]) &&
+		                     candidate.imm - last_imm <= 4 &&
+		                     (candidate.imm - first_imm) / 4 < CompiledResourcePlan::MaxRunDwords;
+		if (!extends) {
+			flush(first_imm, last_imm);
+			first_imm = candidate.imm;
+		}
+		last_imm = candidate.imm;
+		entries.push_back({candidate.slot, static_cast<uint32_t>((candidate.imm - first_imm) / 4)});
+	}
+	flush(first_imm, last_imm);
+	if (!compiled.flat_runs.empty()) {
+		compiled.in_run.assign(compiled.slots.size(), 0u);
+		for (const auto& entry: compiled.run_entries) {
+			compiled.in_run[entry.slot] = 1u;
+		}
+		// The first entry of a run reads dword 0, and its node gives the run's base.
+		for (const auto& run: compiled.flat_runs) {
+			EXIT_IF(compiled.run_entries[run.first].dword != 0u);
+		}
+	}
+}
+
 } // namespace
+
+void SetFlatRunReads(bool enabled) {
+	g_flat_run_reads = enabled;
+}
 
 const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
 	if (program.compiled != nullptr) {
@@ -1566,6 +1648,7 @@ const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
 	}
 	AnalyzeControlFlow(program, *compiled);
 	AnalyzeMemo(program, *compiled);
+	BuildFlatRuns(program, *compiled);
 	program.compiled = std::move(compiled);
 	return *program.compiled;
 }
@@ -2103,7 +2186,25 @@ bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return false;
 	}
 	flat.resize(m_program.srt_reads.size());
+	// Run slots are ordinary: this walker evaluates them. A run that cannot be read whole
+	// evaluates its slots one by one, and fails exactly as that would.
+	const bool runs = !m_compiled.flat_runs.empty() && m_active_mask == ResourceNode::NoNode;
+	for (uint32_t run = 0; runs && run < m_compiled.flat_runs.size(); run++) {
+		const auto& info = m_compiled.flat_runs[run];
+		if (ReadFlatRun(info, flat)) {
+			continue;
+		}
+		for (uint32_t index = 0; index < info.count; index++) {
+			const auto slot = m_compiled.run_entries[info.first + index].slot;
+			if (!Evaluate(m_compiled.slots[slot], flat[m_program.srt_reads[slot].flat_offset])) {
+				return false;
+			}
+		}
+	}
 	for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
+		if (runs && m_compiled.in_run[slot] != 0u) {
+			continue;
+		}
 		const auto offset = m_program.srt_reads[slot].flat_offset;
 		const bool clean  = m_clean_flat_slots && offset < m_compiled.clean_slots.size() &&
 		                   m_compiled.clean_slots[offset] != 0u;
@@ -2119,6 +2220,56 @@ bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	// Only this walker's own contexts use the shortcut; nested EXEC walkers evaluate normally.
 	if (m_active_mask == ResourceNode::NoNode) {
 		m_flat = &flat;
+	}
+	return true;
+}
+
+bool SrtEvaluator::ReadFlatRun(const CompiledResourcePlan::FlatRun& run,
+                               std::vector<uint32_t>& flat) {
+	const auto* entries = m_compiled.run_entries.data() + run.first;
+	const auto& node    = m_nodes[m_compiled.slots[entries[0].slot]];
+	uint64_t    low     = 0;
+	uint64_t    high    = 0;
+	uint64_t    offset  = 0;
+	if (!EvaluateWide(node.args[0], low) || !EvaluateWide(node.args[1], high) ||
+	    !EvaluateWide(node.args[2], offset)) {
+		return false;
+	}
+	// As EvaluateRawRead computes each dword's address; the immediates are dword multiples.
+	const auto base     = (((high << 32u) | static_cast<uint32_t>(low)) & AddressMask) & ~uint64_t {3};
+	const auto relative = static_cast<int64_t>(node.imm) +
+	                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+	const auto span     = static_cast<int64_t>(run.dwords - 1u) * 4;
+	uint64_t   first    = 0;
+	uint64_t   last     = 0;
+	if (!AddSignedAddress(base, relative, first) || !AddSignedAddress(base, relative + span, last) ||
+	    last - first != static_cast<uint64_t>(span)) {
+		return false;
+	}
+	// One read per 64-byte block, as dword reads through a block cache would see memory.
+	std::array<uint32_t, CompiledResourcePlan::MaxRunDwords> words;
+	for (uint32_t done = 0; done < run.dwords;) {
+		const auto address = first + uint64_t {done} * 4u;
+		const auto count   = std::min<uint64_t>(run.dwords - done, (64u - (address & 63u)) / 4u);
+		const auto values  = std::span(words.data() + done, count);
+		if (m_runtime.read_memory != nullptr) {
+			if (!m_runtime.read_memory(m_runtime.userdata, address, values)) {
+				return false;
+			}
+		} else {
+			std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		}
+		done += static_cast<uint32_t>(count);
+	}
+	for (uint32_t index = 0; index < run.count; index++) {
+		const auto& entry = entries[index];
+		auto&       memo  = m_memo[m_compiled.slots[entry.slot]];
+		// A slot this refresh already evaluated (a condition read it) keeps that value.
+		if (memo.generation != m_generation) {
+			memo.value      = words[entry.dword];
+			memo.generation = m_generation;
+		}
+		flat[m_program.srt_reads[entry.slot].flat_offset] = static_cast<uint32_t>(memo.value);
 	}
 	return true;
 }
