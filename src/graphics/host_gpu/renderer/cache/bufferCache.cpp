@@ -602,6 +602,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	RecordUpload(t_upload_source, buffer.CpuAddress() + copies.front().dstOffset, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
@@ -646,6 +647,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
 			m_stream_buffer.Commit();
+			RecordUpload(UploadSource::Stream, vaddr, size);
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -681,6 +683,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
+	const UploadSourceScope upload_source(UploadSource::Image);
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
@@ -700,6 +703,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();
+	RecordUpload(UploadSource::Image, vaddr, size);
 	return {&m_staging_buffer, stage_offset};
 }
 
@@ -896,6 +900,7 @@ void BufferCache::PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept {
 }
 
 void BufferCache::SynchronizeBdaLegacy(const RangeSet& mapped) {
+	const UploadSourceScope upload_source(UploadSource::Bda);
 	// Clear before the full walk so writes racing with the walk stay pending. Summaries go
 	// first: a hint published in between re-sets its summary bit for the next pass.
 	for (size_t summary = 0; summary < MemoryTracker::BDA_SUMMARY_WORDS; ++summary) {
@@ -909,6 +914,7 @@ void BufferCache::SynchronizeBdaLegacy(const RangeSet& mapped) {
 }
 
 bool BufferCache::SynchronizeBdaSelective(const RangeSet& mapped) {
+	const UploadSourceScope upload_source(UploadSource::Bda);
 	for (size_t summary = 0; summary < MemoryTracker::BDA_SUMMARY_WORDS; ++summary) {
 		uint64_t words = m_memory_tracker.ConsumeBdaSummaryWord(summary);
 		// On failure, words not yet visited keep their hint bits; restore their summary bits.

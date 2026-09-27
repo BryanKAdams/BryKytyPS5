@@ -1213,6 +1213,9 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		RecordImageUpload(image.info.data.address, image.info.data.size, image.info.extent.width,
+		                  image.info.extent.height, static_cast<uint32_t>(image.info.guest_format),
+		                  static_cast<uint32_t>(image.info.tile_mode), image.IsBufferModified());
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {

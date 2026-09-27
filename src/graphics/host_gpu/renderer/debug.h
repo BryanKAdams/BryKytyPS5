@@ -119,6 +119,36 @@ private:
 };
 inline thread_local DrawPhaseTimer g_draw_phases;
 
+// KYTY_DEBUG_UPLOADS=1 (with KYTY_DEBUG_DRAW_PHASES): guest memory copied for the GPU, counted
+// per source and printed after each draw-phases line with the images and 4 MiB regions copied
+// most. A copy counts under its thread's innermost UploadSourceScope.
+enum class UploadSource : uint8_t {
+	Buffer, // SynchronizeBuffer outside the scopes below, mostly for bound buffers.
+	Bda,    // PrepareBda's dirty-page synchronization.
+	Stream, // ObtainBuffer's stream-buffer copies of small CPU-written ranges.
+	Image,  // Image uploads (whole image ranges).
+	Fault,  // Not a copy: guest write faults on tracked pages, counted as one page each.
+	BdaPass, // Not a copy: PrepareBda calls.
+	Count
+};
+inline thread_local UploadSource t_upload_source = UploadSource::Buffer;
+[[nodiscard]] bool UploadStatsEnabled() noexcept;
+void               RecordUpload(UploadSource source, uint64_t address, uint64_t bytes) noexcept;
+void RecordImageUpload(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
+                       uint32_t guest_format, uint32_t tile_mode, bool buffer_modified) noexcept;
+class UploadSourceScope {
+public:
+	explicit UploadSourceScope(UploadSource source) noexcept: m_previous(t_upload_source) {
+		t_upload_source = source;
+	}
+	~UploadSourceScope() { t_upload_source = m_previous; }
+	UploadSourceScope(const UploadSourceScope&)            = delete;
+	UploadSourceScope& operator=(const UploadSourceScope&) = delete;
+
+private:
+	UploadSource m_previous;
+};
+
 class CommandBuffer;
 
 namespace HW {

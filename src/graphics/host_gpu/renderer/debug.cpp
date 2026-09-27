@@ -17,8 +17,11 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <intrin.h>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -665,6 +668,131 @@ bool AbFeatureOff() noexcept {
 	return g_ab_off.load(std::memory_order_relaxed);
 }
 
+namespace {
+
+struct ImageUploadEntry {
+	uint64_t size            = 0;
+	uint32_t width           = 0;
+	uint32_t height          = 0;
+	uint32_t guest_format    = 0;
+	uint32_t tile_mode       = 0;
+	uint64_t count           = 0;
+	uint64_t buffer_modified = 0;
+};
+
+struct UploadStats {
+	std::mutex                                      mutex;
+	std::array<uint64_t, size_t(UploadSource::Count)> calls {};
+	std::array<uint64_t, size_t(UploadSource::Count)> bytes {};
+	// Keyed by source << 56 | 4 MiB region.
+	std::unordered_map<uint64_t, uint64_t>         regions;
+	std::unordered_map<uint64_t, ImageUploadEntry> images;
+	// Write faults per 4 KiB page.
+	std::unordered_map<uint64_t, uint64_t>         fault_pages;
+};
+
+UploadStats& GetUploadStats() {
+	static UploadStats stats;
+	return stats;
+}
+
+void PrintUploadStats(double seconds) {
+	static constexpr std::array<const char*, size_t(UploadSource::Count)> Names {
+	    "buffer", "bda", "stream", "image", "fault", "bda-pass"};
+	auto&            stats = GetUploadStats();
+	std::scoped_lock lock {stats.mutex};
+	std::string      line = "uploads:";
+	for (size_t i = 0; i < stats.calls.size(); i++) {
+		line += fmt::format(" {}={:.0f}/s,{:.0f}KiB/s", Names[i], stats.calls[i] / seconds,
+		                    stats.bytes[i] / 1024.0 / seconds);
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> regions(stats.regions.begin(), stats.regions.end());
+	std::sort(regions.begin(), regions.end(),
+	          [](const auto& a, const auto& b) { return a.second > b.second; });
+	line += " | regions:";
+	for (size_t i = 0; i < std::min<size_t>(regions.size(), 12); i++) {
+		line += fmt::format(" {}@0x{:x}={:.0f}KiB/s", Names[regions[i].first >> 56u],
+		                    (regions[i].first & ((uint64_t {1} << 56u) - 1)) << 22u,
+		                    regions[i].second / 1024.0 / seconds);
+	}
+	// How often each faulting page faulted in the window (about 90 frames at 18 fps): pages with
+	// 1, 2-15, 16-63, 64-127, 128-255, 256-511 and 512+ faults.
+	static constexpr std::array<uint64_t, 6> Limits {2, 16, 64, 128, 256, 512};
+	std::array<uint64_t, Limits.size() + 1>  buckets {};
+	for (const auto& [page, count]: stats.fault_pages) {
+		size_t bucket = 0;
+		while (bucket < Limits.size() && count >= Limits[bucket]) {
+			bucket++;
+		}
+		buckets[bucket]++;
+	}
+	line += fmt::format(" | fault pages={} (x1={} x2-15={} x16-63={} x64-127={} x128-255={} "
+	                    "x256-511={} x512+={})",
+	                    stats.fault_pages.size(), buckets[0], buckets[1], buckets[2], buckets[3],
+	                    buckets[4], buckets[5], buckets[6]);
+	std::printf("%s\n", line.c_str());
+	std::vector<std::pair<uint64_t, ImageUploadEntry>> images(stats.images.begin(),
+	                                                          stats.images.end());
+	std::sort(images.begin(), images.end(), [](const auto& a, const auto& b) {
+		return a.second.count * a.second.size > b.second.count * b.second.size;
+	});
+	for (size_t i = 0; i < std::min<size_t>(images.size(), 10); i++) {
+		const auto& [address, image] = images[i];
+		std::printf("uploads: image 0x%" PRIx64 " size=0x%" PRIx64 " %ux%u fmt=%u tile=%u "
+		            "uploads/s=%.1f KiB/s=%.0f buffer-modified=%" PRIu64 "\n",
+		            address, image.size, image.width, image.height, image.guest_format,
+		            image.tile_mode, image.count / seconds,
+		            image.count * image.size / 1024.0 / seconds, image.buffer_modified);
+	}
+	stats.calls.fill(0);
+	stats.bytes.fill(0);
+	stats.regions.clear();
+	stats.images.clear();
+	stats.fault_pages.clear();
+}
+
+} // namespace
+
+bool UploadStatsEnabled() noexcept {
+	static const bool enabled =
+	    DrawPhaseTimer::Hash() != 0 && std::getenv("KYTY_DEBUG_UPLOADS") != nullptr;
+	return enabled;
+}
+
+void RecordUpload(UploadSource source, uint64_t address, uint64_t bytes) noexcept {
+	if (!UploadStatsEnabled()) {
+		return;
+	}
+	auto&            stats = GetUploadStats();
+	const auto       index = static_cast<uint64_t>(source);
+	std::scoped_lock lock {stats.mutex};
+	stats.calls[index]++;
+	stats.bytes[index] += bytes;
+	if (bytes != 0) {
+		stats.regions[index << 56u | address >> 22u] += bytes;
+	}
+	if (source == UploadSource::Fault) {
+		stats.fault_pages[address >> 12u]++;
+	}
+}
+
+void RecordImageUpload(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
+                       uint32_t guest_format, uint32_t tile_mode, bool buffer_modified) noexcept {
+	if (!UploadStatsEnabled()) {
+		return;
+	}
+	auto&            stats = GetUploadStats();
+	std::scoped_lock lock {stats.mutex};
+	auto&            entry = stats.images[address];
+	entry.size             = size;
+	entry.width            = width;
+	entry.height           = height;
+	entry.guest_format     = guest_format;
+	entry.tile_mode        = tile_mode;
+	entry.count++;
+	entry.buffer_modified += buffer_modified ? 1 : 0;
+}
+
 void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	if (!active) {
 		return;
@@ -728,6 +856,9 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 		                    draws != 0 ? probe_totals[i] * to_us / draws : 0.0);
 	}
 	std::printf("%s\n", line.c_str());
+	if (UploadStatsEnabled()) {
+		PrintUploadStats(seconds);
+	}
 	if (AbEnabled()) {
 		g_ab_off.store(!AbFeatureOff(), std::memory_order_relaxed);
 	}

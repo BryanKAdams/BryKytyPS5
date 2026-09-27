@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -88,6 +89,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (access == PageFaultAccess::Write) {
 		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadWriteFault
 		                                          : DrainStats::Reason::GuestWriteFault);
+		RecordUpload(UploadSource::Fault, fault_vaddr, 0x1000);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
@@ -161,6 +163,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	RecordUpload(UploadSource::BdaPass, 0, 0);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	const auto       mode = Config::GetBdaSyncMode();
 	if (mode == Config::BdaSyncMode::Legacy ||
