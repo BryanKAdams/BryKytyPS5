@@ -40,6 +40,12 @@ struct PreparedBindings {
 		ImageId                               found;          // FindImage's result.
 		uint64_t                              generation = 0; // 0: not reusable.
 		uint32_t                              metadata_base_layer = 0;
+		// The view FindTexture last returned for a sampled binding of view_image, and the image
+		// set's generation then (see TextureCache::IsTextureCurrent); generation 0: none.
+		vk::ImageView                         view;
+		ImageId                               view_image;
+		ImageViewInfo                         view_info;
+		uint64_t                              view_generation = 0;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.

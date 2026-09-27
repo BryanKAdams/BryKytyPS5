@@ -693,9 +693,21 @@ TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResource& re
 // and over, so recent descriptions are kept. An entry holds copies of both inputs: a hit is exact.
 class TextureDescriptionCache {
 public:
-	const TextureDescription& Get(const ShaderRecompiler::IR::ImageResource&   resource,
-	                              const ShaderRecompiler::IR::DescriptorValue& value,
-	                              const ShaderTextureResource&                 descriptor) {
+	struct Entry {
+		bool                                  valid = false;
+		ShaderRecompiler::IR::DescriptorValue value;
+		ShaderRecompiler::IR::ImageResource   resource;
+		TextureDescription                    description;
+		// The description's last FindImage result (see TextureCache::RefindImage) and the image
+		// ResolveTexture bound for it; generation 0: none.
+		uint64_t                              generation = 0;
+		ImageId                               found;
+		ImageId                               bound;
+	};
+
+	Entry& Get(const ShaderRecompiler::IR::ImageResource&   resource,
+	           const ShaderRecompiler::IR::DescriptorValue& value,
+	           const ShaderTextureResource&                 descriptor) {
 		uint32_t hash = 2166136261u;
 		for (const auto dword: value.dwords) {
 			hash = (hash ^ dword) * 16777619u;
@@ -707,20 +719,25 @@ public:
 			entry.value       = value;
 			entry.resource    = resource;
 			entry.valid       = true;
+			entry.generation  = 0;
 		}
-		return entry.description;
+		return entry;
 	}
 
 private:
 	static constexpr size_t Size = 256;
-	struct Entry {
-		bool                                   valid = false;
-		ShaderRecompiler::IR::DescriptorValue  value;
-		ShaderRecompiler::IR::ImageResource    resource;
-		TextureDescription                     description;
-	};
 	std::vector<Entry> m_entries = std::vector<Entry>(Size);
 };
+
+// KYTY_DEBUG_TEXTURE_REUSE=0 resolves every texture binding from scratch, for A/B runs (see also
+// AbFeatureOff).
+bool TextureReuseEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_TEXTURE_REUSE");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	return enabled && !AbFeatureOff();
+}
 
 } // namespace
 
@@ -747,25 +764,43 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	thread_local TextureDescriptionCache descriptions;
 	std::optional<DrawPhaseTimer::ProbeScope> describe_probe;
 	describe_probe.emplace(g_draw_phases, DrawPhaseTimer::TextureDescribe);
-	const auto& described = descriptions.Get(resource, value, descriptor);
+	auto&       entry     = descriptions.Get(resource, value, descriptor);
+	const auto& described = entry.description;
 	auto        desc      = described.desc;
 	describe_probe.reset();
 
 	const auto metadata_base_layer = desc.view_info.base_layer;
-	uint64_t   generation          = 0;
-	ImageId    id;
+	const auto remember            = [&](ImageId found, uint64_t generation) {
+		if (source != nullptr && generation != 0) {
+			source->resource            = resource;
+			source->value               = value;
+			source->found               = found;
+			source->generation          = generation;
+			source->metadata_base_layer = metadata_base_layer;
+		}
+	};
+	// The description's previous lookup still holds while the image set is unchanged, and the
+	// validation below passed for the image it bound while that image's stencil association is
+	// unchanged (see ReuseTexture).
+	if (TextureReuseEnabled() && entry.generation != 0 &&
+	    texture_cache.RefindImage(entry.found, entry.generation, desc, metadata_base_layer)) {
+		const auto depth_id = texture_cache.GetImage(entry.found).depth_id;
+		if ((depth_id ? depth_id : entry.found) == entry.bound) {
+			remember(entry.found, entry.generation);
+			return {entry.bound, nullptr, std::move(desc)};
+		}
+	}
+	entry.generation = 0;
+
+	uint64_t generation = 0;
+	ImageId  id;
 	{
 		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::TextureImage);
 		id = texture_cache.FindImage(desc, described.shader_conversion, &generation);
 	}
-	if (source != nullptr && generation != 0) {
-		source->resource            = resource;
-		source->value               = value;
-		source->found               = id;
-		source->generation          = generation;
-		source->metadata_base_layer = metadata_base_layer;
-	}
-	auto*      image               = &texture_cache.GetImage(id);
+	remember(id, generation);
+	const auto found = id;
+	auto*      image = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
 		id    = image->depth_id;
@@ -782,6 +817,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, described.pixel_format,
 		                             descriptor.DstSelXYZW());
+	}
+	if (generation != 0) {
+		entry.generation = generation;
+		entry.found      = found;
+		entry.bound      = id;
 	}
 	return {id, nullptr, std::move(desc)};
 }
@@ -846,11 +886,7 @@ static bool ReuseTexture(TextureCache& cache, const PreparedBindings::ImageSourc
                          const TextureBinding&                        binding,
                          const ShaderRecompiler::IR::ImageResource&   resource,
                          const ShaderRecompiler::IR::DescriptorValue& value) {
-	static const bool enabled = [] {
-		const char* text = std::getenv("KYTY_DEBUG_TEXTURE_REUSE");
-		return text == nullptr || std::strcmp(text, "0") != 0;
-	}();
-	if (!enabled || source.generation == 0 || !(source.value == value) ||
+	if (!TextureReuseEnabled() || source.generation == 0 || !(source.value == value) ||
 	    !(source.resource == resource) ||
 	    !cache.RefindImage(source.found, source.generation, binding.desc,
 	                       source.metadata_base_layer)) {
@@ -1010,8 +1046,21 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
 			binding.image_view = binding.mip_views.front();
+		} else if (auto& source = prepared.image_sources[i];
+		           binding.desc.type == TextureCache::BindingType::Texture &&
+		           TextureReuseEnabled() && source.view_image == binding.image_id &&
+		           source.view_info == binding.desc.view_info &&
+		           texture_cache.IsTextureCurrent(binding.image_id, source.view_generation)) {
+			// A clean sampled image keeps the view FindTexture returned for this binding before.
+			binding.image_view = source.view;
 		} else {
-			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+			const auto generation = texture_cache.ImageSetGeneration();
+			binding.image_view    = texture_cache.FindTexture(binding.image_id, binding.desc);
+			source.view_generation =
+			    binding.desc.type == TextureCache::BindingType::Texture ? generation : 0;
+			source.view       = binding.image_view;
+			source.view_image = binding.image_id;
+			source.view_info  = binding.desc.view_info;
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;

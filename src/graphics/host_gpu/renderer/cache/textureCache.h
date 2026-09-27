@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -57,6 +58,16 @@ public:
 	// unique_generation). Returns false, doing nothing, when the image set changed since.
 	[[nodiscard]] bool          RefindImage(ImageId id, uint64_t generation, const ImageDesc& desc,
 	                                        uint32_t metadata_base_layer);
+	[[nodiscard]] uint64_t      ImageSetGeneration() const noexcept {
+		return m_image_set_generation.load(std::memory_order_acquire);
+	}
+	// Whether FindTexture for a sampled texture that returned a view while the image set had this
+	// generation would now only touch the image and return that view again: the image and its
+	// views still live, and it needs no refresh. Reads the image without m_lock, as GetImage does.
+	[[nodiscard]] bool          IsTextureCurrent(ImageId id, uint64_t generation) const noexcept;
+	// The same for FindRenderTarget: the target is also GPU-owned already, so marking it written
+	// changes nothing.
+	[[nodiscard]] bool IsRenderTargetCurrent(ImageId id, uint64_t generation) const noexcept;
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -270,7 +281,14 @@ private:
 	}
 	static constexpr size_t              ImageLookupCount = 512;
 	std::array<ImageLookup, ImageLookupCount> m_image_lookups {};
-	uint64_t                             m_image_set_generation = 1;
+	// Each cache counts from its own base, so a generation remembered from one cache (a test's
+	// earlier context, say) never matches another's.
+	[[nodiscard]] static uint64_t        NextGenerationBase() noexcept {
+		static std::atomic<uint64_t> caches {0};
+		return (caches.fetch_add(1, std::memory_order_relaxed) + 1) << 40u;
+	}
+	// Changed under m_lock; IsTextureCurrent reads it without.
+	std::atomic<uint64_t>                m_image_set_generation {NextGenerationBase()};
 
 	friend struct TextureCacheTestAccess;
 	friend struct PerformanceMemoryTestAccess;

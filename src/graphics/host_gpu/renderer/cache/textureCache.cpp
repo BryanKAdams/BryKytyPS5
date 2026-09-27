@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -1674,8 +1675,33 @@ bool TextureCache::RefindImage(ImageId id, uint64_t generation, const ImageDesc&
 	return true;
 }
 
+bool TextureCache::IsTextureCurrent(ImageId id, uint64_t generation) const noexcept {
+	if (generation == 0 || generation != m_image_set_generation.load(std::memory_order_acquire)) {
+		return false;
+	}
+	// FindTexture's RefreshImage and stencil refresh would do nothing: the image is tracked over
+	// its whole range and neither CPU nor buffer writes made it dirty.
+	const auto& image = m_slot_images[id];
+	return image.registered && !image.depth_id && !image.binding.needs_rebind &&
+	       !image.info.data.Empty() && !image.info.HasStencil() && !image.IsCpuDirty() &&
+	       !image.IsBufferModified() && image.track_addr == image.info.data.address &&
+	       image.track_addr_end == image.info.data.End();
+}
+
+bool TextureCache::IsRenderTargetCurrent(ImageId id, uint64_t generation) const noexcept {
+	if (!IsTextureCurrent(id, generation)) {
+		return false;
+	}
+	// FindRenderTarget's MarkGpuModified, CommitGpuWrite and usage flag would change nothing, and
+	// TrackImageDownload enrolls nothing (linear readback images re-enroll every acquisition).
+	const auto& image = m_slot_images[id];
+	return image.IsGpuModified() && image.usage.render_target && image.backing.image != nullptr &&
+	       !(m_readback_linear_images && !image.info.IsTiled());
+}
+
 // The part of FindImage after the lookup that runs without the lock.
 void TextureCache::FinishFind(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer) {
+	DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::FindFinish);
 	MaterializeDccClear(id, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {

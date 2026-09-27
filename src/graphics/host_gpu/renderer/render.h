@@ -288,7 +288,14 @@ private:
 		uint64_t         generation          = 0; // 0: not reusable.
 		uint32_t         metadata_base_layer = 0;
 		RenderColorInfo  target;
+		// The view FindRenderTarget last returned for this slot (see
+		// TextureCache::IsRenderTargetCurrent); view_generation 0: none.
+		vk::ImageView    view;
+		ImageId          view_image;
+		ImageViewInfo    view_info;
+		uint64_t         view_generation = 0;
 	};
+	[[nodiscard]] static bool TargetReuseEnabled();
 	// The same for the depth target: its description and image, keyed by its registers.
 	struct DepthTargetSource {
 		HW::DepthRenderTarget   registers;

@@ -691,8 +691,22 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    owner->binding.needs_rebind) {
 			EXIT("color target changed after render-state discovery\n");
 		}
-		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
-		auto&      image      = cache.GetImage(target.image_id);
+		// A clean target the previous draw acquired keeps its view (see IsRenderTargetCurrent).
+		auto&         acquired = m_color_target_sources.at(target.target_slot);
+		vk::ImageView image_view;
+		if (TargetReuseEnabled() && acquired.view_image == target.image_id &&
+		    acquired.view_info == target.desc.view_info &&
+		    cache.IsRenderTargetCurrent(target.image_id, acquired.view_generation)) {
+			image_view = acquired.view;
+		} else {
+			const auto generation    = cache.ImageSetGeneration();
+			image_view               = cache.FindRenderTarget(target.image_id, target.desc);
+			acquired.view            = image_view;
+			acquired.view_image      = target.image_id;
+			acquired.view_info       = target.desc.view_info;
+			acquired.view_generation = generation;
+		}
+		auto& image = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral

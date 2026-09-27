@@ -42,6 +42,16 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	       info.channel_order == Prospero::ChannelOrder::kAlt;
 }
 
+// KYTY_DEBUG_TARGET_REUSE=0 resolves and acquires every draw's targets from scratch, for A/B runs
+// (see also AbFeatureOff).
+bool RenderExecutor::TargetReuseEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_TARGET_REUSE");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	return enabled && !AbFeatureOff();
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
@@ -58,12 +68,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	// Consecutive draws mostly keep their targets: the same registers resolve to the same image
 	// while the image set is unchanged.
-	static const bool reuse_enabled = [] {
-		const char* text = std::getenv("KYTY_DEBUG_TARGET_REUSE");
-		return text == nullptr || std::strcmp(text, "0") != 0;
-	}();
 	auto& source = m_color_target_sources.at(rt_slot);
-	if (reuse_enabled && source.generation != 0 && source.mask == mask &&
+	if (TargetReuseEnabled() && source.generation != 0 && source.mask == mask &&
 	    source.slice_offset == render_target_slice_offset &&
 	    source.ignore_target_mask == ignore_target_mask && source.exact_format == exact_format &&
 	    source.registers == rt &&

@@ -311,13 +311,9 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	}
 	// Consecutive draws mostly keep their depth target: the same registers resolve to the same
 	// image while the image set is unchanged (see ResolveRenderColorTarget).
-	static const bool reuse_enabled = [] {
-		const char* text = std::getenv("KYTY_DEBUG_TARGET_REUSE");
-		return text == nullptr || std::strcmp(text, "0") != 0;
-	}();
 	auto&      cache  = m_context.GetTextureCache();
 	auto&      source = m_depth_target_source;
-	const bool reused = reuse_enabled && source.generation != 0 && source.registers == z &&
+	const bool reused = TargetReuseEnabled() && source.generation != 0 && source.registers == z &&
 	                    cache.RefindImage(source.image_id, source.generation, source.desc,
 	                                      source.metadata_base_layer);
 	if (reused) {
