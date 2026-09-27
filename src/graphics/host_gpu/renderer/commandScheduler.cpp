@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -233,7 +234,16 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	// Draws arrive every few microseconds, the GPU completes submissions every few milliseconds,
+	// and no one waits on these operations (deletions, recycling, fault processing): query the
+	// GPU's progress at most once per interval. IsFree and the command pool query on demand.
+	static constexpr auto RefreshInterval = std::chrono::microseconds(200);
+	static const bool     ab              = AbSelected("pending");
+	const auto            now             = std::chrono::steady_clock::now();
+	if ((ab && AbFeatureOff()) || now - m_last_pending_refresh >= RefreshInterval) {
+		m_master.Refresh();
+		m_last_pending_refresh = now;
+	}
 	for (;;) {
 		PendingOperation operation;
 		{

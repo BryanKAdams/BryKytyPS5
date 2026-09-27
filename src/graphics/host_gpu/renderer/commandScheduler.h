@@ -166,6 +166,7 @@ private:
 	uint32_t              m_zone_chunk      = UINT32_MAX; // Chunk of the recording buffer.
 	std::vector<ZoneMark> m_zone_marks;
 	std::chrono::steady_clock::time_point m_last_submit {};
+	std::chrono::steady_clock::time_point m_last_pending_refresh {}; // See PopPendingOperations.
 };
 
 } // namespace Libs::Graphics
