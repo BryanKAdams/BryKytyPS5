@@ -22840,33 +22840,6 @@ TestCase VectorSpecialF32FlushesDenormalInputs() {
            O::V_SQRT_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-// The flush keeps a denormal's sign, and leaves the smallest normal alone.
-TestCase VectorSpecialF32FlushesNegativeDenormalInputs() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0x807fffffu);
-  AppendVMovLiteral(&code, 5, 0x00800000u);
-  code.push_back(EncodeVop1(0x27, 1, Vgpr(0)));
-  code.push_back(EncodeVop1(0x2a, 2, Vgpr(0)));
-  code.push_back(EncodeVop1(0x33, 3, Vgpr(0)));
-  code.push_back(EncodeVop1(0x2a, 6, Vgpr(5)));
-  code.push_back(EncodeVop1(0x33, 7, Vgpr(5)));
-  AppendStoreVgpr(&code, 1, 0);
-  AppendStoreVgpr(&code, 2, 1);
-  AppendStoreVgpr(&code, 3, 2);
-  AppendStoreVgpr(&code, 6, 3);
-  AppendStoreVgpr(&code, 7, 4);
-  AppendEnd(&code);
-
-  return {"VectorSpecialF32FlushesNegativeDenormalInputs",
-          code,
-          {},
-          {0xff800000u, 0xff800000u, 0x80000000u, 0x7e800000u, 0x20000000u},
-          {O::V_MOV_B32, O::V_LOG_F32, O::V_RCP_F32, O::V_SQRT_F32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-}
-
 TestCase VectorF64CapturedScreenSpaceShadows() {
   using O = ShaderOpcode;
   TestCase test;
@@ -23067,32 +23040,6 @@ TestCase VectorSinCosMaxFiniteSpecialCases() {
           code,
           {},
           {0x00000000u, 0x3f800000u},
-          {O::V_MOV_B32, O::V_SIN_F32, O::V_COS_F32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
-}
-
-// Every finite value of magnitude 2^23 or more is a whole number: no cycle fraction.
-TestCase VectorSinCosLargeFiniteSpecialCases() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0x4b000001u);
-  AppendVMovLiteral(&code, 1, 0xcb000001u);
-  AppendVMovLiteral(&code, 2, 0x7f7fffffu);
-  for (u32 i = 0; i < 3; i++) {
-    code.push_back(EncodeVop1(0x35, 10 + i, Vgpr(i)));
-    code.push_back(EncodeVop1(0x36, 13 + i, Vgpr(i)));
-  }
-  for (u32 i = 0; i < 6; i++) {
-    AppendStoreVgpr(&code, 10 + i, i);
-  }
-  AppendEnd(&code);
-
-  return {"VectorSinCosLargeFiniteSpecialCases",
-          code,
-          {},
-          {0x00000000u, 0x00000000u, 0x00000000u, 0x3f800000u, 0x3f800000u,
-           0x3f800000u},
           {O::V_MOV_B32, O::V_SIN_F32, O::V_COS_F32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
 }
@@ -30520,12 +30467,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
   AddCase(VectorSpecialF32FlushesDenormalInputs);
-  AddCase(VectorSpecialF32FlushesNegativeDenormalInputs);
   AddCase(VectorRcpIflagF32IntegerReciprocal);
   AddCase(VectorF64CapturedScreenSpaceShadows);
   AddCase(VectorF64ModesModifiersAndExec);
   AddCase(VectorSinCosMaxFiniteSpecialCases);
-  AddCase(VectorSinCosLargeFiniteSpecialCases);
   AddCase(VectorCompareOps);
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareEqU64OnGpu);

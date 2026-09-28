@@ -100,24 +100,22 @@ uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	return ret;
 }
 
-// OpIsNan holds for every NaN encoding, signaling ones included, and is one comparison where the
-// exponent and mantissa tests took five instructions: the module preserves NaN
-// (SignedZeroInfNanPreserve), so the driver may not fold it away.
-static F32Class EmitClassifyF32Value(EmitterState& state, uint32_t value, uint32_t bits) {
+F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 	F32Class cls;
-	cls.bits = bits;
-	cls.nan  = Unary(state, spv::OpIsNan, TypeBool(state), value);
-	cls.zero = EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, bits, 0x7fffffffu),
-	                                  0);
+	cls.bits                 = bits;
+	const auto abs_bits      = EmitAndConstant(state, cls.bits, 0x7fffffffu);
+	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
+	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
+	const auto exponent_max =
+	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0x7f800000u);
+	const auto mantissa_nonzero = EmitCompareU32Constant(state, spv::OpINotEqual, mantissa_bits, 0);
+	cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
+	cls.zero                    = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
 	return cls;
 }
 
-F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
-	return EmitClassifyF32Value(state, EmitBitcastU32ToF32(state, bits), bits);
-}
-
 F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
-	return EmitClassifyF32Value(state, value, EmitBitcastF32ToU32(state, value));
+	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
 }
 
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
@@ -190,10 +188,7 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	const auto ordered_bits =
 	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
 
-	// Both are zeros when neither has a bit set besides the sign.
-	const auto both_zero    = EmitCompareU32Constant(
-	    state, spv::OpIEqual,
-	    EmitAndConstant(state, EmitOrU32(state, lhs_class.bits, rhs_class.bits), 0x7fffffffu), 0);
+	const auto both_zero    = EmitLogicalAndBool(state, lhs_class.zero, rhs_class.zero);
 	const auto zero_bits    = max_value ? EmitAndU32(state, lhs_class.bits, rhs_class.bits)
 	                                    : EmitOrU32(state, lhs_class.bits, rhs_class.bits);
 	const auto numeric_bits = EmitSelectValueU32(state, both_zero, zero_bits, ordered_bits);
@@ -205,29 +200,56 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
-	// A zero exponent field means a zero or a denormal. Keeping only the sign bit gives the same
-	// zero for a zero and flushes a denormal to the zero of its sign, so no zero test is needed.
-	const auto bits          = Unary(state, spv::OpBitcast, TypeU32(state), value);
-	const auto exponent_zero = EmitCompareU32Constant(
-	    state, spv::OpIEqual, EmitAndConstant(state, bits, 0x7f800000u), 0);
-	const auto selected = EmitSelectValueU32(state, exponent_zero,
-	                                         EmitAndConstant(state, bits, 0x80000000u), bits);
-	return Unary(state, spv::OpBitcast, TypeF32(state), selected);
+	const auto bits      = state.builder.AllocateId();
+	const auto abs_bits  = state.builder.AllocateId();
+	const auto sign_bits = state.builder.AllocateId();
+	const auto non_zero  = state.builder.AllocateId();
+	const auto subnormal = state.builder.AllocateId();
+	const auto flush     = state.builder.AllocateId();
+	const auto selected  = state.builder.AllocateId();
+	const auto ret       = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits,
+	                          ConstantU32(state, 0x7fffffffu));
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), sign_bits, bits,
+	                          ConstantU32(state, 0x80000000u));
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), non_zero, abs_bits,
+	                          ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), subnormal, abs_bits,
+	                          ConstantU32(state, 0x00800000u));
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), flush, non_zero, subnormal);
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, flush, sign_bits, bits);
+	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), ret, selected);
+	return ret;
 }
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {
-	// A finite value of magnitude 2^23 or more is a whole number, so its fraction is +0 without
-	// a test for it (VectorSinCosLargeFiniteSpecialCases).
-	const auto reduced = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), reduced, GlslStd450(state),
+	const auto fract        = state.builder.AllocateId();
+	const auto bits         = state.builder.AllocateId();
+	const auto abs_bits     = state.builder.AllocateId();
+	const auto large        = state.builder.AllocateId();
+	const auto finite       = state.builder.AllocateId();
+	const auto large_finite = state.builder.AllocateId();
+	const auto reduced      = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), fract, GlslStd450(state),
 	                          GLSLstd450Fract, src);
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, src);
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits,
+	                          ConstantU32(state, 0x7fffffffu));
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), large, abs_bits,
+	                          ConstantU32(state, 0x4b000000u));
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), finite, abs_bits,
+	                          ConstantU32(state, 0x7f800000u));
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), large_finite, large, finite);
+	state.builder.AddFunction(spv::OpSelect, TypeF32(state), reduced, large_finite,
+	                          ConstantF32(state, 0), fract);
 	if (!preserve_signed_zero) {
 		return reduced;
 	}
-	const auto bits = Unary(state, spv::OpBitcast, TypeU32(state), src);
-	const auto zero = EmitCompareU32Constant(state, spv::OpIEqual,
-	                                         EmitAndConstant(state, bits, 0x7fffffffu), 0);
+	const auto zero = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), zero, abs_bits,
+	                          ConstantU32(state, 0));
 	state.builder.AddFunction(spv::OpSelect, TypeF32(state), ret, zero, src, reduced);
 	return ret;
 }
