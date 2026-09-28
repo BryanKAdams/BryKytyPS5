@@ -34,7 +34,8 @@ inline RenderDebugCounters g_render_debug_counters;
 // as one payload call), pipelinememo (the last graphics pipeline reused without a map lookup),
 // depthreuse (a clean depth target keeping its view between draws), regiongen (image lookups and
 // views checked against the images over their own range rather than the whole image set),
-// streamreuse (a range copied into the stream ring earlier in the BDA epoch bound again).
+// streamreuse (a range copied into the stream ring earlier in the BDA epoch bound again),
+// metamemo (the last depth surface clear-state answer kept without the texture cache lock).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 // KYTY_DEBUG_FULL_BARRIERS=1: every draw and dispatch waits for all earlier GPU work and sees all
 // its memory writes (RecordFullBarrier). Slow; it tells synchronization bugs (a result that changes)

@@ -2642,13 +2642,28 @@ bool TextureCache::IsKnownDccMetadata(uint64_t address, uint64_t size) {
 	return m_dcc_metadata_seen.Intersects(address, size);
 }
 
+// Draws ask about the same depth surface over and over. The answer holds until its clear state
+// changes or a surface metadata entry comes or goes, so the last one is kept without m_lock.
+// KYTY_DEBUG_AB=metamemo looks every answer up in every other window.
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
-	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
-		return false;
+	static const bool ab       = AbSelected("metamemo");
+	auto&             memo     = m_meta_clear_memo;
+	// Read before the lookup: a change racing with it leaves the memo stale, never wrong.
+	const auto        surfaces = m_surface_meta_generation.load(std::memory_order_acquire);
+	const auto        clears   = m_meta_clear_generation.load(std::memory_order_acquire);
+	if (!(memo.valid && memo.address == address && memo.surface_generation == surfaces &&
+	      memo.clear_generation == clears) ||
+	    (ab && AbFeatureOff())) {
+		std::scoped_lock lock {m_lock};
+		const auto       found = m_surface_metas.find(address);
+		memo = {.address            = address,
+		        .surface_generation = surfaces,
+		        .clear_generation   = clears,
+		        .clear_mask         = found != m_surface_metas.end() ? found->second.clear_mask : 0,
+		        .found              = found != m_surface_metas.end(),
+		        .valid              = true};
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return memo.found && slice < 32 && (memo.clear_mask & (1u << slice)) != 0;
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -2658,6 +2673,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	m_meta_clear_generation.fetch_add(1, std::memory_order_release);
 	return true;
 }
 
@@ -2667,10 +2683,14 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
+	const auto previous = found->second.clear_mask;
 	if (is_clear) {
 		found->second.clear_mask |= 1u << slice;
 	} else {
 		found->second.clear_mask &= ~(1u << slice);
+	}
+	if (found->second.clear_mask != previous) {
+		m_meta_clear_generation.fetch_add(1, std::memory_order_release);
 	}
 	return true;
 }
