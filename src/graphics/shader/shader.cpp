@@ -456,7 +456,10 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	const auto record = [](const uint32_t* address, const uint32_t* words, uint32_t dwords) {
 		if (auto* log = t_vertex_table_reads; log != nullptr) {
 			const uint32_t first = log->count == 0 ? 0u : log->reads[0].first + log->reads[0].dwords;
-			EXIT_IF(log->count >= log->reads.size() || first + dwords > log->words.size());
+			if (log->count >= log->reads.size() || first + dwords > log->words.size()) {
+				log->complete = false; // More reads than one stage makes: never taken.
+				return;
+			}
 			log->reads[log->count++] = {reinterpret_cast<uint64_t>(address), dwords, first};
 			std::copy_n(words, dwords, log->words.begin() + first);
 		}
@@ -986,6 +989,9 @@ ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderR
 }
 
 bool VertexTableReadsUnchanged(const VertexTableReads& reads) {
+	if (!reads.complete) {
+		return false;
+	}
 	std::array<uint32_t, 256> words;
 	for (uint32_t i = 0; i < reads.count; i++) {
 		const auto& read = reads.reads[i];

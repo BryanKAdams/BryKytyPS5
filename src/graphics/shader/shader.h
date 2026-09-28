@@ -318,7 +318,8 @@ struct VertexTableReads {
 		uint32_t dwords  = 0;
 		uint32_t first   = 0; // Into words.
 	};
-	uint32_t                                                        count = 0;
+	uint32_t                                                        count    = 0;
+	bool                                                            complete = true; // All fit.
 	std::array<Read, 2>                                             reads;
 	std::array<uint32_t, 256 + 4 * ShaderVertexInputInfo::RES_MAX> words;
 };

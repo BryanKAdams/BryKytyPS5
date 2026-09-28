@@ -2000,6 +2000,7 @@ bool PipelineCache::SpeculateGraphicsPrograms(const HW::Context& ctx, const HW::
 	for (auto& stage: draw.stages) {
 		stage.source = nullptr;
 	}
+	draw.prepared.valid = false;
 	bool ps_active = false;
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> export_mapping {};
 	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch ||
@@ -2012,11 +2013,12 @@ bool PipelineCache::SpeculateGraphicsPrograms(const HW::Context& ctx, const HW::
 	thread_local std::array<ShaderVertexInputInfo, 3> vertex_info;
 	thread_local ShaderPixelInputInfo                 pixel_info;
 	pixel_info = {};
-	auto& prepared                = draw.prepared;
-	prepared.valid                = false;
-	prepared.shader_map_version   = ShaderMapVersion();
-	prepared.vertex_tables.count  = 0;
-	t_vertex_table_reads          = &prepared.vertex_tables;
+	auto& prepared                  = draw.prepared;
+	prepared.valid                  = false;
+	prepared.shader_map_version     = ShaderMapVersion();
+	prepared.vertex_tables.count    = 0;
+	prepared.vertex_tables.complete = true;
+	t_vertex_table_reads            = &prepared.vertex_tables;
 	ShaderParams pixel_params;
 	const auto   vertex_params =
 	    PrepareGraphicsStages(m_graphics, sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
