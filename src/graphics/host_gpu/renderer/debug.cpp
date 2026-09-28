@@ -15,11 +15,13 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <intrin.h>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
@@ -625,6 +627,36 @@ uint64_t DrawPhaseTimer::Hash() {
 
 uint64_t DrawPhaseTimer::Now() {
 	return __rdtsc();
+}
+
+// KYTY_DEBUG_FULL_BARRIERS_FILE=<path> turns them on only while that file exists (checked twice a
+// second): a route that needs the normal frame rate to get somewhere creates it on arrival.
+bool DebugFullBarriers() noexcept {
+	static const bool  enabled = std::getenv("KYTY_DEBUG_FULL_BARRIERS") != nullptr;
+	static const char* file    = std::getenv("KYTY_DEBUG_FULL_BARRIERS_FILE");
+	if (enabled || file == nullptr) {
+		return enabled;
+	}
+	static std::atomic<int64_t> next_check {0};
+	static std::atomic<bool>    present {false};
+	const auto                  now = std::chrono::steady_clock::now().time_since_epoch();
+	if (now.count() >= next_check.load(std::memory_order_relaxed)) {
+		next_check.store((now + std::chrono::milliseconds(500)).count(), std::memory_order_relaxed);
+		std::error_code error;
+		present.store(std::filesystem::exists(file, error), std::memory_order_relaxed);
+	}
+	return present.load(std::memory_order_relaxed);
+}
+
+// Outside rendering: all earlier commands finish, and their writes are visible to everything
+// later.
+void RecordFullBarrier(vk::CommandBuffer command) noexcept {
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
+	                        0, nullptr);
 }
 
 static std::atomic<bool> g_ab_off {false};

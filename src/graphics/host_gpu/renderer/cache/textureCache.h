@@ -77,6 +77,10 @@ public:
 	// The same for FindRenderTarget: the target is also GPU-owned already, so marking it written
 	// changes nothing.
 	[[nodiscard]] bool IsRenderTargetCurrent(ImageId id, uint64_t generation) const noexcept;
+	// The same for FindTexture with a storage binding: the image is also GPU-owned already, so
+	// marking it written and committing the write change nothing, and it is not enrolled for
+	// downloads.
+	[[nodiscard]] bool IsStorageCurrent(ImageId id, uint64_t generation) const noexcept;
 	// The same for FindDepthTarget with a depth-only request: the target is also GPU-owned and a
 	// depth target already, with the request's metadata, and no surface metadata entry was added
 	// or removed since meta_generation (SurfaceMetaGeneration before that acquisition), so the
@@ -257,6 +261,19 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Bumped when a surface's clear state changes (ClearMeta, TouchMeta). With
+	// m_surface_meta_generation it validates m_meta_clear_memo.
+	std::atomic<uint64_t> m_meta_clear_generation {0};
+	// IsMetaCleared's last answer: draws ask about the same depth surface over and over. Its callers
+	// are GPU-thread only.
+	struct MetaClearMemo {
+		uint64_t address            = 0;
+		uint64_t surface_generation = 0;
+		uint64_t clear_generation   = 0;
+		uint32_t clear_mask         = 0;
+		bool     found              = false;
+		bool     valid              = false;
+	} m_meta_clear_memo;
 	// Bumped when m_surface_metas gains or loses an entry (see ColorClearUnchanged and
 	// IsDepthTargetCurrent).
 	std::atomic<uint64_t>                             m_surface_meta_generation {0};

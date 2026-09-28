@@ -1833,6 +1833,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	if (DebugFullBarriers()) [[unlikely]] {
+		m_context.GetCommandScheduler().EndRendering();
+		RecordFullBarrier(buffer.Handle());
+	}
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (gpu_args) {

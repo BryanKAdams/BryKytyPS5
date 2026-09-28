@@ -342,31 +342,55 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+// Callers hold m_lock, so there is one writer at a time. The regions are stamped first and the
+// new generation published after them: a reader that sees a generation also sees every stamp up
+// to it (RangeGeneration's memo relies on this).
 void TextureCache::AdvanceImageSetGeneration(GuestRange range) noexcept {
-	const auto stamp = m_image_set_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+	const auto stamp = m_image_set_generation.load(std::memory_order_relaxed) + 1;
 	const auto first = range.address >> RegionGenerationBits;
 	const auto last  = (range.End() - 1) >> RegionGenerationBits;
 	for (auto region = first; region <= last; region++) {
 		m_region_generations[region % RegionGenerationBuckets].store(stamp,
-		                                                            std::memory_order_release);
+		                                                            std::memory_order_relaxed);
 	}
+	m_image_set_generation.store(stamp, std::memory_order_release);
 }
 
 // KYTY_DEBUG_AB=regiongen uses the whole image set's generation for every range in every other
 // window. The two agree on what they call unchanged: the whole set's generation is at least every
 // range's, and equals a range's only when that range saw the newest change.
 uint64_t TextureCache::RangeGeneration(GuestRange range) const noexcept {
-	static const bool ab = AbSelected("regiongen");
+	static const bool ab    = AbSelected("regiongen");
+	const auto        whole = m_image_set_generation.load(std::memory_order_acquire);
 	if ((ab && AbFeatureOff()) || range.size == 0) {
-		return m_image_set_generation.load(std::memory_order_acquire);
+		return whole;
+	}
+	// Draws ask about the same ranges draw after draw, and while the whole set's generation is
+	// unchanged no range's is: the answer is kept with the generation it was computed under. A
+	// render target spans many regions, and their buckets are scattered over the table.
+	// KYTY_DEBUG_AB=rangememo computes every answer in every other window.
+	struct Memo {
+		const TextureCache* cache      = nullptr;
+		uint64_t            address    = 0;
+		uint64_t            size       = 0;
+		uint64_t            whole      = 0;
+		uint64_t            generation = 0;
+	};
+	thread_local std::array<Memo, 1024> memos {};
+	static const bool memo_ab = AbSelected("rangememo");
+	auto& memo = memos[((range.address >> 12u) ^ (range.address >> 24u) ^ range.size) % memos.size()];
+	if (memo.cache == this && memo.whole == whole && memo.address == range.address &&
+	    memo.size == range.size && !(memo_ab && AbFeatureOff())) {
+		return memo.generation;
 	}
 	uint64_t   generation = m_image_set_base;
 	const auto first      = range.address >> RegionGenerationBits;
 	const auto last       = (range.End() - 1) >> RegionGenerationBits;
 	for (auto region = first; region <= last; region++) {
 		generation = std::max(generation, m_region_generations[region % RegionGenerationBuckets].load(
-		                                      std::memory_order_acquire));
+		                                      std::memory_order_relaxed));
 	}
+	memo = {this, range.address, range.size, whole, generation};
 	return generation;
 }
 
@@ -1930,6 +1954,17 @@ bool TextureCache::IsRenderTargetCurrent(ImageId id, uint64_t generation) const 
 	       !(m_readback_linear_images && !image.info.IsTiled());
 }
 
+bool TextureCache::IsStorageCurrent(ImageId id, uint64_t generation) const noexcept {
+	if (!IsTextureCurrent(id, generation)) {
+		return false;
+	}
+	// FindTexture's MarkGpuModified and CommitGpuWrite would change nothing, and TrackImageDownload
+	// enrolls nothing (linear readback images re-enroll every acquisition).
+	const auto& image = m_slot_images[id];
+	return image.IsGpuModified() && image.backing.image != nullptr &&
+	       !(m_readback_linear_images && !image.info.IsTiled());
+}
+
 bool TextureCache::IsDepthTargetCurrent(ImageId id, uint64_t generation, uint64_t meta_generation,
                                         const ImageDesc& desc) const noexcept {
 	// A stencil request associates the stencil image, which IsTextureCurrent does not cover.
@@ -2642,13 +2677,28 @@ bool TextureCache::IsKnownDccMetadata(uint64_t address, uint64_t size) {
 	return m_dcc_metadata_seen.Intersects(address, size);
 }
 
+// Draws ask about the same depth surface over and over. The answer holds until its clear state
+// changes or a surface metadata entry comes or goes, so the last one is kept without m_lock.
+// KYTY_DEBUG_AB=metamemo looks every answer up in every other window.
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
-	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
-		return false;
+	static const bool ab       = AbSelected("metamemo");
+	auto&             memo     = m_meta_clear_memo;
+	// Read before the lookup: a change racing with it leaves the memo stale, never wrong.
+	const auto        surfaces = m_surface_meta_generation.load(std::memory_order_acquire);
+	const auto        clears   = m_meta_clear_generation.load(std::memory_order_acquire);
+	if (!(memo.valid && memo.address == address && memo.surface_generation == surfaces &&
+	      memo.clear_generation == clears) ||
+	    (ab && AbFeatureOff())) {
+		std::scoped_lock lock {m_lock};
+		const auto       found = m_surface_metas.find(address);
+		memo = {.address            = address,
+		        .surface_generation = surfaces,
+		        .clear_generation   = clears,
+		        .clear_mask         = found != m_surface_metas.end() ? found->second.clear_mask : 0,
+		        .found              = found != m_surface_metas.end(),
+		        .valid              = true};
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return memo.found && slice < 32 && (memo.clear_mask & (1u << slice)) != 0;
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -2658,6 +2708,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	m_meta_clear_generation.fetch_add(1, std::memory_order_release);
 	return true;
 }
 
@@ -2667,10 +2718,14 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
+	const auto previous = found->second.clear_mask;
 	if (is_clear) {
 		found->second.clear_mask |= 1u << slice;
 	} else {
 		found->second.clear_mask &= ~(1u << slice);
+	}
+	if (found->second.clear_mask != previous) {
+		m_meta_clear_generation.fetch_add(1, std::memory_order_release);
 	}
 	return true;
 }

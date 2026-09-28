@@ -35,8 +35,16 @@ inline RenderDebugCounters g_render_debug_counters;
 // depthreuse (a clean depth target keeping its view between draws), regiongen (image lookups and
 // views checked against the images over their own range rather than the whole image set),
 // streamreuse (a range copied into the stream ring earlier in the BDA epoch bound again),
-// budgetcache (VMA's memory budget fetched from the driver at most every 500 ms).
+// metamemo (the last depth surface clear-state answer kept without the texture cache lock),
+// storagereuse (a clean storage image keeping its view between draws), rangememo (range
+// generations kept while the whole image set is unchanged), budgetcache (VMA's memory budget
+// fetched from the driver at most every 500 ms).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
+// KYTY_DEBUG_FULL_BARRIERS=1: every draw and dispatch waits for all earlier GPU work and sees all
+// its memory writes (RecordFullBarrier). Slow; it tells synchronization bugs (a result that changes)
+// from bugs that do not depend on timing.
+[[nodiscard]] bool DebugFullBarriers() noexcept;
+void               RecordFullBarrier(vk::CommandBuffer command) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
 inline std::atomic<uint64_t> g_gpu_busy_ns {0};

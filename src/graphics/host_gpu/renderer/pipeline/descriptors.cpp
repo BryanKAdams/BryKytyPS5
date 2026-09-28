@@ -1125,6 +1125,48 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 }
 
+// KYTY_DEBUG_STORAGE_REUSE=0 acquires storage images every draw; KYTY_DEBUG_AB=storagereuse
+// alternates.
+static bool StorageReuseEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_STORAGE_REUSE");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	static const bool ab = AbSelected("storagereuse");
+	return enabled && !(ab && AbFeatureOff());
+}
+
+// KYTY_VERIFY_STORAGE_REUSE=1: a storage binding that keeps its view acquires it anyway and
+// reports what FindTexture returned differently or changed (see TextureCache::IsStorageCurrent).
+static bool VerifyStorageReuse() {
+	static const bool enabled = std::getenv("KYTY_VERIFY_STORAGE_REUSE") != nullptr;
+	return enabled;
+}
+
+static void CheckStorageReuse(TextureCache& cache, const TextureBinding& binding) {
+	const auto& image           = cache.GetImage(binding.image_id);
+	const bool  gpu_modified    = image.IsGpuModified();
+	const bool  buffer_modified = image.IsBufferModified();
+	const bool  cpu_dirty       = image.IsCpuDirty();
+	const auto  view            = cache.FindTexture(binding.image_id, binding.desc);
+	const auto& after           = cache.GetImage(binding.image_id);
+	const bool  same            = view == binding.image_view &&
+	                  after.IsGpuModified() == gpu_modified &&
+	                  after.IsBufferModified() == buffer_modified && after.IsCpuDirty() == cpu_dirty;
+	static std::atomic<uint64_t> checked {0};
+	static std::atomic<uint64_t> missed {0};
+	const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (!same && missed.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("storage-reuse verify: 0x%016" PRIx64 " kept view would have missed a change\n",
+		            image.info.data.address);
+	}
+	if (count % 100000 == 0) {
+		std::printf("storage-reuse verify: reuses=%" PRIu64 " missed=%" PRIu64 "\n", count,
+		            missed.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+	}
+}
+
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -1164,17 +1206,28 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 			binding.image_view = binding.mip_views.front();
 		} else if (auto& source = prepared.image_sources[i];
-		           binding.desc.type == TextureCache::BindingType::Texture &&
 		           TextureReuseEnabled() && source.view_image == binding.image_id &&
 		           source.view_info == binding.desc.view_info &&
-		           texture_cache.IsTextureCurrent(binding.image_id, source.view_generation)) {
-			// A clean sampled image keeps the view FindTexture returned for this binding before.
+		           (binding.desc.type == TextureCache::BindingType::Texture
+		                ? texture_cache.IsTextureCurrent(binding.image_id, source.view_generation)
+		                : binding.desc.type == TextureCache::BindingType::Storage &&
+		                      StorageReuseEnabled() &&
+		                      texture_cache.IsStorageCurrent(binding.image_id,
+		                                                     source.view_generation))) {
+			// A clean image keeps the view FindTexture returned for this binding before.
 			binding.image_view = source.view;
+			if (binding.desc.type == TextureCache::BindingType::Storage &&
+			    VerifyStorageReuse()) [[unlikely]] {
+				CheckStorageReuse(texture_cache, binding);
+			}
 		} else {
 			const auto generation = texture_cache.ImageGeneration(binding.image_id);
 			binding.image_view    = texture_cache.FindTexture(binding.image_id, binding.desc);
 			source.view_generation =
-			    binding.desc.type == TextureCache::BindingType::Texture ? generation : 0;
+			    binding.desc.type == TextureCache::BindingType::Texture ||
+			            binding.desc.type == TextureCache::BindingType::Storage
+			        ? generation
+			        : 0;
 			source.view       = binding.image_view;
 			source.view_image = binding.image_id;
 			source.view_info  = binding.desc.view_info;
