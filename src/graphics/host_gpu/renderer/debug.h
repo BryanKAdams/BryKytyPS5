@@ -30,7 +30,8 @@ inline RenderDebugCounters g_render_debug_counters;
 // cpwrite (BDA epochs started by the GPU thread's own guest memory writes), streamhost (the stream
 // ring in cached host memory rather than device memory), colorclear (skipped color clear
 // rechecks), prioritywait (draw entry leaving operations queued rather than waiting for the
-// priority thread). 
+// priority thread), pushpayload (push constants and descriptors handed to the recording thread
+// as one payload call).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
