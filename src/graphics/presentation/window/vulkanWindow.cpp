@@ -724,11 +724,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	// Storage buffer range checks can be left to the device when out-of-range dword accesses are
 	// defined (robustBufferAccess2, checked in units of at most a dword) and a range too short for
-	// one dword can be bound as a null descriptor. KYTY_DEBUG_HW_BUFFER_BOUNDS=1 enables it while
-	// its gain is measured.
+	// one dword can be bound as a null descriptor. The hardware-buffer-bounds setting (on by
+	// default) enables it; KYTY_DEBUG_HW_BUFFER_BOUNDS=0/1 overrides it for A/B runs.
 	const char* hardware_bounds = std::getenv("KYTY_DEBUG_HW_BUFFER_BOUNDS");
 	graphics.hardware_storage_buffer_bounds =
-	    hardware_bounds != nullptr && std::strcmp(hardware_bounds, "1") == 0 &&
+	    (hardware_bounds != nullptr ? std::strcmp(hardware_bounds, "0") != 0
+	                                : Config::HardwareBufferBoundsEnabled()) &&
 	    robustness2_ext_enabled && robustness2.robustBufferAccess2 == VK_TRUE &&
 	    robustness2.nullDescriptor == VK_TRUE &&
 	    robustness2_properties.robustStorageBufferAccessSizeAlignment <= sizeof(uint32_t);

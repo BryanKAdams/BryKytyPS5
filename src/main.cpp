@@ -109,6 +109,8 @@ static void PrintUsage() {
 	         "thread ahead of the GPU thread. Default: true.\n");
 	::printf("  --record-thread <true|false>         Record the GPU thread's Vulkan commands on the "
 	         "submit thread. Default: true.\n");
+	::printf("  --hardware-buffer-bounds <true|false> Let the GPU check shader buffer ranges where "
+	         "it supports that, instead of checks compiled into each shader. Default: true.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -463,6 +465,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--record-thread") {
 			if (!ParseBool(value, options.config.record_thread_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--hardware-buffer-bounds") {
+			if (!ParseBool(value, options.config.hardware_buffer_bounds)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

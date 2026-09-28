@@ -1148,6 +1148,23 @@ struct SystemOverlay::Impl {
 		    "at the next start.");
 		ImGui::PopTextWrapPos();
 		ImGui::Separator();
+
+		if (hardware_bounds_choice < 0) {
+			hardware_bounds_choice = Config::HardwareBufferBoundsEnabled() ? 1 : 0;
+		}
+		bool hardware_bounds = hardware_bounds_choice != 0;
+		if (ImGui::Checkbox("GPU checks shader buffer ranges", &hardware_bounds)) {
+			hardware_bounds_choice = hardware_bounds ? 1 : 0;
+			settings_save_failed = !Common::SettingsFile::Save(
+			    "hardware-buffer-bounds", hardware_bounds ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "Shaders leave their buffer range checks to the GPU where it supports that, which "
+		    "saves GPU time in shader-heavy scenes. Turn off only to compare. Applies at the next "
+		    "start.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
 		if (settings_save_failed) {
 			ImGui::TextColored({1.0f, 0.5f, 0.4f, 1.0f}, "Could not save %s",
 			                   Common::SettingsFile::FileName);
@@ -1257,6 +1274,7 @@ struct SystemOverlay::Impl {
 	int                                   settings_saved_percent = 100;
 	bool                                  settings_save_failed   = false;
 	int                                   record_thread_choice   = -1;
+	int                                   hardware_bounds_choice = -1;
 	ImVec2                                panel_offset {};
 	ImVec2                                right_stick {};
 	OverlaySession                        session;

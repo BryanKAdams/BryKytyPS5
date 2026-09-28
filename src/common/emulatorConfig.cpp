@@ -228,6 +228,10 @@ bool RecordThreadEnabled() {
 	return g_config->record_thread_enabled;
 }
 
+bool HardwareBufferBoundsEnabled() {
+	return g_config->hardware_buffer_bounds;
+}
+
 static std::atomic<int> g_relaxed_readback_override {-1};
 
 bool RelaxedReadbackEnabled() {
