@@ -176,13 +176,23 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// What MaterializeColorClearNow did: nothing it would repeat for the same surface (no
+	// single-mip metadata slices, or GPU-written slices already checked), or something else.
+	enum class ColorClearOutcome : uint8_t { NoSlices, GpuChecked, Other };
+	[[nodiscard]] ColorClearOutcome MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
+	                                                         uint32_t metadata_base_layer,
+	                                                         bool&    changed);
+	[[nodiscard]] bool              ColorClearUnchanged(const Image& image, const ImageDesc& desc,
+	                                                    uint32_t metadata_base_layer) const;
 	void                        FinishFind(ImageId id, const ImageDesc& desc,
 	                                       uint32_t metadata_base_layer);
 	// Applies clears found in GPU-written color metadata (DCC or CMASK keys) with conditional
-	// rendering. Returns false when the target needs the CPU readback path.
+	// rendering. Returns false when the target needs the CPU readback path. `no_op`: set when it
+	// returned true without doing anything (no applicable key, or the slices were checked already).
 	[[nodiscard]] bool MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 	                                            uint64_t slices_address, uint64_t slice_size,
-	                                            uint32_t image_first, uint32_t count);
+	                                            uint32_t image_first, uint32_t count,
+	                                            bool* no_op = nullptr);
 	[[nodiscard]] bool DccSlicesChecked(uint64_t address, uint64_t slice_size, uint32_t count,
 	                                    uint32_t code_mask);
 	void MarkDccSlicesChecked(uint64_t address, uint64_t slice_size, uint32_t count,
@@ -224,6 +234,8 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Bumped when m_surface_metas gains an entry (see ColorClearUnchanged).
+	std::atomic<uint64_t>                             m_surface_meta_generation {0};
 	RangeSet                                          m_dcc_metadata_seen;
 	struct DccCheckedSlice {
 		uint64_t size      = 0;
@@ -236,6 +248,8 @@ private:
 	// to the slice erases its entry; CPU writes leave the metadata CPU-dirty, which bypasses it.
 	std::mutex                         m_dcc_checked_mutex;
 	std::map<uint64_t, DccCheckedSlice> m_dcc_checked;
+	// Bumped whenever m_dcc_checked changes (see ColorClearUnchanged).
+	std::atomic<uint64_t>              m_dcc_checked_generation {0};
 	std::mutex                                        m_pending_download_mutex;
 	std::vector<GuestRange>                           m_pending_downloads;
 	uint64_t                                          m_total_used_memory  = 0;

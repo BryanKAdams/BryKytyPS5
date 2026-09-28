@@ -1727,7 +1727,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	{
 		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::PendingOps);
-		m_context.GetCommandScheduler().PopPendingOperations();
+		m_context.GetCommandScheduler().PopPendingOperations(false);
 	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -1847,7 +1847,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	{
 		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::PendingOps);
-		m_context.GetCommandScheduler().PopPendingOperations();
+		m_context.GetCommandScheduler().PopPendingOperations(false);
 	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();

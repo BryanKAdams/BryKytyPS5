@@ -153,6 +153,24 @@ public:
 	// The GC tick the LRU entry last received, so that touching it again in the same tick,
 	// which the LRU ignores, skips the LRU lookup.
 	uint64_t         lru_tick           = 0;
+	// TextureCache::MaterializeColorClear's last call for this image when it changed nothing, and
+	// the state that result depended on (see ColorClearUnchanged).
+	struct ColorClearCheck {
+		ImageMetadataInfo metadata;
+		ImageViewInfo     view;
+		ImageSubresources resources;
+		vk::Extent3D      extent;
+		uint32_t          image_type              = 0;
+		uint32_t          metadata_base_layer     = 0;
+		uint8_t           binding_type            = 0;
+		bool              valid                   = false;
+		// A GPU-written metadata check that found every slice checked (or no key it could
+		// apply); otherwise a surface without single-mip metadata slices.
+		bool              gpu_checked             = false;
+		uint64_t          surface_meta_generation = 0;
+		uint64_t          gpu_dirty_generation    = 0;
+		uint64_t          dcc_checked_generation  = 0;
+	} color_clear_check;
 
 private:
 	friend struct ImageTestAccess;

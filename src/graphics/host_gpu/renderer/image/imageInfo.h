@@ -28,6 +28,8 @@ struct ImageMetadataInfo {
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
 	bool                dcc_alpha_msb        = true;
+
+	bool operator==(const ImageMetadataInfo&) const = default;
 };
 
 struct ImageSubresources {

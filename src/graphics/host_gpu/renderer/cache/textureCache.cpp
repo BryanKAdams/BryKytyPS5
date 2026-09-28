@@ -1239,24 +1239,100 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
+// Whether MaterializeColorClearNow would change nothing, as it did last time for this image: the
+// same surface and view, no clear flag registered since (its erase would find none), and for a
+// GPU-written check, no GPU-dirty change and no GPU write into checked slices since (the same
+// slices stay checked, with the same keys).
+bool TextureCache::ColorClearUnchanged(const Image& image, const ImageDesc& desc,
+                                       uint32_t metadata_base_layer) const {
+	const auto& check = image.color_clear_check;
+	return check.valid && check.metadata == desc.info.metadata &&
+	       image.info.metadata == desc.info.metadata && check.view == desc.view_info &&
+	       check.resources == desc.info.resources && check.extent == desc.info.extent &&
+	       check.image_type == static_cast<uint32_t>(desc.info.type) &&
+	       check.metadata_base_layer == metadata_base_layer &&
+	       check.binding_type == static_cast<uint8_t>(desc.type) &&
+	       check.surface_meta_generation ==
+	           m_surface_meta_generation.load(std::memory_order_relaxed) &&
+	       (!check.gpu_checked ||
+	        (check.gpu_dirty_generation == m_buffer_cache.GpuDirtyGeneration() &&
+	         check.dcc_checked_generation ==
+	             m_dcc_checked_generation.load(std::memory_order_acquire)));
+}
+
+// Most lookups bind a color surface whose metadata was already checked, with nothing to apply:
+// skip the check while nothing it depends on has changed (ColorClearUnchanged). Only Thread_Gpu
+// changes images and their checks. KYTY_VERIFY_COLOR_CLEAR=1 checks anyway and reports skips that
+// would have missed a change; KYTY_DEBUG_AB=colorclear checks every time in alternate windows.
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
+	static const bool verify = std::getenv("KYTY_VERIFY_COLOR_CLEAR") != nullptr;
+	static const bool ab     = AbSelected("colorclear");
+	const bool        skip   = !(ab && AbFeatureOff()) &&
+	                  ColorClearUnchanged(m_slot_images[id], desc, metadata_base_layer);
+	if (skip && !verify) {
+		return;
+	}
+	bool       changed = false;
+	const auto outcome = MaterializeColorClearNow(id, desc, metadata_base_layer, changed);
+	if (skip) {
+		static std::atomic<uint64_t> checked {0};
+		static std::atomic<uint64_t> missed {0};
+		const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (changed || outcome == ColorClearOutcome::Other) {
+			const auto index = missed.fetch_add(1, std::memory_order_relaxed);
+			if (index < 16) {
+				std::printf("color-clear verify: skip of 0x%016" PRIx64 " (metadata 0x%016" PRIx64
+				            ") would have missed a change (outcome %d, changed %d)\n",
+				            m_slot_images[id].info.data.address, desc.info.metadata.range.address,
+				            static_cast<int>(outcome), changed ? 1 : 0);
+			}
+		}
+		if (count % 100000 == 0) {
+			std::printf("color-clear verify: skips=%" PRIu64 " missed=%" PRIu64 "\n", count,
+			            missed.load(std::memory_order_relaxed));
+			std::fflush(stdout);
+		}
+	}
+	auto& check = m_slot_images[id].color_clear_check;
+	if (outcome == ColorClearOutcome::Other) {
+		check.valid = false;
+		return;
+	}
+	check.metadata                = desc.info.metadata;
+	check.view                    = desc.view_info;
+	check.resources               = desc.info.resources;
+	check.extent                  = desc.info.extent;
+	check.image_type              = static_cast<uint32_t>(desc.info.type);
+	check.metadata_base_layer     = metadata_base_layer;
+	check.binding_type            = static_cast<uint8_t>(desc.type);
+	check.valid                   = true;
+	check.gpu_checked             = outcome == ColorClearOutcome::GpuChecked;
+	check.surface_meta_generation = m_surface_meta_generation.load(std::memory_order_relaxed);
+	check.gpu_dirty_generation    = m_buffer_cache.GpuDirtyGeneration();
+	check.dcc_checked_generation  = m_dcc_checked_generation.load(std::memory_order_acquire);
+}
+
+TextureCache::ColorClearOutcome
+TextureCache::MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
+                                       uint32_t metadata_base_layer, bool& changed) {
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
-		auto& image         = m_slot_images[id];
+		auto& image = m_slot_images[id];
+		changed |= !(image.info.metadata == desc.info.metadata);
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
-		m_surface_metas.erase(range.address);
+		changed |= m_surface_metas.erase(range.address) != 0;
 		if (DrainStats::Enabled() && range.Valid()) {
 			m_dcc_metadata_seen.Add(range.address, range.size);
 		}
 		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
-			return;
+			return ColorClearOutcome::NoSlices;
 		}
 	}
 	const auto layers = desc.info.TransferLayers();
@@ -1276,9 +1352,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	const auto slice_size  = range.size / layers;
 	const bool gpu_written = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
-	if (gpu_written && MaterializeDccClearOnGpu(id, desc, range.address + slice_size * first,
-	                                            slice_size, image_first, count)) {
-		return;
+	if (gpu_written) {
+		bool no_op = false;
+		if (MaterializeDccClearOnGpu(id, desc, range.address + slice_size * first, slice_size,
+		                             image_first, count, &no_op)) {
+			return no_op ? ColorClearOutcome::GpuChecked : ColorClearOutcome::Other;
+		}
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
@@ -1327,11 +1406,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
 		}
 	}
+	return ColorClearOutcome::Other;
 }
 
 bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
                                             uint64_t slices_address, uint64_t slice_size,
-                                            uint32_t image_first, uint32_t count) {
+                                            uint32_t image_first, uint32_t count, bool* no_op) {
 	if (!m_dcc_gpu_clear || count == 0) {
 		return false;
 	}
@@ -1345,11 +1425,17 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 	}
 	if (code_mask == 0) {
 		// No key clears this view, so the metadata bytes cannot change the image.
+		if (no_op != nullptr) {
+			*no_op = true;
+		}
 		return true;
 	}
 	// A GPU check consumed every clear it found, and no GPU write has touched the slices since,
 	// so any binding type (textures, storage, video out) would find no clear to apply either.
 	if (DccSlicesChecked(slices_address, slice_size, count, code_mask)) {
+		if (no_op != nullptr) {
+			*no_op = true;
+		}
 		return true;
 	}
 	// Render targets and sampled textures: both consume the keys (as the CPU path does), so each
@@ -1472,6 +1558,7 @@ void TextureCache::MarkDccSlicesChecked(uint64_t address, uint64_t slice_size, u
 	for (uint32_t slice = 0; slice < count; slice++) {
 		m_dcc_checked[address + slice_size * slice] = {slice_size, code_mask};
 	}
+	m_dcc_checked_generation.fetch_add(1, std::memory_order_release);
 }
 
 void TextureCache::OnBufferGpuWrite(uint64_t address, uint64_t size) {
@@ -1488,6 +1575,7 @@ void TextureCache::OnBufferGpuWrite(uint64_t address, uint64_t size) {
 	}
 	while (entry != m_dcc_checked.end() && entry->first < address + size) {
 		entry = m_dcc_checked.erase(entry);
+		m_dcc_checked_generation.fetch_add(1, std::memory_order_release);
 	}
 }
 
@@ -1861,9 +1949,13 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		m_surface_metas.emplace(desc.info.metadata.range.address,
-		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                      .clear_mask = image.info.htile_clear_mask});
+		if (m_surface_metas
+		        .emplace(desc.info.metadata.range.address,
+		                 MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
+		                               .clear_mask = image.info.htile_clear_mask})
+		        .second) {
+			m_surface_meta_generation.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);

@@ -679,6 +679,7 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
     : info(image_info), m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
+	g_allocation_counters.images_created.fetch_add(1, std::memory_order_relaxed);
 	ImageOps::Validate(info);
 	m_cpu_dirty =
 	    !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
@@ -744,6 +745,7 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	g_allocation_counters.images_destroyed.fetch_add(1, std::memory_order_relaxed);
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);

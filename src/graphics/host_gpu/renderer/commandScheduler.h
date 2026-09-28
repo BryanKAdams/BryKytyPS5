@@ -39,7 +39,10 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
-	void                      PopPendingOperations();
+	// Runs the deferred operations of completed ticks. `wait_for_priority` = false (draw and
+	// dispatch entry) leaves an operation queued until the priority thread has run the priority
+	// operations of its tick, instead of waiting for it.
+	void                      PopPendingOperations(bool wait_for_priority = true);
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Whether `tick` completed and every priority operation deferred up to it has run.

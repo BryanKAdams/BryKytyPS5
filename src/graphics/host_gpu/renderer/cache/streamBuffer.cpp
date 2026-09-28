@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
 
@@ -63,6 +64,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
+	g_allocation_counters.buffers_created.fetch_add(1, std::memory_order_relaxed);
 
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
@@ -112,6 +114,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
+	g_allocation_counters.buffers_destroyed.fetch_add(1, std::memory_order_relaxed);
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
