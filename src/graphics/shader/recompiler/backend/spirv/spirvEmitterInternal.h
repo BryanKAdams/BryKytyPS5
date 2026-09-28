@@ -280,6 +280,14 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+// Whether a wave32 guest program may run in a 64-lane host subgroup (vertex stages: drivers need
+// not take a required subgroup size there). Host lanes 32-63 are then a second guest wave, so
+// lane choices and ballots stay within the invocation's own 32 lanes.
+bool     WaveHalvesInHostSubgroup(const EmitterState& state);
+// The invocation's own 32-lane word of a host ballot, per WaveHalvesInHostSubgroup.
+uint32_t EmitOwnWaveHalfWord(EmitterState& state, uint32_t ballot);
+// 32 in host lanes 32-63 when WaveHalvesInHostSubgroup, else 0.
+uint32_t EmitOwnWaveHalfBase(EmitterState& state);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

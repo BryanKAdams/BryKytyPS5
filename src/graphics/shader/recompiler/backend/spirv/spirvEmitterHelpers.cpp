@@ -124,6 +124,36 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	return {subid, ConstantBool(state, true)};
 }
 
+bool WaveHalvesInHostSubgroup(const EmitterState& state) {
+	// KYTY_DEBUG_WAVE_HALVES=0 emits as if the host subgroup matched the guest wave (A/B).
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_WAVE_HALVES");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	const auto stage = state.program.stage;
+	return enabled && state.program.wave_size == 32u && state.lane_count == 1 &&
+	       (stage == ShaderType::Vertex || stage == ShaderType::Local ||
+	        stage == ShaderType::TessellationEvaluation);
+}
+
+uint32_t EmitOwnWaveHalfBase(EmitterState& state) {
+	return EmitBinaryU32(state, spv::OpBitwiseAnd, EmitSubgroupLocalInvocationId(state),
+	                     ConstantU32(state, 32));
+}
+
+uint32_t EmitOwnWaveHalfWord(EmitterState& state, uint32_t ballot) {
+	const auto low   = state.builder.AllocateId();
+	const auto high  = state.builder.AllocateId();
+	const auto upper = state.builder.AllocateId();
+	const auto word  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), upper, EmitOwnWaveHalfBase(state),
+	                          ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), word, upper, high, low);
+	return word;
+}
+
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");

@@ -1740,12 +1740,16 @@ void TestNggVertexEntryState() {
     options.input_info.vertex = &input;
     options.wave_size = input.wave_size;
     const auto result = RecompileForTest(params.code, options);
+    // A wave32 vertex shader may run in a 64-lane host subgroup (drivers need not take a
+    // required subgroup size for vertex stages), which then holds two guest waves: its NGG
+    // subgroup counts 64 vertices, so every host lane passes the launch-count test.
+    const uint32_t vertex_count = wave_size == 32u ? 64u : wave_size;
     bool live_vertex_range = false;
     for (const auto *block : result.program.blocks) {
       for (const auto &inst : *block) {
         if (inst.GetOpcode() == IR::ValueOpcode::UGreaterThan32) {
           const auto count = inst.Arg(0).Resolve();
-          live_vertex_range |= count.IsImmediate() && count.U32() == wave_size;
+          live_vertex_range |= count.IsImmediate() && count.U32() == vertex_count;
         }
       }
     }

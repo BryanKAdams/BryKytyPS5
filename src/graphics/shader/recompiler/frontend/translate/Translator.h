@@ -21,6 +21,15 @@ struct LoopHeat {
 };
 const LoopHeat& DebugLoopHeat();
 
+// Whether a wave32 guest program may run in a 64-lane host subgroup: pixel and compute pipelines
+// require the guest's wave size, but drivers need not take a required size for vertex stages
+// (AMD runs them as wave64). Host lanes 32-63 are then a second guest wave: their EXEC, VCC and
+// ballots are the host ballot's upper word, and MBCNT counts within their own 32 lanes.
+[[nodiscard]] bool WaveHalvesInHostSubgroup(const IR::Program& program);
+// The guest wave's 32-lane mask from a host ballot, per WaveHalvesInHostSubgroup.
+[[nodiscard]] IR::U32 GuestWaveMask(IR::IREmitter& ir, const IR::Program& program,
+                                    const IR::Value& ballot);
+
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit)

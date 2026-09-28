@@ -338,8 +338,12 @@ void Translator::V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low) {
 	    ir.ISub(ir.ShiftLeftLogical(IR::U32(IR::Value(1u)), local), IR::U32(IR::Value(1u)));
 	const auto high_lane =
 	    IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32, {lane, IR::Value(32u)}));
-	const auto thread_mask = low ? ir.Select(high_lane, IR::U32(IR::Value(0xffffffffu)), below)
-	                             : ir.Select(high_lane, below, IR::U32(IR::Value(0u)));
+	// A wave32 guest in a 64-lane host subgroup counts within its own 32 lanes (see
+	// WaveHalvesInHostSubgroup): host lanes 32-63 are lanes 0-31 of the second guest wave.
+	const auto thread_mask = WaveHalvesInHostSubgroup(program)
+	                             ? (low ? below : IR::U32(IR::Value(0u)))
+	                         : low ? ir.Select(high_lane, IR::U32(IR::Value(0xffffffffu)), below)
+	                               : ir.Select(high_lane, below, IR::U32(IR::Value(0u)));
 	const auto active      = ir.BitwiseAnd(ReadU32(inst.src0), thread_mask);
 	const auto count       = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {active}));
 	WriteOperand(DestinationOperand(inst), ir.IAdd(count, ReadU32(inst.src1)));

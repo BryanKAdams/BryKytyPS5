@@ -666,6 +666,10 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto ballot   = ctx.Ballot(inst.Arg(1));
 	const auto lane     = ctx.FirstLane(ballot);
 	const auto shuffled = ctx.Shuffle(inst, 0, lane);
+	if (WaveHalvesInHostSubgroup(ctx.state)) {
+		// Each half is its own guest wave: the value is uniform per half only.
+		return shuffled;
+	}
 	// Every lane now holds the same value, so reading the first active lane changes nothing but
 	// tells the driver the result is uniform. AMD compiles the shuffle alone to ds_bpermute and
 	// treats its result as per-lane, which turned everything derived from a waterfall key
@@ -681,8 +685,15 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// V_READLANE's lane is an SGPR or a constant, so the result is uniform too; see
 	// EmitReadFirstLane.
+	auto& state = ctx.state;
+	if (WaveHalvesInHostSubgroup(state)) {
+		// The lane is the guest wave's (wave32 reads its low 5 bits): offset it into the
+		// invocation's own half.
+		const auto lane =
+		    EmitBinaryU32(state, spv::OpBitwiseAnd, ctx.Arg(inst, 1), ConstantU32(state, 31));
+		return ctx.Shuffle(inst, 0, EmitAddU32(state, lane, EmitOwnWaveHalfBase(state)));
+	}
 	const auto shuffled = ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
-	auto&      state    = ctx.state;
 	const auto result   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst,
 	                          TypeId(state, inst.Arg(0).GetType()), result,
@@ -693,8 +704,12 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto hit   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), hit,
-	                          EmitSubgroupLocalInvocationId(state), ctx.Arg(inst, 2));
+	const auto lane  = WaveHalvesInHostSubgroup(state)
+	                       ? EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                                       EmitSubgroupLocalInvocationId(state),
+	                                       ConstantU32(state, 31))
+	                       : EmitSubgroupLocalInvocationId(state);
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), hit, lane, ctx.Arg(inst, 2));
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, hit, ctx.Arg(inst, 1),
 	                                                ctx.Arg(inst, 0));
 }
