@@ -1370,8 +1370,25 @@ static uint64_t ImageUsersAddress() {
 	return address;
 }
 
+// KYTY_DEBUG_IMAGE_USERS_SHADER=<hash>[,<hash>...]: every image and buffer binding of the draws
+// and dispatches with one of these pixel, vertex or compute shaders is listed too, whatever its
+// address.
+static const std::vector<uint64_t>& ImageUsersShaders() {
+	static const std::vector<uint64_t> shaders = [] {
+		std::vector<uint64_t> list;
+		const char*           text = std::getenv("KYTY_DEBUG_IMAGE_USERS_SHADER");
+		while (text != nullptr && *text != ' ') {
+			char* end = nullptr;
+			list.push_back(std::strtoull(text, &end, 16));
+			text = (end != nullptr && *end == ',') ? end + 1 : nullptr;
+		}
+		return list;
+	}();
+	return shaders;
+}
+
 bool ImageUsersEnabled() {
-	return ImageUsersAddress() != 0;
+	return ImageUsersAddress() != 0 || !ImageUsersShaders().empty();
 }
 
 void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stages,
@@ -1380,6 +1397,9 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 	static std::map<std::string, uint64_t> counts;
 	static auto window_start = std::chrono::steady_clock::now();
 	const auto  address      = ImageUsersAddress();
+	const auto& shaders      = ImageUsersShaders();
+	const bool  every        = std::ranges::find(shaders, pixel_hash) != shaders.end() ||
+	                   std::ranges::find(shaders, vertex_hash) != shaders.end();
 	// KYTY_DEBUG_IMAGE_USERS_TRACE=1 also prints each draw's or dispatch's uses in order, one line
 	// per call, with a run of identical calls collapsed into a count: the order of the passes
 	// sharing the surface (image-churn lines from the texture cache interleave).
@@ -1397,7 +1417,8 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 		const auto& image     = cache.GetImage(id);
 		const auto& request   = desc.info.data;
 		const bool  requested = address >= request.address && address < request.End();
-		if (!requested && (address < image.info.data.address || address >= image.info.data.End())) {
+		if (!every && !requested &&
+		    (address < image.info.data.address || address >= image.info.data.End())) {
 			return;
 		}
 		const auto& view = desc.view_info;
@@ -1405,16 +1426,17 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 		                    vk::to_string(image.info.pixel_format), desc.info.extent.width,
 		                    desc.info.extent.height);
 		counts[fmt::format("ps={:016x} vs={:016x} {} stage={} slot={}{} req=0x{:x}+0x{:x} {} "
-		                   "guest_fmt={} {}x{} view={}+{} layers {}+{} -> image=0x{:x}+0x{:x} {} {}x{}"
-		                   " cpu_dirty={} buf_mod={} gpu_mod={}",
+		                   "guest_fmt={} tile={} {}x{} view={}+{} layers {}+{} -> image=0x{:x}+0x{:x} {} "
+		                   "tile={} {}x{} cpu_dirty={} buf_mod={} gpu_mod={}",
 		                   pixel_hash, vertex_hash, role, stage, slot, extra, request.address,
 		                   request.size, vk::to_string(desc.info.pixel_format),
-		                   static_cast<uint32_t>(desc.info.guest_format), desc.info.extent.width,
+		                   static_cast<uint32_t>(desc.info.guest_format),
+		                   static_cast<uint32_t>(desc.info.tile_mode), desc.info.extent.width,
 		                   desc.info.extent.height, view.base_level, view.level_count,
 		                   view.base_layer, view.layer_count, image.info.data.address,
 		                   image.info.data.size, vk::to_string(image.info.pixel_format),
-		                   image.info.extent.width, image.info.extent.height,
-		                   image.IsCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+		                   static_cast<uint32_t>(image.info.tile_mode), image.info.extent.width,
+		                   image.info.extent.height, image.IsCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
 		                   image.IsGpuModified() ? 1 : 0)]++;
 	};
 	for (const auto* stage: stages) {
@@ -1425,7 +1447,8 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 		const auto buffer_count = std::min(program.info.buffers.size(), stage->buffer_sources.size());
 		for (uint32_t i = 0; i < buffer_count; i++) {
 			const auto& source = stage->buffer_sources[i];
-			if (source.size != 0 && address >= source.address && address < source.address + source.size) {
+			if (source.size != 0 &&
+			    (every || (address >= source.address && address < source.address + source.size))) {
 				const auto& resource = program.info.buffers[i];
 				counts[fmt::format("ps={:016x} vs={:016x} buffer stage={} slot={} range=0x{:x}+0x{:x}"
 				                   " written={} stored={} atomic={}",
