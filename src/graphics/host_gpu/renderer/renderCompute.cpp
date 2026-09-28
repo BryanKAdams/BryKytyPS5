@@ -264,6 +264,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// Temporary until RT is implemented.
 		return;
 	}
+	if (DebugSkipShader(input_info.stage.program->shader_hash)) [[unlikely]] {
+		return;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -439,6 +442,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}();
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		return;
+	}
+	if (DebugSkipShader(input_info.stage.program->shader_hash)) [[unlikely]] {
 		return;
 	}
 	buffer.EndRendering();

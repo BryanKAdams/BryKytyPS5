@@ -648,6 +648,40 @@ bool DebugFullBarriers() noexcept {
 	return present.load(std::memory_order_relaxed);
 }
 
+// KYTY_DEBUG_SKIP_SHADERS_FILE=<path> skips them only while that file exists (checked twice a
+// second), like KYTY_DEBUG_FULL_BARRIERS_FILE.
+bool DebugSkipShader(uint64_t shader_hash) noexcept {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		for (const char* text = std::getenv("KYTY_DEBUG_SKIP_SHADERS"); text != nullptr;) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(text, &end, 16);
+			if (end == text) {
+				break;
+			}
+			list.push_back(hash);
+			text = *end == ',' ? end + 1 : nullptr;
+		}
+		return list;
+	}();
+	if (hashes.empty() || std::ranges::find(hashes, shader_hash) == hashes.end()) {
+		return false;
+	}
+	static const char* file = std::getenv("KYTY_DEBUG_SKIP_SHADERS_FILE");
+	if (file == nullptr) {
+		return true;
+	}
+	static std::atomic<int64_t> next_check {0};
+	static std::atomic<bool>    present {false};
+	const auto                  now = std::chrono::steady_clock::now().time_since_epoch();
+	if (now.count() >= next_check.load(std::memory_order_relaxed)) {
+		next_check.store((now + std::chrono::milliseconds(500)).count(), std::memory_order_relaxed);
+		std::error_code error;
+		present.store(std::filesystem::exists(file, error), std::memory_order_relaxed);
+	}
+	return present.load(std::memory_order_relaxed);
+}
+
 // Outside rendering: all earlier commands finish, and their writes are visible to everything
 // later.
 void RecordFullBarrier(vk::CommandBuffer command) noexcept {

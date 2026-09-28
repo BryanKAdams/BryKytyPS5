@@ -47,6 +47,10 @@ inline RenderDebugCounters g_render_debug_counters;
 // its memory writes (RecordFullBarrier). Slow; it tells synchronization bugs (a result that changes)
 // from bugs that do not depend on timing.
 [[nodiscard]] bool DebugFullBarriers() noexcept;
+// KYTY_DEBUG_SKIP_SHADERS=<shader hashes, hex, comma-separated>: draws with a listed pixel or
+// vertex shader and dispatches of a listed compute shader are left out, to find the draws behind a
+// visual defect.
+[[nodiscard]] bool DebugSkipShader(uint64_t shader_hash) noexcept;
 void               RecordFullBarrier(vk::CommandBuffer command) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
