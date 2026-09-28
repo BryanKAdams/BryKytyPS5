@@ -804,7 +804,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	static auto     window_start = std::chrono::steady_clock::now();
 	static uint64_t window_tsc   = Now();
 	static uint64_t window_gpu   = g_gpu_busy_ns.load(std::memory_order_relaxed);
-	static std::array<uint64_t, 4> window_allocations {};
+	static std::array<uint64_t, 7> window_allocations {};
 	static std::array<uint64_t, 5> window_repeats {};
 	uint64_t        sum          = 0;
 	for (const auto ticks: current) {

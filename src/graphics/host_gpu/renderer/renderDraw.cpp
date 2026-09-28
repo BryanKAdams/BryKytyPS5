@@ -1628,7 +1628,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				    mesh_slices.emplace_back(slice, records.BufferDeviceAddress() + offset);
 			    });
 		};
-		if (primitive_restart_enable && draw.IsIndexed() && MeshRestartSplitEnabled()) {
+		// Indices the GPU wrote may not have reached guest memory, where the split reads them.
+		const bool gpu_indices =
+		    primitive_restart_enable && draw.IsIndexed() &&
+		    m_context.GetBufferCache().IsRegionGpuModified(
+		        index_source.address, uint64_t {draw.index_count} * index_source.guest_element_size);
+		if (gpu_indices) {
+			static std::atomic_bool gpu_indices_warned = false;
+			if (!gpu_indices_warned.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Warning: mesh draw with primitive restart reads GPU-written indices; "
+				            "drawn without restart (primitive=%u)\n",
+				            static_cast<uint32_t>(ucfg.GetPrimType()));
+			}
+		}
+		if (primitive_restart_enable && draw.IsIndexed() && !gpu_indices &&
+		    MeshRestartSplitEnabled()) {
 			// The mesh shader assembles strips and fans from the draw's first index on (a fan's
 			// center is its vertex 0, a strip's winding follows its primitive number) and knows
 			// nothing of restart. So each run of indices between restart markers is drawn as a
