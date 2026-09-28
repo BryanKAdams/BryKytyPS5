@@ -794,7 +794,8 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	    "pipeline", "records",   "commit",     "record",     "tail"};
 	static constexpr std::array<const char*, ProbeCount> ProbeNames {
 	    "rt-image", "tex-image", "tex-describe", "buf-written", "buf-read", "buf-invalidate",
-	    "upload",   "find-finish", "stream-copy", "pending-ops", "bda"};
+	    "upload",   "find-finish", "stream-copy", "pending-ops", "bda",       "spec-reads",
+	    "refresh",  "prog-match",  "inputs-check"};
 	static std::array<uint64_t, Count>      totals {};
 	static std::array<uint64_t, ProbeCount> probe_totals {};
 	static uint64_t draws        = 0;

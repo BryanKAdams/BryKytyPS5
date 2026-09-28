@@ -643,6 +643,7 @@ struct PipelineCache::ProgramCache {
 		// if it has one yet.
 		const auto existing = [&](SourceEntry& source) -> std::optional<ShaderProgram> {
 			if (!AdoptSpeculation(source, stage, user_data, params.Base(), runtime, wait)) {
+				DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::ResourceRefresh);
 				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 				    source.resource_plan, runtime, source.resources, source.specialization,
 				    &source.memo));
@@ -654,6 +655,7 @@ struct PipelineCache::ProgramCache {
 			if (stats_enabled) {
 				CountRefresh(source);
 			}
+			DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::ProgramMatch);
 			const auto matches = [&](const Permutation& candidate) {
 				const auto& layout = candidate.program.bindings;
 				return layout.push_data_start_dword ==
@@ -898,6 +900,10 @@ struct PipelineCache::ProgramCache {
 		                                                                : SpeculatedDraw::Vertex];
 		static const bool ab      = AbSelected("specprep");
 		bool              adopted = false;
+		const auto        reads_unchanged = [&] {
+			DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::SpeculationReads);
+			return ShaderRecompiler::IR::ReadsUnchanged(stage_result->reads, runtime);
+		};
 		if (stage_result == nullptr || stage_result->source == nullptr) {
 			speculation.unspeculated++;
 		} else {
@@ -910,7 +916,7 @@ struct PipelineCache::ProgramCache {
 				speculation.mismatched++;
 			} else if (ab && AbFeatureOff()) {
 				speculation.skipped++;
-			} else if (!ShaderRecompiler::IR::ReadsUnchanged(stage_result->reads, runtime)) {
+			} else if (!reads_unchanged()) {
 				speculation.changed++;
 			} else {
 				std::swap(source.resources, stage_result->snapshot);
@@ -1569,12 +1575,16 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		if (ab && AbFeatureOff()) {
 			return nullptr;
 		}
-		thread_local GraphicsStageRegisters registers;
-		CaptureGraphicsStageRegisters(registers, vertex_regs, pixel_regs, sh, context, user_config,
-		                              target_export_mapping, pixel_active);
-		if (std::memcmp(&registers, &prepared.registers, sizeof(registers)) != 0 ||
-		    ShaderMapVersion() != prepared.shader_map_version ||
-		    !VertexTableReadsUnchanged(prepared.vertex_tables)) {
+		const bool unchanged = [&] {
+			DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::InputsCheck);
+			thread_local GraphicsStageRegisters registers;
+			CaptureGraphicsStageRegisters(registers, vertex_regs, pixel_regs, sh, context,
+			                              user_config, target_export_mapping, pixel_active);
+			return std::memcmp(&registers, &prepared.registers, sizeof(registers)) == 0 &&
+			       ShaderMapVersion() == prepared.shader_map_version &&
+			       VertexTableReadsUnchanged(prepared.vertex_tables);
+		}();
+		if (!unchanged) {
 			m_program_cache->speculation.inputs_changed++;
 			return nullptr;
 		}

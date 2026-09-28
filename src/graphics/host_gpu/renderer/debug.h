@@ -85,6 +85,10 @@ struct DrawPhaseTimer {
 		StreamCopy,       // ObtainBuffer's copies of small CPU-written buffers.
 		PendingOps,       // The scheduler's completed operations run at draw entry.
 		Bda,              // PrepareBda for stages reading memory through addresses.
+		SpeculationReads, // Repeating a speculated stage's guest reads before adopting it.
+		ResourceRefresh,  // Refreshing a stage's resources that were not adopted.
+		ProgramMatch,     // Finding the refreshed stage's permutation.
+		InputsCheck,      // Comparing the registers of speculation-prepared stage inputs.
 		ProbeCount
 	};
 	class ProbeScope {
