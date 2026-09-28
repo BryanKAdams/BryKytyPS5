@@ -15,6 +15,7 @@
 #include <intrin.h>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -495,6 +496,15 @@ thread_local CommandStream::Slot* t_home = nullptr;
 // The stream this thread runs, if it is a consumer.
 thread_local CommandStream::Impl* t_consuming = nullptr;
 
+// A payload call between ReserveRecordedCall and CommitRecordedCall on this thread.
+struct PendingCall {
+	CommandStream::Impl* stream  = nullptr;
+	uint8_t*             start   = nullptr;
+	uint8_t*             closure = nullptr;
+	VkCommandBuffer      buffer  = VK_NULL_HANDLE;
+};
+thread_local PendingCall t_pending_call;
+
 // The stream `buffer` records through, if it is routed. The thread recording into a buffer owns
 // it (Vulkan requires external synchronization), so it sees the routing ordered before that.
 [[nodiscard]] CommandStream::Slot* SlotFor(VkCommandBuffer buffer) {
@@ -516,6 +526,10 @@ thread_local CommandStream::Impl* t_consuming = nullptr;
 // Whether a call into `buffer` goes into the stream (t_stream). Another thread recording into a
 // routed buffer records directly, after what the stream holds.
 [[nodiscard]] bool Routed(VkCommandBuffer buffer) {
+	// A consumer's calls (a payload call's run, see CommitRecordedCall) are the recording itself.
+	if (t_consuming != nullptr) {
+		return false;
+	}
 	auto* slot = SlotFor(buffer);
 	if (slot == nullptr) {
 		return false;
@@ -575,13 +589,28 @@ template <typename T>
 }
 
 // Builds one packet: copies of arrays, then the closure that makes the call.
+// Publishes a reserved packet: its header, then `call` at `closure` (after its arrays).
+template <typename Call>
+void CommitCall(CommandStream::Impl& stream, uint8_t* start, uint8_t* closure, Call call) {
+	static_assert(std::is_trivially_destructible_v<Call>);
+	static_assert(sizeof(Call) <= CommandStream::Impl::ClosureBytes);
+	auto* header = reinterpret_cast<CommandStream::Impl::Header*>(start);
+	::new (closure) Call(call);
+	header->run            = [](void* bytes) { (*static_cast<Call*>(bytes))(); };
+	header->closure_offset = static_cast<uint32_t>(closure - start);
+	const auto used        = static_cast<size_t>(closure - start) + sizeof(Call);
+	header->size = static_cast<uint32_t>((used + CommandStream::Impl::Align - 1) &
+	                                     ~(CommandStream::Impl::Align - 1));
+	stream.Publish(start, header->size);
+}
+
 class Packet {
 public:
 	// Reserves room for the arrays and the largest closure; publishes only what it uses.
 	Packet(CommandStream::Impl& stream, size_t array_bytes)
 	    : m_stream(stream), m_size(CommandStream::Impl::HeaderBytes + array_bytes +
 	                               CommandStream::Impl::ClosureBytes),
-	      m_start(stream.Reserve(m_size)), m_next(m_start + CommandStream::Impl::HeaderBytes) {}
+	      m_start(Start(stream, m_size)), m_next(m_start + CommandStream::Impl::HeaderBytes) {}
 	KYTY_CLASS_NO_COPY(Packet);
 
 	template <typename T>
@@ -598,19 +627,19 @@ public:
 
 	template <typename Call>
 	void Commit(Call call) {
-		static_assert(std::is_trivially_destructible_v<Call>);
-		static_assert(sizeof(Call) <= CommandStream::Impl::ClosureBytes);
-		auto* header = reinterpret_cast<CommandStream::Impl::Header*>(m_start);
-		::new (m_next) Call(call);
-		header->run            = [](void* closure) { (*static_cast<Call*>(closure))(); };
-		header->closure_offset = static_cast<uint32_t>(m_next - m_start);
-		const auto used        = static_cast<size_t>(m_next - m_start) + sizeof(Call);
-		header->size = static_cast<uint32_t>((used + CommandStream::Impl::Align - 1) &
-		                                     ~(CommandStream::Impl::Align - 1));
-		m_stream.Publish(m_start, header->size);
+		CommitCall(m_stream, m_start, m_next, call);
 	}
 
 private:
+	static uint8_t* Start(CommandStream::Impl& stream, size_t bytes) {
+		// A payload call's reservation is not published yet: another packet would overwrite it.
+		if (t_pending_call.stream == &stream) {
+			EXIT("deferred recording: a command was recorded between ReserveRecordedCall and "
+			     "CommitRecordedCall\n");
+		}
+		return stream.Reserve(bytes);
+	}
+
 	CommandStream::Impl& m_stream;
 	size_t               m_size;
 	uint8_t*             m_start;
@@ -1344,6 +1373,9 @@ struct FallbackHook<Tag, R(VKAPI_PTR*)(VkCommandBuffer, A...)> {
 	static inline R(VKAPI_PTR* real)(VkCommandBuffer, A...) = nullptr;
 
 	static R VKAPI_PTR Call(VkCommandBuffer buffer, A... args) {
+		if (t_consuming != nullptr) {
+			return real(buffer, args...);
+		}
 		if (auto* stream = StreamFor(buffer); stream != nullptr) {
 			g_fallback_calls.fetch_add(1, std::memory_order_relaxed);
 			stream->Drain();
@@ -1477,6 +1509,29 @@ bool CommandRecordingDeferred() {
 
 void DrainGpuThreadCommands() {
 	BeforeDirect();
+}
+
+uint8_t* ReserveRecordedCall(VkCommandBuffer buffer, size_t bytes) {
+	EXIT_IF(t_pending_call.stream != nullptr);
+	auto* slot = SlotFor(buffer);
+	if (slot == nullptr || t_consuming != nullptr ||
+	    slot->owner.load(std::memory_order_relaxed) != &t_owner_token) {
+		return nullptr;
+	}
+	auto&      stream  = *slot->stream.load(std::memory_order_relaxed);
+	const auto payload = (bytes + CommandStream::Impl::Align - 1) & ~(CommandStream::Impl::Align - 1);
+	auto*      start   = stream.Reserve(CommandStream::Impl::HeaderBytes + payload +
+	                                    CommandStream::Impl::ClosureBytes);
+	t_pending_call     = {&stream, start, start + CommandStream::Impl::HeaderBytes + payload, buffer};
+	return start + CommandStream::Impl::HeaderBytes;
+}
+
+void CommitRecordedCall(void (*run)(VkCommandBuffer buffer, const uint8_t* payload)) {
+	const auto call = std::exchange(t_pending_call, {});
+	EXIT_IF(call.stream == nullptr || run == nullptr);
+	const auto* payload = call.start + CommandStream::Impl::HeaderBytes;
+	CommitCall(*call.stream, call.start, call.closure,
+	           [run, buffer = call.buffer, payload] { run(buffer, payload); });
 }
 
 CommandStream::CommandStream() {

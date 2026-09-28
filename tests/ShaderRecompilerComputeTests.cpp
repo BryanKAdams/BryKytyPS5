@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandHooks.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/meshIndirect.h"
@@ -1199,6 +1200,78 @@ void CheckLeastRecentlyUsedCacheOrdering() {
           visited == std::vector<uint32_t>{1, 3, 2},
           "touching a non-tail item left a cycle or changed LRU order");
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
+}
+
+// Payload calls (ReserveRecordedCall/CommitRecordedCall) run on the stream's consumer in order
+// with pushed work, with the routed buffer and their whole payload; other threads and buffers
+// that are not routed get no room. No GPU: the command buffer is only a handle.
+namespace CommandStreamPayloadTest {
+std::vector<int64_t> g_order; // Consumer only, read after a drain.
+bool g_payload_ok = true;
+const auto g_buffer = reinterpret_cast<VkCommandBuffer>(uintptr_t{0x1230});
+
+void Run(VkCommandBuffer buffer, const uint8_t *payload) {
+  uint32_t index = 0;
+  uint32_t size = 0;
+  std::memcpy(&index, payload, sizeof(index));
+  std::memcpy(&size, payload + 4, sizeof(size));
+  g_payload_ok = g_payload_ok && buffer == g_buffer &&
+                 reinterpret_cast<uintptr_t>(payload) % 16u == 0;
+  for (uint32_t i = 8; i < size; i++) {
+    g_payload_ok = g_payload_ok && payload[i] == static_cast<uint8_t>(index + i);
+  }
+  g_order.push_back(index);
+}
+} // namespace CommandStreamPayloadTest
+
+void CheckCommandStreamPayloads() {
+  using namespace CommandStreamPayloadTest;
+  using Libs::Graphics::CommitRecordedCall;
+  using Libs::Graphics::ReserveRecordedCall;
+  constexpr const char *name = "CommandStreamPayloads";
+  Libs::Graphics::CommandStream stream;
+  std::jthread consumer([&](std::stop_token stop) { stream.Consume(stop); });
+  stream.Route(g_buffer);
+  Require(name, "other buffer",
+          ReserveRecordedCall(reinterpret_cast<VkCommandBuffer>(uintptr_t{0x4560}), 16) ==
+              nullptr,
+          "a buffer that is not routed got payload room");
+  bool other_thread_refused = false;
+  std::thread([&] { other_thread_refused = ReserveRecordedCall(g_buffer, 16) == nullptr; })
+      .join();
+  Require(name, "other thread", other_thread_refused,
+          "a thread that did not route the buffer got payload room");
+  std::vector<int64_t> expected;
+  for (uint32_t i = 0; i < 3000; i++) {
+    const uint32_t size = 8u + (i * 37u) % 1500u;
+    auto *payload = ReserveRecordedCall(g_buffer, size);
+    Require(name, "reserve", payload != nullptr, "the routing thread got no payload room");
+    std::memcpy(payload, &i, sizeof(i));
+    std::memcpy(payload + 4, &size, sizeof(size));
+    for (uint32_t b = 8; b < size; b++) {
+      payload[b] = static_cast<uint8_t>(i + b);
+    }
+    CommitRecordedCall(Run);
+    expected.push_back(i);
+    if (i % 7u == 0) {
+      const auto marker = -static_cast<int64_t>(i) - 1;
+      stream.Push([marker] { g_order.push_back(marker); });
+      expected.push_back(marker);
+    }
+    if (i % 500u == 0) {
+      stream.Wake();
+    }
+  }
+  stream.Route(VK_NULL_HANDLE);
+  stream.Wake();
+  stream.Drain();
+  Require(name, "order", g_order == expected,
+          "payload calls and pushed work ran out of order or went missing");
+  Require(name, "payload", g_payload_ok,
+          "a payload call saw the wrong buffer, a misaligned payload or changed bytes");
+  consumer.request_stop();
+  consumer.join();
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 struct BdaMapping {
@@ -35147,6 +35220,10 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckAttachmentFeedbackPipelineKeys();
+  if (argc == 2 && std::strcmp(argv[1], "--command-stream-only") == 0) {
+    CheckCommandStreamPayloads();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--shader-precompile-only") == 0) {
     VulkanHarness vulkan;
     CheckShaderPrecompileGpu(vulkan);
