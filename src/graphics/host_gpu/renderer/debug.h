@@ -34,15 +34,19 @@ inline RenderDebugCounters g_render_debug_counters;
 // as one payload call), pipelinememo (the last graphics pipeline reused without a map lookup),
 // depthreuse (a clean depth target keeping its view between draws), regiongen (image lookups and
 // views checked against the images over their own range rather than the whole image set),
-// streamreuse (a range copied into the stream ring earlier in the BDA epoch bound again).
+// streamreuse (a range copied into the stream ring earlier in the BDA epoch bound again),
+// budgetcache (VMA's memory budget fetched from the driver at most every 500 ms).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
 inline std::atomic<uint64_t> g_gpu_busy_ns {0};
 // GPU buffers and images created and destroyed, for the draw-phases line's allocation churn.
 struct AllocationCounters {
-	std::atomic<uint64_t> buffers_created {0};
+	std::atomic<uint64_t> buffers_created {0}; // Every Buffer, temporary staging included.
 	std::atomic<uint64_t> buffers_destroyed {0};
+	std::atomic<uint64_t> game_buffers_created {0};   // BufferCache::CreateBuffer.
+	std::atomic<uint64_t> game_buffers_joined {0};    // Merged into a larger one (JoinOverlap).
+	std::atomic<uint64_t> game_buffers_collected {0}; // Deleted by garbage collection.
 	std::atomic<uint64_t> images_created {0};
 	std::atomic<uint64_t> images_destroyed {0};
 };
