@@ -1380,6 +1380,13 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 	static std::map<std::string, uint64_t> counts;
 	static auto window_start = std::chrono::steady_clock::now();
 	const auto  address      = ImageUsersAddress();
+	// KYTY_DEBUG_IMAGE_USERS_TRACE=1 also prints each draw's or dispatch's uses in order, one line
+	// per call, with a run of identical calls collapsed into a count: the order of the passes
+	// sharing the surface (image-churn lines from the texture cache interleave).
+	static const bool trace = std::getenv("KYTY_DEBUG_IMAGE_USERS_TRACE") != nullptr;
+	static std::string previous_call;
+	static uint64_t    repeats = 0;
+	std::string        call;
 	// The binding's guest request (desc.info) and the cache image it resolved to (id), which can
 	// be a larger image holding the request.
 	const auto note = [&](const char* role, uint32_t stage, uint32_t slot, ImageId id,
@@ -1394,6 +1401,9 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 			return;
 		}
 		const auto& view = desc.view_info;
+		call += fmt::format(" | {} {}/{} {} {}x{}", role, stage, slot,
+		                    vk::to_string(image.info.pixel_format), desc.info.extent.width,
+		                    desc.info.extent.height);
 		counts[fmt::format("ps={:016x} vs={:016x} {} stage={} slot={}{} req=0x{:x}+0x{:x} {} "
 		                   "guest_fmt={} {}x{} view={}+{} layers {}+{} -> image=0x{:x}+0x{:x} {} {}x{}"
 		                   " cpu_dirty={} buf_mod={} gpu_mod={}",
@@ -1440,6 +1450,19 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 		    depth->depth_load_clear_enable ? 1 : 0,
 		    depth->desc.info.metadata.kind == ImageMetadataKind::Htile ? 1 : 0);
 		note("depth", 0, 0, depth->image_id, depth->desc, extra.c_str());
+	}
+	if (trace && !call.empty()) {
+		call = fmt::format("ps={:016x} vs={:016x}{}", pixel_hash, vertex_hash, call);
+		if (call == previous_call) {
+			repeats++;
+		} else {
+			if (repeats != 0) {
+				std::printf("image-trace   x%" PRIu64 " more\n", repeats);
+			}
+			std::printf("image-trace %s\n", call.c_str());
+			previous_call = std::move(call);
+			repeats       = 0;
+		}
 	}
 	const auto now = std::chrono::steady_clock::now();
 	if (now - window_start < std::chrono::seconds(5)) {
