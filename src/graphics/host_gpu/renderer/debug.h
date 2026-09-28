@@ -101,6 +101,7 @@ struct DrawPhaseTimer {
 		ResourceRefresh,  // Refreshing a stage's resources that were not adopted.
 		ProgramMatch,     // Finding the refreshed stage's permutation.
 		InputsCheck,      // Comparing the registers of speculation-prepared stage inputs.
+		UploadCopy,       // Copying guest bytes into the staging buffer (UploadCopies).
 		ProbeCount
 	};
 	class ProbeScope {
