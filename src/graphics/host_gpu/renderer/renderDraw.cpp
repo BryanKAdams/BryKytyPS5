@@ -737,7 +737,29 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
 			EXIT("depth target changed after render-state discovery\n");
 		}
-		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
+		// A clean depth target the previous draw acquired keeps its view (see
+		// IsDepthTargetCurrent). KYTY_DEBUG_AB=depthreuse acquires it every draw in every other
+		// window.
+		static const bool depth_ab = AbSelected("depthreuse");
+		auto&             acquired = m_depth_target_source;
+		vk::ImageView     image_view;
+		if (TargetReuseEnabled() && !(depth_ab && AbFeatureOff()) &&
+		    acquired.view_image == depth.image_id && acquired.view_info == depth.desc.view_info &&
+		    cache.IsDepthTargetCurrent(depth.image_id, acquired.view_generation,
+		                               acquired.view_meta_generation, depth.desc)) {
+			image_view = acquired.view;
+		} else {
+			// Both generations from before the acquisition: its own changes make the next draw
+			// acquire again rather than trust a state it did not check.
+			const auto generation      = cache.ImageSetGeneration();
+			const auto meta_generation = cache.SurfaceMetaGeneration();
+			image_view                 = cache.FindDepthTarget(depth.image_id, depth.desc);
+			acquired.view              = image_view;
+			acquired.view_image        = depth.image_id;
+			acquired.view_info         = depth.desc.view_info;
+			acquired.view_generation   = generation;
+			acquired.view_meta_generation = meta_generation;
+		}
 		const auto& metadata   = depth.desc.info.metadata;
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
 		    !cache.ClearMeta(metadata.range.address)) {

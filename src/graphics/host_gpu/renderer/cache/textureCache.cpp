@@ -414,6 +414,7 @@ void TextureCache::DeleteImage(ImageId id, std::vector<ImageId>* retired) {
 		    metadata->second.type == MetaDataInfo::Type::HTile) {
 			// A later binding may have reused this address for another metadata type.
 			m_surface_metas.erase(metadata);
+			m_surface_meta_generation.fetch_add(1, std::memory_order_release);
 		}
 	}
 	UnregisterImage(id);
@@ -1365,7 +1366,10 @@ TextureCache::MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
 		changed |= !(image.info.metadata == desc.info.metadata);
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
-		changed |= m_surface_metas.erase(range.address) != 0;
+		if (m_surface_metas.erase(range.address) != 0) {
+			changed = true;
+			m_surface_meta_generation.fetch_add(1, std::memory_order_release);
+		}
 		if (DrainStats::Enabled() && range.Valid()) {
 			m_dcc_metadata_seen.Add(range.address, range.size);
 		}
@@ -1864,6 +1868,20 @@ bool TextureCache::IsRenderTargetCurrent(ImageId id, uint64_t generation) const 
 	const auto& image = m_slot_images[id];
 	return image.IsGpuModified() && image.usage.render_target && image.backing.image != nullptr &&
 	       !(m_readback_linear_images && !image.info.IsTiled());
+}
+
+bool TextureCache::IsDepthTargetCurrent(ImageId id, uint64_t generation, uint64_t meta_generation,
+                                        const ImageDesc& desc) const noexcept {
+	// A stencil request associates the stencil image, which IsTextureCurrent does not cover.
+	if (desc.info.HasStencil() || !IsTextureCurrent(id, generation) ||
+	    meta_generation != m_surface_meta_generation.load(std::memory_order_acquire)) {
+		return false;
+	}
+	// FindDepthTarget's MarkGpuModified, CommitGpuWrite, usage flag and stencil and metadata
+	// assignments would change nothing, and the metadata entry it made is still there.
+	const auto& image = m_slot_images[id];
+	return image.IsGpuModified() && image.usage.depth_target && image.backing.image != nullptr &&
+	       image.info.stencil == desc.info.stencil && image.info.metadata == desc.info.metadata;
 }
 
 // The part of FindImage after the lookup that runs without the lock.
@@ -2608,6 +2626,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
 			metadata = m_surface_metas.erase(metadata);
+			m_surface_meta_generation.fetch_add(1, std::memory_order_release);
 		} else {
 			++metadata;
 		}
