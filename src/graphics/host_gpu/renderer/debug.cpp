@@ -881,6 +881,20 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 			pm4 += fmt::format(" {:02x}:{:.0f}:{:.2f}", op, ops.counts[op] / seconds,
 			                   ops.ticks[op] * to_us / 1000.0 / seconds);
 		}
+		// Draw packets by how their handler ended, as outcome:packets/s:ms/s.
+		static constexpr std::array<const char*, Pm4OpTimer::OutcomeCount> OutcomeNames {
+		    "drawn", "empty", "metadata", "depth-copy", "resolve", "no-shader", "not-prepared",
+		    "rect-skip"};
+		for (uint32_t kind = 0; kind < 2; kind++) {
+			pm4 += kind == 0 ? " | indexed:" : " | auto:";
+			for (uint32_t outcome = 0; outcome < Pm4OpTimer::OutcomeCount; outcome++) {
+				if (ops.outcome_counts[kind][outcome] != 0) {
+					pm4 += fmt::format(" {}:{:.0f}:{:.2f}", OutcomeNames[outcome],
+					                   ops.outcome_counts[kind][outcome] / seconds,
+					                   ops.outcome_ticks[kind][outcome] * to_us / 1000.0 / seconds);
+				}
+			}
+		}
 		std::printf("%s\n", pm4.c_str());
 		ops = {};
 	}

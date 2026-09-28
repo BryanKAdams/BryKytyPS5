@@ -142,9 +142,25 @@ inline thread_local DrawPhaseTimer g_draw_phases;
 // and in ProcessPm4 between handlers, printed as a "pm4-ops" line after each draw-phases line.
 // Draw handlers include their draw phases; the rest is the time no draw phase covers.
 struct Pm4OpTimer {
+	// How a draw packet's handler ended (set by the handler, reset before each packet).
+	enum Outcome : uint8_t {
+		Drawn,
+		Empty,         // No vertices or instances.
+		MetadataOp,    // A color metadata (clear) operation instead of a draw.
+		DepthCopy,     // A depth/stencil copy instead of a draw.
+		Resolve,       // A color resolve instead of a draw.
+		NoShader,      // No valid vertex shader or no topology.
+		NotPrepared,   // Programs pending or no target (PrepareDrawRenderState).
+		RectListSkip,  // A rect list with nothing to interpolate.
+		OutcomeCount
+	};
 	std::array<uint64_t, 256> ticks {};
 	std::array<uint64_t, 256> counts {};
 	uint64_t                  between = 0;
+	Outcome                   outcome = Drawn;
+	// By outcome: [0] indexed draw packets, [1] DRAW_INDEX_AUTO.
+	std::array<std::array<uint64_t, OutcomeCount>, 2> outcome_ticks {};
+	std::array<std::array<uint64_t, OutcomeCount>, 2> outcome_counts {};
 };
 inline thread_local Pm4OpTimer g_pm4_ops;
 

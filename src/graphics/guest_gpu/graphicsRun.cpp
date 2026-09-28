@@ -1062,6 +1062,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    m_speculator != nullptr && IsDrawOpcode(opcode) && DrawSpeculator::Enabled();
 		if (speculated) {
 			t_speculated_draw = m_speculator->Take(packet);
+			// KYTY_DEBUG_AB=specprefetch skips the prefetch in every other window.
+			static const bool ab_prefetch = AbSelected("specprefetch"); // AB-TEMP
+			if (t_speculated_draw != nullptr && !(ab_prefetch && AbFeatureOff())) {
+				PrefetchSpeculatedDraw(*t_speculated_draw);
+			}
 		}
 		uint64_t handler_start = 0;
 		if (timed) [[unlikely]] {
@@ -1069,13 +1074,20 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			if (handler_end != 0) {
 				g_pm4_ops.between += handler_start - handler_end;
 			}
+			g_pm4_ops.outcome = Pm4OpTimer::Drawn;
 		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		if (timed) [[unlikely]] {
-			handler_end = DrawPhaseTimer::Now();
-			g_pm4_ops.ticks[opcode] += handler_end - handler_start;
+			handler_end       = DrawPhaseTimer::Now();
+			const auto ticks = handler_end - handler_start;
+			g_pm4_ops.ticks[opcode] += ticks;
 			g_pm4_ops.counts[opcode]++;
+			if (IsDrawOpcode(opcode)) {
+				const auto kind = opcode == Pm4::IT_DRAW_INDEX_AUTO ? 1u : 0u;
+				g_pm4_ops.outcome_ticks[kind][g_pm4_ops.outcome] += ticks;
+				g_pm4_ops.outcome_counts[kind][g_pm4_ops.outcome]++;
+			}
 		}
 		if (speculated) {
 			m_speculator->Release(t_speculated_draw);

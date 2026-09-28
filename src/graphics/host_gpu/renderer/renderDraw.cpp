@@ -1738,16 +1738,24 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
+		g_pm4_ops.outcome = Pm4OpTimer::Empty;
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	// A color metadata operation, depth copy or resolve instead of a draw.
+	const auto operation =
+	    ConsumeMetadataColorOperation(buffer) ? Pm4OpTimer::MetadataOp
+	    : DepthStencilCopy(buffer)            ? Pm4OpTimer::DepthCopy
+	    : ResolveColorTargets(buffer, args.render_target_slice_offset) ? Pm4OpTimer::Resolve
+	                                                                   : Pm4OpTimer::Drawn;
+	if (operation != Pm4OpTimer::Drawn) {
+		g_pm4_ops.outcome = operation;
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
 		return;
 	}
 
@@ -1774,6 +1782,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
 		return;
 	}
 
@@ -1816,6 +1825,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                        args.instance_count, args.first_instance, args.indirect_args};
 	DrawRenderState state;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NotPrepared;
 		ResetBindings();
 		return;
 	}
@@ -1858,16 +1868,24 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
+		g_pm4_ops.outcome = Pm4OpTimer::Empty;
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	// A color metadata operation, depth copy or resolve instead of a draw.
+	const auto operation =
+	    ConsumeMetadataColorOperation(buffer) ? Pm4OpTimer::MetadataOp
+	    : DepthStencilCopy(buffer)            ? Pm4OpTimer::DepthCopy
+	    : ResolveColorTargets(buffer, args.render_target_slice_offset) ? Pm4OpTimer::Resolve
+	                                                                   : Pm4OpTimer::Drawn;
+	if (operation != Pm4OpTimer::Drawn) {
+		g_pm4_ops.outcome = operation;
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
 		return;
 	}
 
@@ -1893,11 +1911,13 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
 		ResetBindings();
 		return;
 	}
 	DrawRenderState state;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NotPrepared;
 		ResetBindings();
 		return;
 	}
@@ -1912,6 +1932,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
+		g_pm4_ops.outcome = Pm4OpTimer::RectListSkip;
 		ResetBindings();
 		return;
 	}
