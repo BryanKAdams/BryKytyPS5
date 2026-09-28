@@ -49,6 +49,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -1353,6 +1354,45 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// KYTY_DEBUG_MESH_RESTART=0 draws a mesh-emulated strip or fan with primitive restart as one
+// draw, reading its restart markers as vertices, as before restart was handled there.
+static bool MeshRestartSplitEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_MESH_RESTART");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Calls segment(first, count) for each run of the `count` guest indices at `address` between
+// restart markers (all bits set, the only marker ResolvePrimitiveRestart leaves enabled), in order.
+template <typename Segment>
+static void ForEachRestartSegment(uint64_t address, uint32_t element_size, uint32_t count,
+                                  Segment&& segment) {
+	const auto scan = [&](const auto* indices) {
+		using Index         = std::remove_cvref_t<decltype(*indices)>;
+		constexpr auto mark = static_cast<Index>(~Index {0});
+		uint32_t       first = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			if (indices[i] == mark) {
+				if (i > first) {
+					segment(first, i - first);
+				}
+				first = i + 1;
+			}
+		}
+		if (count > first) {
+			segment(first, count - first);
+		}
+	};
+	switch (element_size) {
+		case 1: scan(reinterpret_cast<const uint8_t*>(address)); break;
+		case 2: scan(reinterpret_cast<const uint16_t*>(address)); break;
+		case 4: scan(reinterpret_cast<const uint32_t*>(address)); break;
+		default: EXIT("unsupported index size for primitive restart: %u\n", element_size);
+	}
+}
+
 // Whether a draw may read buffer bytes that pending writes changed: any buffer binding, vertex,
 // index or argument range overlapping them, or a shader reading memory through addresses. Only
 // atomics on both sides need no barrier: atomics on the same memory are coherent without one.
@@ -1459,7 +1499,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		static std::atomic_bool restart_warned = false;
-		if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
+		if (primitive_restart_enable && (!draw.IsIndexed() || !MeshRestartSplitEnabled()) &&
+		    !restart_warned.exchange(true, std::memory_order_relaxed)) {
 			std::printf("Warning: primitive restart is not implemented for mesh shaders; "
 			            "continuing draw (primitive=%u indexed=%u)\n",
 			            static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed());
@@ -1562,23 +1603,53 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    draw.indirect_args, MeshIndirectArgs::ArgumentsSize, false);
 	} else if (mesh_active) {
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		ForEachMeshDispatch(
-		    mesh_groups, draw.instance_count, limits.maxMeshWorkGroupCount[0],
-		    limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount,
-		    [&](const MeshDispatchSlice& slice) {
-			    const uint32_t draw_data[] {
-			        draw.index_count,
-			        draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-			        emit.first_instance + slice.instance_offset,
-			        index_source.guest_element_size,
-			        static_cast<uint32_t>(index_source.address),
-			        static_cast<uint32_t>(index_source.address >> 32u),
-			        slice.group_offset};
-			    static_assert(std::size(draw_data) ==
-			                  ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-			    const auto offset = records.Copy(draw_data, sizeof(draw_data), 16);
-			    mesh_slices.emplace_back(slice, records.BufferDeviceAddress() + offset);
-		    });
+		const auto& mesh   = state.vertex_info[0].mesh;
+		// Dispatches drawing `index_count` indices from `index_address` as one draw.
+		const auto record_dispatches = [&](uint32_t index_count, uint64_t index_address) {
+			const auto primitives = mesh.InputPrimitiveCount(index_count);
+			if (primitives == 0) {
+				return;
+			}
+			ForEachMeshDispatch(
+			    (primitives - 1u) / mesh.primitives_per_group + 1u, draw.instance_count,
+			    limits.maxMeshWorkGroupCount[0], limits.maxMeshWorkGroupCount[1],
+			    limits.maxMeshWorkGroupTotalCount, [&](const MeshDispatchSlice& slice) {
+				    const uint32_t draw_data[] {
+				        index_count,
+				        draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+				        emit.first_instance + slice.instance_offset,
+				        index_source.guest_element_size,
+				        static_cast<uint32_t>(index_address),
+				        static_cast<uint32_t>(index_address >> 32u),
+				        slice.group_offset};
+				    static_assert(std::size(draw_data) ==
+				                  ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+				    const auto offset = records.Copy(draw_data, sizeof(draw_data), 16);
+				    mesh_slices.emplace_back(slice, records.BufferDeviceAddress() + offset);
+			    });
+		};
+		if (primitive_restart_enable && draw.IsIndexed() && MeshRestartSplitEnabled()) {
+			// The mesh shader assembles strips and fans from the draw's first index on (a fan's
+			// center is its vertex 0, a strip's winding follows its primitive number) and knows
+			// nothing of restart. So each run of indices between restart markers is drawn as a
+			// draw of its own, which restarts both, and the markers are never read as vertices.
+			uint32_t segments = 0;
+			ForEachRestartSegment(index_source.address, index_source.guest_element_size,
+			                      draw.index_count, [&](uint32_t first, uint32_t count) {
+				                      record_dispatches(count, index_source.address +
+				                                                   uint64_t {first} *
+				                                                       index_source.guest_element_size);
+				                      segments++;
+			                      });
+			static std::atomic_uint split_logs = 0;
+			if (split_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::printf("mesh restart: prim=%u indices=%u index_bytes=%u split into %u draws\n",
+				            static_cast<uint32_t>(ucfg.GetPrimType()), draw.index_count,
+				            index_source.guest_element_size, segments);
+			}
+		} else {
+			record_dispatches(draw.index_count, index_source.address);
+		}
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::Records);
 	if (draw_logged) [[unlikely]] {
