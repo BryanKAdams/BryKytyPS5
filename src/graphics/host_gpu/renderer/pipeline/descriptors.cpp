@@ -854,6 +854,12 @@ void RenderExecutor::ResolveTextureInto(const ShaderRecompiler::IR::ImageResourc
 	out.desc              = described.desc;
 	auto&       desc      = out.desc;
 	describe_probe.reset();
+	// Debug: KYTY_DEBUG_VOLUME_MIP0=1 views volume textures as their first level only, so every
+	// sample clamps to it: tells wrong lower levels (their layout) from wrong level 0.
+	static const bool volume_mip0 = std::getenv("KYTY_DEBUG_VOLUME_MIP0") != nullptr;
+	if (volume_mip0 && desc.info.IsVolume()) [[unlikely]] {
+		desc.view_info.level_count = 1;
+	}
 
 	const auto metadata_base_layer = desc.view_info.base_layer;
 	const auto remember            = [&](ImageId found, uint64_t generation) {

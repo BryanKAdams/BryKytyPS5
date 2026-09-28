@@ -41,7 +41,8 @@ inline RenderDebugCounters g_render_debug_counters;
 // fetched from the driver at most every 500 ms), specspin (the draw speculation thread spinning
 // for a restart before sleeping), speclead (draws within SpeculationLead of the GPU thread left to
 // it), specreads (a speculation's guest reads kept without making them again while its BDA epoch
-// lasts and nothing became GPU-written).
+// lasts and nothing became GPU-written), exactwrite (a buffer write over exactly one image's
+// range leaving the images it only partly overlaps as they were).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 // KYTY_DEBUG_FULL_BARRIERS=1: every draw and dispatch waits for all earlier GPU work and sees all
 // its memory writes (RecordFullBarrier). Slow; it tells synchronization bugs (a result that changes)
@@ -51,8 +52,11 @@ inline RenderDebugCounters g_render_debug_counters;
 // vertex shader and dispatches of a listed compute shader are left out, to find the draws behind a
 // visual defect. An entry <value>/<mask> skips every pixel and compute shader whose hash matches
 // value under mask (p: or c: before it limits that to one kind), to bisect an unknown shader.
+// Masks leave out only calls that pass bisect: draws of more than two triangles or with
+// GPU-written counts, so that the frame's full-screen passes stay.
 enum class DebugShaderKind { Pixel, Vertex, Compute };
-[[nodiscard]] bool DebugSkipShader(uint64_t shader_hash, DebugShaderKind kind) noexcept;
+[[nodiscard]] bool DebugSkipShader(uint64_t shader_hash, DebugShaderKind kind,
+                                   bool bisect = true) noexcept;
 void               RecordFullBarrier(vk::CommandBuffer command) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.

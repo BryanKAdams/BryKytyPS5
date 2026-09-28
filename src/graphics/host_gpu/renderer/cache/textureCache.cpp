@@ -2582,9 +2582,29 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, true)) {
+	const auto images = FindImagesInRegion(address, size, true);
+	// A shader writing exactly one image's range as a buffer (Sky Garden writes several tiled
+	// render-target surfaces so, each a few times a frame) changes that image and those inside
+	// the range. An image the range only partly overlaps is another surface using the memory at
+	// another time: on the console the bytes outside the range keep its contents, and the bytes
+	// inside are another surface's layout, which it does not read. Re-uploading it from the
+	// buffer instead lost the rest of its contents and cost a full-size detile per write.
+	// KYTY_DEBUG_AB=exactwrite marks every overlapped image again in every other window.
+	static const bool ab    = AbSelected("exactwrite");
+	bool              exact = false;
+	if (!(ab && AbFeatureOff())) {
+		for (const auto id: images) {
+			const auto& data = m_slot_images[id].info.data;
+			exact            = exact || (data.address == address && data.size == size);
+		}
+	}
+	for (const auto id: images) {
 		auto& image = m_slot_images[id];
 		if (!image.Overlaps(address, size)) {
+			continue;
+		}
+		if (exact && (image.info.data.address < address ||
+		              image.info.data.End() > address + size)) {
 			continue;
 		}
 		if (GpuZones::Enabled()) [[unlikely]] {

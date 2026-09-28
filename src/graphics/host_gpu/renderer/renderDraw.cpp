@@ -225,6 +225,41 @@ static void Account(uint64_t pixel, uint64_t vertex, uint64_t restarts, uint64_t
 
 } // namespace DrawLog
 
+// Debug: KYTY_DEBUG_DEPTH_OVERRIDE=<pixel shader hash>:<letters>[,...] turns tests off for the
+// draws with that pixel shader: d the depth test and write, s the stencil test, b the depth bounds
+// test. It tells a defect from rejected fragments (the test's inputs are wrong) from one in the
+// fragments themselves.
+enum : uint32_t { DepthOverrideDepth = 1, DepthOverrideStencil = 2, DepthOverrideBounds = 4 };
+
+static uint32_t DebugDepthOverride(uint64_t pixel_hash) {
+	static const std::vector<std::pair<uint64_t, uint32_t>> entries = [] {
+		std::vector<std::pair<uint64_t, uint32_t>> list;
+		for (const char* text = std::getenv("KYTY_DEBUG_DEPTH_OVERRIDE"); text != nullptr;) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(text, &end, 16);
+			if (end == text || *end != ':') {
+				break;
+			}
+			uint32_t tests = 0;
+			for (text = end + 1; *text != '\0' && *text != ','; text++) {
+				tests |= *text == 'd' ? DepthOverrideDepth
+				         : *text == 's' ? DepthOverrideStencil
+				         : *text == 'b' ? DepthOverrideBounds
+				                        : 0u;
+			}
+			list.emplace_back(hash, tests);
+			text = *text == ',' ? text + 1 : nullptr;
+		}
+		return list;
+	}();
+	for (const auto& [hash, tests]: entries) {
+		if (hash == pixel_hash) {
+			return tests;
+		}
+	}
+	return 0;
+}
+
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
 
 static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::PolyOffset& offset,
@@ -1221,7 +1256,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		return false;
 	}
 	if (DebugSkipShader(state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
-	                    DebugShaderKind::Pixel) ||
+	                    DebugShaderKind::Pixel, draw.index_count > 6 || draw.indirect_args != 0) ||
 	    DebugSkipShader(state.vertex_info[0].stage.program->shader_hash, DebugShaderKind::Vertex))
 	    [[unlikely]] {
 		return false;
@@ -1253,6 +1288,21 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	if (const auto tests = DebugDepthOverride(
+	        state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0);
+	    tests != 0) [[unlikely]] {
+		auto& depth = state.depth_info;
+		if ((tests & DepthOverrideDepth) != 0) {
+			depth.depth_test_enable  = false;
+			depth.depth_write_enable = false;
+		}
+		if ((tests & DepthOverrideStencil) != 0) {
+			depth.stencil_test_enable = false;
+		}
+		if ((tests & DepthOverrideBounds) != 0) {
+			depth.depth_bounds_test_enable = false;
+		}
+	}
 	g_draw_phases.Mark(DrawPhaseTimer::Targets);
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
