@@ -1569,7 +1569,11 @@ void CheckRectListShaders() {
 }
 
 void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
-  if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
+  // The cases' SPIR-V shapes are checked in the default run; with hardware
+  // bounds the range compares they may count on are gone, so only results are
+  // checked.
+  if ((test.required_spirv.empty() && test.forbidden_spirv.empty()) ||
+      g_hardware_buffer_bounds_requested) {
     return;
   }
 
