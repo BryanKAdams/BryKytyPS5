@@ -304,8 +304,38 @@ bool TextureCache::SafeToDownload(const Image& image) {
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
+// Debugging aid: KYTY_DEBUG_IMAGE_CHURN=1 prints every image the cache creates or frees, with the
+// path that did it (ChurnReason), to find images recreated in steady state.
+namespace {
+thread_local const char* t_churn_reason = "other";
+struct ChurnReason {
+	explicit ChurnReason(const char* reason): previous(t_churn_reason) { t_churn_reason = reason; }
+	~ChurnReason() { t_churn_reason = previous; }
+	ChurnReason(const ChurnReason&)            = delete;
+	ChurnReason& operator=(const ChurnReason&) = delete;
+	const char*  previous;
+};
+void LogImageChurn(const char* what, const Image& image) {
+	static const bool enabled = std::getenv("KYTY_DEBUG_IMAGE_CHURN") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	const auto& info = image.info;
+	std::printf("image-churn: %s %s 0x%016" PRIx64 " size=0x%" PRIx64
+	            " %ux%ux%u fmt=%u guest=%u type=%u tile=%u mips=%u layers=%u samples=%u"
+	            " usage=%s%s%s%s\n",
+	            what, t_churn_reason, info.data.address, info.data.size, info.extent.width,
+	            info.extent.height, info.extent.depth, static_cast<uint32_t>(info.pixel_format),
+	            static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.type),
+	            static_cast<uint32_t>(info.tile_mode), info.resources.levels, info.resources.layers,
+	            info.samples, image.usage.texture ? "T" : "", image.usage.render_target ? "R" : "",
+	            image.usage.depth_target ? "D" : "", image.usage.storage ? "S" : "");
+}
+} // namespace
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	LogImageChurn("new", m_slot_images[id]);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -398,6 +428,9 @@ void TextureCache::DeleteImage(ImageId id, std::vector<ImageId>* retired) {
 
 void TextureCache::FreeImage(ImageId id, std::vector<ImageId>* retired) {
 	auto* image = m_slot_images.try_get(id);
+	if (image != nullptr) {
+		LogImageChurn("free", *image);
+	}
 	while (image != nullptr && image->registered &&
 	       HasPendingDownload(image->info.data.address, image->info.data.size)) {
 		// Overlap replacement also retires images outside the collector. Preserve its
@@ -787,7 +820,8 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
-	auto& cached = m_slot_images[cached_id];
+	ChurnReason reason("depth-overlap");
+	auto&       cached = m_slot_images[cached_id];
 	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
 	    cached.info.tile_mode != requested.tile_mode) {
 		return {};
@@ -919,6 +953,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    (requested.resources == cached.info.resources &&
 		     requested.mip_layout != cached.info.mip_layout)) {
 			if (safe_to_delete) {
+				ChurnReason reason("overlap-layout");
 				FreeImage(cached_id);
 			}
 			return {merged_id};
@@ -981,16 +1016,19 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
+		ChurnReason reason("overlap-merge");
 		FreeImage(cached_id);
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
+		ChurnReason reason("overlap-replace");
 		FreeImage(cached_id);
 	}
 	return {merged_id};
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	ChurnReason reason("expand");
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      expanded    = m_slot_images[expanded_id];
@@ -1693,6 +1731,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 				if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 					result = {};
 				} else if (resolved.info.resources < desc.info.resources) {
+					ChurnReason reason("find-grow");
 					FreeImage(result);
 					result = {};
 				}
@@ -1725,6 +1764,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 				lookup();
 			}
 			if (!result) {
+				ChurnReason reason("find-miss");
 				result         = InsertImage(desc.info);
 				auto& inserted = m_slot_images[result];
 				if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
@@ -2539,6 +2579,7 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
+	ChurnReason reason("unmap");
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
@@ -2567,6 +2608,7 @@ void TextureCache::RunGarbageCollector() {
 }
 
 bool TextureCache::CollectGarbage(bool pressure_only) {
+	ChurnReason reason("gc");
 	std::unique_lock lock {m_lock};
 	const uint64_t   tick = pressure_only ? m_gc_tick : m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {

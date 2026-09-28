@@ -30,7 +30,7 @@ inline RenderDebugCounters g_render_debug_counters;
 // cpwrite (BDA epochs started by the GPU thread's own guest memory writes), streamhost (the stream
 // ring in cached host memory rather than device memory), colorclear (skipped color clear
 // rechecks), prioritywait (draw entry leaving operations queued rather than waiting for the
-// priority thread).
+// priority thread). 
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
@@ -43,6 +43,16 @@ struct AllocationCounters {
 	std::atomic<uint64_t> images_destroyed {0};
 };
 inline AllocationCounters g_allocation_counters;
+// How often a stage binds the same program and descriptors as its previous draw, for the
+// draw-phases line (see NoteBindingRepeat in descriptors.cpp).
+struct BindingRepeats {
+	std::atomic<uint64_t> stages {0};
+	std::atomic<uint64_t> same_program {0};
+	std::atomic<uint64_t> same_images {0};
+	std::atomic<uint64_t> same_buffers {0};
+	std::atomic<uint64_t> same_all {0};
+};
+inline BindingRepeats g_binding_repeats;
 
 // KYTY_DEBUG_DRAW_PHASES=<pixel shader hash> times the render thread's CPU phases of that pixel
 // shader's draws and prints their average every 5 s; =all times every draw. Each Mark charges the
@@ -123,6 +133,8 @@ struct DrawPhaseTimer {
 	}
 	// Accounts the draw if its pixel shader is the one timed.
 	void End(uint64_t pixel_hash);
+	// Whether a draw is being timed (between Begin and End).
+	[[nodiscard]] bool Active() const noexcept { return active; }
 
 private:
 	static uint64_t Now();

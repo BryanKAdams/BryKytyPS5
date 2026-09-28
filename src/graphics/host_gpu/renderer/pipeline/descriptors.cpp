@@ -40,6 +40,7 @@
 #include <optional>
 #include <span>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -943,12 +944,42 @@ static bool ReuseTexture(TextureCache& cache, const PreparedBindings::ImageSourc
 	return (depth_id ? depth_id : source.found) == binding.image_id;
 }
 
+// Debugging aid for the draw-phases line: counts stages whose program and descriptors repeat the
+// previous draw's.
+static void NoteBindingRepeat(PreparedBindings& prepared, const ShaderStageRuntime& runtime) {
+	const auto& snapshot = *runtime.resources;
+	const auto  hash     = [](const std::vector<ShaderRecompiler::IR::DescriptorValue>& values) {
+		return values.empty() ? uint64_t {0}
+		                      : XXH3_64bits(values.data(), values.size() * sizeof(values[0]));
+	};
+	const PreparedBindings::RepeatKey key {runtime.program, hash(snapshot.images),
+	                                      hash(snapshot.buffers), hash(snapshot.samplers)};
+	const auto&                       last    = prepared.repeat_key;
+	const bool                        program = last.program == key.program;
+	auto&                             stats   = g_binding_repeats;
+	stats.stages.fetch_add(1, std::memory_order_relaxed);
+	stats.same_program.fetch_add(program ? 1 : 0, std::memory_order_relaxed);
+	stats.same_images.fetch_add(program && last.images == key.images ? 1 : 0,
+	                           std::memory_order_relaxed);
+	stats.same_buffers.fetch_add(program && last.buffers == key.buffers ? 1 : 0,
+	                            std::memory_order_relaxed);
+	stats.same_all.fetch_add(program && last.images == key.images && last.buffers == key.buffers &&
+	                                last.samplers == key.samplers
+	                            ? 1
+	                            : 0,
+	                        std::memory_order_relaxed);
+	prepared.repeat_key = key;
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
+	if (g_draw_phases.Active()) [[unlikely]] {
+		NoteBindingRepeat(prepared, runtime);
+	}
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};

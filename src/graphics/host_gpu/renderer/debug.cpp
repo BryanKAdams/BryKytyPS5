@@ -804,6 +804,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	static uint64_t window_tsc   = Now();
 	static uint64_t window_gpu   = g_gpu_busy_ns.load(std::memory_order_relaxed);
 	static std::array<uint64_t, 4> window_allocations {};
+	static std::array<uint64_t, 5> window_repeats {};
 	uint64_t        sum          = 0;
 	for (const auto ticks: current) {
 		sum += ticks;
@@ -848,6 +849,19 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	for (uint32_t i = 0; i < Count; i++) {
 		line += fmt::format(" {}={:.2f}", Names[i], draws != 0 ? totals[i] * to_us / draws : 0.0);
 	}
+	const std::array<uint64_t, 5> repeats {
+	    g_binding_repeats.stages.load(std::memory_order_relaxed),
+	    g_binding_repeats.same_program.load(std::memory_order_relaxed),
+	    g_binding_repeats.same_images.load(std::memory_order_relaxed),
+	    g_binding_repeats.same_buffers.load(std::memory_order_relaxed),
+	    g_binding_repeats.same_all.load(std::memory_order_relaxed)};
+	const auto stages = static_cast<double>(std::max<uint64_t>(repeats[0] - window_repeats[0], 1));
+	line += fmt::format(" rep-prog%={:.0f} rep-img%={:.0f} rep-buf%={:.0f} rep-all%={:.0f}",
+	                    100.0 * static_cast<double>(repeats[1] - window_repeats[1]) / stages,
+	                    100.0 * static_cast<double>(repeats[2] - window_repeats[2]) / stages,
+	                    100.0 * static_cast<double>(repeats[3] - window_repeats[3]) / stages,
+	                    100.0 * static_cast<double>(repeats[4] - window_repeats[4]) / stages);
+	window_repeats = repeats;
 	line += fmt::format(" | buf+/s={:.0f} buf-/s={:.0f} img+/s={:.0f} img-/s={:.0f}",
 	                    static_cast<double>(allocations[0] - window_allocations[0]) / seconds,
 	                    static_cast<double>(allocations[1] - window_allocations[1]) / seconds,
