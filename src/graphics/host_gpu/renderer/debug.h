@@ -110,6 +110,8 @@ struct DrawPhaseTimer {
 		uint64_t        m_start;
 	};
 	static uint64_t Hash();
+	// The time stamp counter the phases are measured in.
+	static uint64_t Now();
 	void            Begin() {
 		if (Hash() != 0) [[unlikely]] {
 			active = true;
@@ -129,14 +131,22 @@ struct DrawPhaseTimer {
 	void End(uint64_t pixel_hash);
 
 private:
-	static uint64_t Now();
-
 	bool                             active = false;
 	uint64_t                         last   = 0;
 	std::array<uint64_t, Count>      current {};
 	std::array<uint64_t, ProbeCount> probes {};
 };
 inline thread_local DrawPhaseTimer g_draw_phases;
+
+// With KYTY_DEBUG_DRAW_PHASES: the render thread's time in each PM4 packet's handler, by opcode,
+// and in ProcessPm4 between handlers, printed as a "pm4-ops" line after each draw-phases line.
+// Draw handlers include their draw phases; the rest is the time no draw phase covers.
+struct Pm4OpTimer {
+	std::array<uint64_t, 256> ticks {};
+	std::array<uint64_t, 256> counts {};
+	uint64_t                  between = 0;
+};
+inline thread_local Pm4OpTimer g_pm4_ops;
 
 // KYTY_DEBUG_UPLOADS=1 (with KYTY_DEBUG_DRAW_PHASES): guest memory copied for the GPU, counted
 // per source and printed after each draw-phases line with the images and 4 MiB regions copied

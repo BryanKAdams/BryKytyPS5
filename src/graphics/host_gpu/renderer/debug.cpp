@@ -863,6 +863,27 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	if (UploadStatsEnabled()) {
 		PrintUploadStats(seconds);
 	}
+	{
+		// The PM4 handlers that took the most time, as opcode:packets/s:ms/s.
+		auto&                                          ops = g_pm4_ops;
+		std::array<std::pair<uint64_t, uint32_t>, 256> ranked {};
+		uint64_t                                       handled = 0;
+		for (uint32_t op = 0; op < 256; op++) {
+			ranked[op] = {ops.ticks[op], op};
+			handled += ops.ticks[op];
+		}
+		std::ranges::sort(ranked, std::greater {});
+		std::string pm4 = fmt::format("pm4-ops: handlers ms/s={:.1f} between ms/s={:.1f} |",
+		                              handled * to_us / 1000.0 / seconds,
+		                              ops.between * to_us / 1000.0 / seconds);
+		for (uint32_t i = 0; i < 12 && ranked[i].first != 0; i++) {
+			const auto op = ranked[i].second;
+			pm4 += fmt::format(" {:02x}:{:.0f}:{:.2f}", op, ops.counts[op] / seconds,
+			                   ops.ticks[op] * to_us / 1000.0 / seconds);
+		}
+		std::printf("%s\n", pm4.c_str());
+		ops = {};
+	}
 	if (AbEnabled()) {
 		g_ab_off.store(!AbFeatureOff(), std::memory_order_relaxed);
 	}
