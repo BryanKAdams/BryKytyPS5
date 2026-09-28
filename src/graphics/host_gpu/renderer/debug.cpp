@@ -803,6 +803,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	static auto     window_start = std::chrono::steady_clock::now();
 	static uint64_t window_tsc   = Now();
 	static uint64_t window_gpu   = g_gpu_busy_ns.load(std::memory_order_relaxed);
+	static std::array<uint64_t, 4> window_allocations {};
 	uint64_t        sum          = 0;
 	for (const auto ticks: current) {
 		sum += ticks;
@@ -828,6 +829,11 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	const double seconds = std::chrono::duration<double>(now - window_start).count();
 	const double to_us   = seconds * 1e6 / static_cast<double>(tsc - window_tsc);
 	const auto   gpu_ns  = g_gpu_busy_ns.load(std::memory_order_relaxed);
+	const std::array<uint64_t, 4> allocations {
+	    g_allocation_counters.buffers_created.load(std::memory_order_relaxed),
+	    g_allocation_counters.buffers_destroyed.load(std::memory_order_relaxed),
+	    g_allocation_counters.images_created.load(std::memory_order_relaxed),
+	    g_allocation_counters.images_destroyed.load(std::memory_order_relaxed)};
 	uint64_t     all     = 0;
 	for (const auto ticks: totals) {
 		all += ticks;
@@ -842,6 +848,11 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	for (uint32_t i = 0; i < Count; i++) {
 		line += fmt::format(" {}={:.2f}", Names[i], draws != 0 ? totals[i] * to_us / draws : 0.0);
 	}
+	line += fmt::format(" | buf+/s={:.0f} buf-/s={:.0f} img+/s={:.0f} img-/s={:.0f}",
+	                    static_cast<double>(allocations[0] - window_allocations[0]) / seconds,
+	                    static_cast<double>(allocations[1] - window_allocations[1]) / seconds,
+	                    static_cast<double>(allocations[2] - window_allocations[2]) / seconds,
+	                    static_cast<double>(allocations[3] - window_allocations[3]) / seconds);
 	line += " | probes:";
 	for (uint32_t i = 0; i < ProbeCount; i++) {
 		line += fmt::format(" {}={:.2f}", ProbeNames[i],
@@ -862,6 +873,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	window_start = now;
 	window_tsc   = tsc;
 	window_gpu   = gpu_ns;
+	window_allocations = allocations;
 }
 
 void LogDrawPhase(const char* draw_name, const char* phase) {

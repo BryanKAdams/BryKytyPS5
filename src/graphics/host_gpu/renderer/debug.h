@@ -28,11 +28,20 @@ inline RenderDebugCounters g_render_debug_counters;
 // (lock-free cached guest backing reads), bdaepoch (one BDA synchronization per epoch), scratch
 // (pooled tiler scratch buffers), cleanpages (remembered clean pages for GPU-write queries),
 // cpwrite (BDA epochs started by the GPU thread's own guest memory writes), streamhost (the stream
-// ring in cached host memory rather than device memory).
+// ring in cached host memory rather than device memory), colorclear (skipped color clear
+// rechecks).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
 inline std::atomic<uint64_t> g_gpu_busy_ns {0};
+// GPU buffers and images created and destroyed, for the draw-phases line's allocation churn.
+struct AllocationCounters {
+	std::atomic<uint64_t> buffers_created {0};
+	std::atomic<uint64_t> buffers_destroyed {0};
+	std::atomic<uint64_t> images_created {0};
+	std::atomic<uint64_t> images_destroyed {0};
+};
+inline AllocationCounters g_allocation_counters;
 
 // KYTY_DEBUG_DRAW_PHASES=<pixel shader hash> times the render thread's CPU phases of that pixel
 // shader's draws and prints their average every 5 s; =all times every draw. Each Mark charges the
