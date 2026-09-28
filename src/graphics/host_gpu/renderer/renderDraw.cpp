@@ -1443,12 +1443,18 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 		const auto& program    = *stage->runtime->program;
 		const auto  stage_type = static_cast<uint32_t>(program.stage);
 		// Storage buffers over the address: a written one makes the texture cache drop the GPU
-		// contents of every image there (InvalidateMemoryFromGPU).
+		// contents of every image there (InvalidateMemoryFromGPU). The chosen shaders' other
+		// buffers (mostly constant ranges, one line each) only with KYTY_DEBUG_IMAGE_USERS_BUFFERS=1.
+		static const bool every_buffer = [] {
+			const char* text = std::getenv("KYTY_DEBUG_IMAGE_USERS_BUFFERS");
+			return text != nullptr && std::strcmp(text, "0") != 0;
+		}();
 		const auto buffer_count = std::min(program.info.buffers.size(), stage->buffer_sources.size());
 		for (uint32_t i = 0; i < buffer_count; i++) {
 			const auto& source = stage->buffer_sources[i];
 			if (source.size != 0 &&
-			    (every || (address >= source.address && address < source.address + source.size))) {
+			    ((every && every_buffer) ||
+			     (address >= source.address && address < source.address + source.size))) {
 				const auto& resource = program.info.buffers[i];
 				counts[fmt::format("ps={:016x} vs={:016x} buffer stage={} slot={} range=0x{:x}+0x{:x}"
 				                   " written={} stored={} atomic={}",
