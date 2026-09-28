@@ -983,7 +983,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	static auto     window_start = std::chrono::steady_clock::now();
 	static uint64_t window_tsc   = Now();
 	static uint64_t window_gpu   = g_gpu_busy_ns.load(std::memory_order_relaxed);
-	static std::array<uint64_t, 7> window_allocations {};
+	static std::array<uint64_t, 8> window_allocations {};
 	static std::array<uint64_t, 5> window_repeats {};
 	uint64_t        sum          = 0;
 	for (const auto ticks: current) {
@@ -1019,14 +1019,15 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	const double seconds = std::chrono::duration<double>(now - window_start).count();
 	const double to_us   = seconds * 1e6 / static_cast<double>(tsc - window_tsc);
 	const auto   gpu_ns  = g_gpu_busy_ns.load(std::memory_order_relaxed);
-	const std::array<uint64_t, 7> allocations {
+	const std::array<uint64_t, 8> allocations {
 	    g_allocation_counters.buffers_created.load(std::memory_order_relaxed),
 	    g_allocation_counters.buffers_destroyed.load(std::memory_order_relaxed),
 	    g_allocation_counters.images_created.load(std::memory_order_relaxed),
 	    g_allocation_counters.images_destroyed.load(std::memory_order_relaxed),
 	    g_allocation_counters.game_buffers_created.load(std::memory_order_relaxed),
 	    g_allocation_counters.game_buffers_joined.load(std::memory_order_relaxed),
-	    g_allocation_counters.game_buffers_collected.load(std::memory_order_relaxed)};
+	    g_allocation_counters.game_buffers_collected.load(std::memory_order_relaxed),
+	    g_allocation_counters.buffer_create_ns.load(std::memory_order_relaxed)};
 	uint64_t     all     = 0;
 	for (const auto ticks: totals) {
 		all += ticks;
@@ -1058,9 +1059,9 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 		return static_cast<double>(allocations[i] - window_allocations[i]) / seconds;
 	};
 	line += fmt::format(" | buf+/s={:.0f} buf-/s={:.0f} img+/s={:.0f} img-/s={:.0f} game-buf+/s={:.0f}"
-	                    " game-buf-join/s={:.0f} game-buf-gc/s={:.0f}",
+	                    " game-buf-join/s={:.0f} game-buf-gc/s={:.0f} buf-create-ms/s={:.2f}",
 	                    per_second(0), per_second(1), per_second(2), per_second(3), per_second(4),
-	                    per_second(5), per_second(6));
+	                    per_second(5), per_second(6), per_second(7) / 1e6);
 	line += " | probes:";
 	for (uint32_t i = 0; i < ProbeCount; i++) {
 		line += fmt::format(" {}={:.2f}", ProbeNames[i],

@@ -45,7 +45,10 @@ inline RenderDebugCounters g_render_debug_counters;
 // range leaving the images it only partly overlaps as they were), viewmemo (a resolved texture
 // binding starting from the view its description's last binding acquired), imagegroups (a stage
 // repeating its program and image descriptors keeping its last images and views), nullreuse (a
-// null texture binding keeping its image and view while its descriptor repeats).
+// null texture binding keeping its image and view while its descriptor repeats), imagebuf (a
+// repeatedly re-uploaded CPU-written image range held in a buffer, copying only written pages),
+// suballoc (game buffers up to 64 MiB sharing VMA's memory blocks rather than taking dedicated
+// memory).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 // KYTY_DEBUG_FULL_BARRIERS=1: every draw and dispatch waits for all earlier GPU work and sees all
 // its memory writes (RecordFullBarrier). Slow; it tells synchronization bugs (a result that changes)
@@ -73,6 +76,7 @@ struct AllocationCounters {
 	std::atomic<uint64_t> game_buffers_collected {0}; // Deleted by garbage collection.
 	std::atomic<uint64_t> images_created {0};
 	std::atomic<uint64_t> images_destroyed {0};
+	std::atomic<uint64_t> buffer_create_ns {0}; // Time in vmaCreateBuffer.
 };
 inline AllocationCounters g_allocation_counters;
 // How often a stage binds the same program and descriptors as its previous draw, for the

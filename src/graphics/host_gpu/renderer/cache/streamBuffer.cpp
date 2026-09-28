@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
 
+#include <chrono>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -70,9 +71,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
 
+	// Game buffers (the ones with device addresses) took dedicated memory, a kernel allocation
+	// each: ~0.3 ms per buffer, and Sky Garden creates ~35 a second. Up to SharedMax they share
+	// VMA's blocks instead; the BDA page table holds each page's own address, so any placement
+	// works. KYTY_DEBUG_AB=suballoc allocates them all dedicated in alternate windows.
+	static constexpr uint64_t SharedMax = 64ull * 1024 * 1024;
+	static const bool         ab        = AbSelected("suballoc");
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && (size > SharedMax || (ab && AbFeatureOff()))
+	        ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+	        : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	// `host_cached`: cached host memory, where CPU writes stay in the CPU's caches and the GPU reads
 	// them over the bus, instead of write-combined device memory.
@@ -88,9 +97,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
+	const auto        create_start  = std::chrono::steady_clock::now();
 	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
 	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
 	    &native_buffer, &m_allocation, &allocation_result));
+	g_allocation_counters.buffer_create_ns.fetch_add(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                              std::chrono::steady_clock::now() - create_start)
+	                              .count()),
+	    std::memory_order_relaxed);
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
