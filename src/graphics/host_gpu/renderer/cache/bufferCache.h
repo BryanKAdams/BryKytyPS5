@@ -77,6 +77,9 @@ public:
 	[[nodiscard]] bool IsPageGpuDirtyHint(uint64_t vaddr) const noexcept {
 		return m_memory_tracker.IsPageGpuDirtyHint(vaddr);
 	}
+	// Changes whenever bytes become GPU-dirty or a download starts, which is also the only way a
+	// GPU-dirty range can become clean again (see m_clean_pages). GPU thread only.
+	[[nodiscard]] uint64_t GpuDirtyGeneration() const noexcept { return m_gpu_dirty_generation; }
 	// Eager readback of hot pages: memory that CPU reads have faulted on. A write recorded to a
 	// hot page is downloaded at the next flush point, so its bytes are usually published before
 	// the CPU reads them again. OnCommandRecorded() marks writes of the bindings obtained so far
