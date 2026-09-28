@@ -114,6 +114,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	DrainStats::ReasonScope reason(DrainStats::Reason::KernelInvalidate);
+	RecordUpload(UploadSource::Kernel, vaddr, size);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	AdvanceBdaEpoch();

@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -781,6 +783,17 @@ struct ImageUploadEntry {
 	uint32_t tile_mode       = 0;
 	uint64_t count           = 0;
 	uint64_t buffer_modified = 0;
+	// Staged uploads compared with the image's previous staged upload (RecordImageChunks): bytes
+	// compared, bytes in changed chunks, and runs of consecutive changed chunks.
+	uint64_t compared        = 0;
+	uint64_t changed         = 0;
+	uint64_t changed_runs    = 0;
+};
+
+// The previous staged upload of an image address: its size and a hash per chunk.
+struct ImageChunkHashes {
+	uint64_t              size = 0;
+	std::vector<uint64_t> hashes;
 };
 
 struct UploadStats {
@@ -792,6 +805,10 @@ struct UploadStats {
 	std::unordered_map<uint64_t, ImageUploadEntry> images;
 	// Write faults per 4 KiB page.
 	std::unordered_map<uint64_t, uint64_t>         fault_pages;
+	// Kept across windows.
+	std::unordered_map<uint64_t, ImageChunkHashes> chunk_hashes;
+	uint64_t                                       compared = 0;
+	uint64_t                                       changed  = 0;
 };
 
 UploadStats& GetUploadStats() {
@@ -801,7 +818,7 @@ UploadStats& GetUploadStats() {
 
 void PrintUploadStats(double seconds) {
 	static constexpr std::array<const char*, size_t(UploadSource::Count)> Names {
-	    "buffer", "bda", "stream", "image", "fault", "bda-pass", "bda-sync"};
+	    "buffer", "bda", "stream", "image", "fault", "bda-pass", "bda-sync", "kernel"};
 	auto&            stats = GetUploadStats();
 	std::scoped_lock lock {stats.mutex};
 	std::string      line = "uploads:";
@@ -833,6 +850,8 @@ void PrintUploadStats(double seconds) {
 	                    "x256-511={} x512+={})",
 	                    stats.fault_pages.size(), buckets[0], buckets[1], buckets[2], buckets[3],
 	                    buckets[4], buckets[5], buckets[6]);
+	line += fmt::format(" | staged changed={:.0f}KiB/s of compared={:.0f}KiB/s",
+	                    stats.changed / 1024.0 / seconds, stats.compared / 1024.0 / seconds);
 	std::printf("%s\n", line.c_str());
 	std::vector<std::pair<uint64_t, ImageUploadEntry>> images(stats.images.begin(),
 	                                                          stats.images.end());
@@ -842,11 +861,18 @@ void PrintUploadStats(double seconds) {
 	for (size_t i = 0; i < std::min<size_t>(images.size(), 10); i++) {
 		const auto& [address, image] = images[i];
 		std::printf("uploads: image 0x%" PRIx64 " size=0x%" PRIx64 " %ux%u fmt=%u tile=%u "
-		            "uploads/s=%.1f KiB/s=%.0f buffer-modified=%" PRIu64 "\n",
+		            "uploads/s=%.1f KiB/s=%.0f buffer-modified=%" PRIu64 " changed=%.1f%%"
+		            " runs/upload=%.1f\n",
 		            address, image.size, image.width, image.height, image.guest_format,
 		            image.tile_mode, image.count / seconds,
-		            image.count * image.size / 1024.0 / seconds, image.buffer_modified);
+		            image.count * image.size / 1024.0 / seconds, image.buffer_modified,
+		            image.compared != 0 ? 100.0 * image.changed / image.compared : 0.0,
+		            image.compared != 0 ? static_cast<double>(image.changed_runs) * image.size /
+		                                      image.compared
+		                                : 0.0);
 	}
+	stats.compared = 0;
+	stats.changed  = 0;
 	stats.calls.fill(0);
 	stats.bytes.fill(0);
 	stats.regions.clear();
@@ -894,6 +920,45 @@ void RecordImageUpload(uint64_t address, uint64_t size, uint32_t width, uint32_t
 	entry.tile_mode        = tile_mode;
 	entry.count++;
 	entry.buffer_modified += buffer_modified ? 1 : 0;
+}
+
+void RecordImageChunks(uint64_t address, uint64_t size) noexcept {
+	if (!UploadStatsEnabled() || size == 0) {
+		return;
+	}
+	static constexpr uint64_t                ChunkSize = 64 * 1024;
+	static thread_local std::vector<uint8_t> bytes;
+	bytes.resize(size);
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, bytes.data(), size)) {
+		return;
+	}
+	const auto            chunks = (size + ChunkSize - 1) / ChunkSize;
+	std::vector<uint64_t> hashes(chunks);
+	for (uint64_t i = 0; i < chunks; i++) {
+		const auto begin = i * ChunkSize;
+		hashes[i]        = XXH3_64bits(bytes.data() + begin, std::min(ChunkSize, size - begin));
+	}
+	auto&            stats = GetUploadStats();
+	std::scoped_lock lock {stats.mutex};
+	auto&            previous = stats.chunk_hashes[address];
+	if (previous.size == size) {
+		uint64_t changed = 0;
+		uint64_t runs    = 0;
+		for (uint64_t i = 0; i < chunks; i++) {
+			if (hashes[i] != previous.hashes[i]) {
+				changed += std::min(ChunkSize, size - i * ChunkSize);
+				runs += (i == 0 || hashes[i - 1] == previous.hashes[i - 1]) ? 1 : 0;
+			}
+		}
+		auto& entry = stats.images[address];
+		entry.compared += size;
+		entry.changed += changed;
+		entry.changed_runs += runs;
+		stats.compared += size;
+		stats.changed += changed;
+	}
+	previous.size   = size;
+	previous.hashes = std::move(hashes);
 }
 
 void DrawPhaseTimer::End(uint64_t pixel_hash) {

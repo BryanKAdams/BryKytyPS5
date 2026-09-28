@@ -223,6 +223,7 @@ enum class UploadSource : uint8_t {
 	Fault,  // Not a copy: guest write faults on tracked pages, counted as one page each.
 	BdaPass, // Not a copy: PrepareBda calls.
 	BdaSync, // Not a copy: PrepareBda calls that synchronized (the first of their epoch).
+	Kernel,  // Not a copy: kernel invalidations (file and AMPR reads into guest memory).
 	Count
 };
 inline thread_local UploadSource t_upload_source = UploadSource::Buffer;
@@ -230,6 +231,9 @@ inline thread_local UploadSource t_upload_source = UploadSource::Buffer;
 void               RecordUpload(UploadSource source, uint64_t address, uint64_t bytes) noexcept;
 void RecordImageUpload(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
                        uint32_t guest_format, uint32_t tile_mode, bool buffer_modified) noexcept;
+// KYTY_DEBUG_UPLOADS: compares a staged image upload with the previous one at the same address
+// in 64 KiB chunks, to report how much of each re-upload changed.
+void RecordImageChunks(uint64_t address, uint64_t size) noexcept;
 class UploadSourceScope {
 public:
 	explicit UploadSourceScope(UploadSource source) noexcept: m_previous(t_upload_source) {

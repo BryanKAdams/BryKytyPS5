@@ -815,6 +815,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 	m_staging_buffer.Commit();
 	RecordUpload(UploadSource::Image, vaddr, size);
+	RecordImageChunks(vaddr, size);
 	return {&m_staging_buffer, stage_offset};
 }
 
