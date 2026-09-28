@@ -23067,6 +23067,32 @@ TestCase VectorSinCosMaxFiniteSpecialCases() {
            O::S_ENDPGM}};
 }
 
+// Every finite value of magnitude 2^23 or more is a whole number: no cycle fraction.
+TestCase VectorSinCosLargeFiniteSpecialCases() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x4b000001u);
+  AppendVMovLiteral(&code, 1, 0xcb000001u);
+  AppendVMovLiteral(&code, 2, 0x7f7fffffu);
+  for (u32 i = 0; i < 3; i++) {
+    code.push_back(EncodeVop1(0x35, 10 + i, Vgpr(i)));
+    code.push_back(EncodeVop1(0x36, 13 + i, Vgpr(i)));
+  }
+  for (u32 i = 0; i < 6; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"VectorSinCosLargeFiniteSpecialCases",
+          code,
+          {},
+          {0x00000000u, 0x00000000u, 0x00000000u, 0x3f800000u, 0x3f800000u,
+           0x3f800000u},
+          {O::V_MOV_B32, O::V_SIN_F32, O::V_COS_F32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
 TestCase VectorCompareOps() {
   using O = ShaderOpcode;
 
@@ -30495,6 +30521,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorF64CapturedScreenSpaceShadows);
   AddCase(VectorF64ModesModifiersAndExec);
   AddCase(VectorSinCosMaxFiniteSpecialCases);
+  AddCase(VectorSinCosLargeFiniteSpecialCases);
   AddCase(VectorCompareOps);
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareEqU64OnGpu);
