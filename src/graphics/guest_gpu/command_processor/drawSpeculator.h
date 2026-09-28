@@ -62,6 +62,8 @@ private:
 	struct Snapshot;
 	static constexpr uint32_t RingSize = 32;
 	static constexpr uint64_t NotStopped = UINT64_MAX;
+	// Draws within this many of the GPU thread's next draw are not speculated (see Walk).
+	static constexpr uint64_t SpeculationLead = 2;
 
 	void Run();
 	// Walks from the current snapshot until it stops, speculating the draws it meets.
@@ -89,6 +91,8 @@ private:
 	std::unique_ptr<Snapshot>  m_snapshot; // Pending restart, under m_mutex.
 	std::unique_ptr<Snapshot>  m_spare;    // The worker's; swapped with m_snapshot to take it.
 	bool                       m_restart = false;
+	// Set with m_restart, read without the lock: the worker spins on it before sleeping.
+	std::atomic<bool>          m_restart_pending {false};
 	bool                       m_quit    = false;
 	std::atomic<bool>          m_waiting {false};
 	// While the worker waits: the GPU thread's draw count that wakes it (a waking per draw would

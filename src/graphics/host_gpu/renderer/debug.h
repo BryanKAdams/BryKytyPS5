@@ -38,7 +38,9 @@ inline RenderDebugCounters g_render_debug_counters;
 // metamemo (the last depth surface clear-state answer kept without the texture cache lock),
 // storagereuse (a clean storage image keeping its view between draws), rangememo (range
 // generations kept while the whole image set is unchanged), budgetcache (VMA's memory budget
-// fetched from the driver at most every 500 ms).
+// fetched from the driver at most every 500 ms), specspin (the draw speculation thread spinning
+// for a restart before sleeping), speclead (draws within SpeculationLead of the GPU thread left to
+// it).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 // KYTY_DEBUG_FULL_BARRIERS=1: every draw and dispatch waits for all earlier GPU work and sees all
 // its memory writes (RecordFullBarrier). Slow; it tells synchronization bugs (a result that changes)
