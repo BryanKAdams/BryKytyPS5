@@ -77,6 +77,10 @@ public:
 	// The same for FindRenderTarget: the target is also GPU-owned already, so marking it written
 	// changes nothing.
 	[[nodiscard]] bool IsRenderTargetCurrent(ImageId id, uint64_t generation) const noexcept;
+	// The same for FindTexture with a storage binding: the image is also GPU-owned already, so
+	// marking it written and committing the write change nothing, and it is not enrolled for
+	// downloads.
+	[[nodiscard]] bool IsStorageCurrent(ImageId id, uint64_t generation) const noexcept;
 	// The same for FindDepthTarget with a depth-only request: the target is also GPU-owned and a
 	// depth target already, with the request's metadata, and no surface metadata entry was added
 	// or removed since meta_generation (SurfaceMetaGeneration before that acquisition), so the

@@ -1930,6 +1930,17 @@ bool TextureCache::IsRenderTargetCurrent(ImageId id, uint64_t generation) const 
 	       !(m_readback_linear_images && !image.info.IsTiled());
 }
 
+bool TextureCache::IsStorageCurrent(ImageId id, uint64_t generation) const noexcept {
+	if (!IsTextureCurrent(id, generation)) {
+		return false;
+	}
+	// FindTexture's MarkGpuModified and CommitGpuWrite would change nothing, and TrackImageDownload
+	// enrolls nothing (linear readback images re-enroll every acquisition).
+	const auto& image = m_slot_images[id];
+	return image.IsGpuModified() && image.backing.image != nullptr &&
+	       !(m_readback_linear_images && !image.info.IsTiled());
+}
+
 bool TextureCache::IsDepthTargetCurrent(ImageId id, uint64_t generation, uint64_t meta_generation,
                                         const ImageDesc& desc) const noexcept {
 	// A stencil request associates the stencil image, which IsTextureCurrent does not cover.
