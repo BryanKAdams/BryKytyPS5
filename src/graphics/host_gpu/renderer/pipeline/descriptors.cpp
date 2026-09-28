@@ -817,9 +817,21 @@ bool TextureReuseEnabled() {
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
                                               PreparedBindings::ImageSource*               source) {
+	TextureBinding binding;
+	ResolveTextureInto(resource, value, source, binding);
+	return binding;
+}
+
+void RenderExecutor::ResolveTextureInto(const ShaderRecompiler::IR::ImageResource&   resource,
+                                        const ShaderRecompiler::IR::DescriptorValue& value,
+                                        PreparedBindings::ImageSource*               source,
+                                        TextureBinding&                              out) {
 	if (source != nullptr) {
 		source->generation = 0;
 	}
+	out.image_view = nullptr;
+	out.layout     = vk::ImageLayout::eUndefined;
+	out.mip_views.clear();
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
@@ -828,10 +840,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		out.desc     = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                 : TextureCache::BindingType::Texture);
+		out.image_id = texture_cache.FindImage(out.desc);
+		return;
 	}
 
 	thread_local TextureDescriptionCache descriptions;
@@ -839,7 +851,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	describe_probe.emplace(g_draw_phases, DrawPhaseTimer::TextureDescribe);
 	auto&       entry     = descriptions.Get(resource, value, descriptor);
 	const auto& described = entry.description;
-	auto        desc      = described.desc;
+	out.desc              = described.desc;
+	auto&       desc      = out.desc;
 	describe_probe.reset();
 
 	const auto metadata_base_layer = desc.view_info.base_layer;
@@ -860,7 +873,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		const auto depth_id = texture_cache.GetImage(entry.found).depth_id;
 		if ((depth_id ? depth_id : entry.found) == entry.bound) {
 			remember(entry.found, entry.generation);
-			return {entry.bound, nullptr, std::move(desc)};
+			out.image_id = entry.bound;
+			return;
 		}
 	}
 	entry.generation = 0;
@@ -896,7 +910,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		entry.found      = found;
 		entry.bound      = id;
 	}
-	return {id, nullptr, std::move(desc)};
+	out.image_id = id;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -1043,12 +1057,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			          previous.desc.type == TextureCache::BindingType::Storage);
 			continue;
 		}
-		auto binding =
-		    ResolveTexture(program.info.images[i], snapshot.images[i], &prepared.image_sources[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
+		ResolveTextureInto(program.info.images[i], snapshot.images[i], &prepared.image_sources[i],
+		                   previous);
+		BindImage(previous.image_id, previous.desc.type == TextureCache::BindingType::Storage);
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::StageTextures);
 	prepared.samplers.reserve(program.info.samplers.size());
@@ -1184,8 +1195,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i],
-			                           &prepared.image_sources[i]);
+			ResolveTextureInto(program.info.images[i], snapshot.images[i],
+			                   &prepared.image_sources[i], images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}

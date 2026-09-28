@@ -241,6 +241,11 @@ private:
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value,
 	                                            PreparedBindings::ImageSource* source = nullptr);
+	// ResolveTexture into `out`, keeping its mip view storage: bindings resolve into the draw's own
+	// slots without copying the image description around.
+	void ResolveTextureInto(const ShaderRecompiler::IR::ImageResource&   resource,
+	                        const ShaderRecompiler::IR::DescriptorValue& value,
+	                        PreparedBindings::ImageSource* source, TextureBinding& out);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
