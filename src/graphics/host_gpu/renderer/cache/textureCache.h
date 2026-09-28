@@ -68,6 +68,16 @@ public:
 	// The same for FindRenderTarget: the target is also GPU-owned already, so marking it written
 	// changes nothing.
 	[[nodiscard]] bool IsRenderTargetCurrent(ImageId id, uint64_t generation) const noexcept;
+	// The same for FindDepthTarget with a depth-only request: the target is also GPU-owned and a
+	// depth target already, with the request's metadata, and no surface metadata entry was added
+	// or removed since meta_generation (SurfaceMetaGeneration before that acquisition), so the
+	// entry it made is still there.
+	[[nodiscard]] bool     IsDepthTargetCurrent(ImageId id, uint64_t generation,
+	                                            uint64_t meta_generation,
+	                                            const ImageDesc& desc) const noexcept;
+	[[nodiscard]] uint64_t SurfaceMetaGeneration() const noexcept {
+		return m_surface_meta_generation.load(std::memory_order_acquire);
+	}
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -234,7 +244,8 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	// Bumped when m_surface_metas gains an entry (see ColorClearUnchanged).
+	// Bumped when m_surface_metas gains or loses an entry (see ColorClearUnchanged and
+	// IsDepthTargetCurrent).
 	std::atomic<uint64_t>                             m_surface_meta_generation {0};
 	RangeSet                                          m_dcc_metadata_seen;
 	struct DccCheckedSlice {
