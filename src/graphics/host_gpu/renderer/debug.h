@@ -42,7 +42,10 @@ inline RenderDebugCounters g_render_debug_counters;
 // for a restart before sleeping), speclead (draws within SpeculationLead of the GPU thread left to
 // it), specreads (a speculation's guest reads kept without making them again while its BDA epoch
 // lasts and nothing became GPU-written), exactwrite (a buffer write over exactly one image's
-// range leaving the images it only partly overlaps as they were).
+// range leaving the images it only partly overlaps as they were), viewmemo (a resolved texture
+// binding starting from the view its description's last binding acquired), imagegroups (a stage
+// repeating its program and image descriptors keeping its last images and views), nullreuse (a
+// null texture binding keeping its image and view while its descriptor repeats).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 // KYTY_DEBUG_FULL_BARRIERS=1: every draw and dispatch waits for all earlier GPU work and sees all
 // its memory writes (RecordFullBarrier). Slow; it tells synchronization bugs (a result that changes)

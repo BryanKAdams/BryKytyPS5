@@ -1330,10 +1330,16 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
+TextureCache::TargetState TextureCache::CurrentTargetState() const noexcept {
+	return {m_image_set_generation.load(std::memory_order_acquire), m_scheduler.CurrentTick(),
+	        m_gc_tick};
+}
+
 // Whether MaterializeColorClearNow would change nothing, as it did last time for this image: the
 // same surface and view, no clear flag registered since (its erase would find none), and for a
 // GPU-written check, no GPU-dirty change and no GPU write into checked slices since (the same
-// slices stay checked, with the same keys).
+// slices stay checked, with the same keys); for a check of metadata the GPU had not written, no
+// GPU-dirty change since and the same first key in each slice.
 bool TextureCache::ColorClearUnchanged(const Image& image, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) const {
 	const auto& check = image.color_clear_check;
@@ -1348,7 +1354,29 @@ bool TextureCache::ColorClearUnchanged(const Image& image, const ImageDesc& desc
 	       (!check.gpu_checked ||
 	        (check.gpu_dirty_generation == m_buffer_cache.GpuDirtyGeneration() &&
 	         check.dcc_checked_generation ==
-	             m_dcc_checked_generation.load(std::memory_order_acquire)));
+	             m_dcc_checked_generation.load(std::memory_order_acquire))) &&
+	       (!check.cpu_checked ||
+	        (check.gpu_dirty_generation == m_buffer_cache.GpuDirtyGeneration() &&
+	         ColorClearKeysUnchanged(check.keys)));
+}
+
+bool TextureCache::IsColorClearCurrent(ImageId id, const ImageDesc& desc,
+                                       uint32_t metadata_base_layer) const {
+	return (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
+	        desc.info.metadata.kind != ImageMetadataKind::Cmask) ||
+	       ColorClearUnchanged(m_slot_images[id], desc, metadata_base_layer);
+}
+
+// Whether each slice's first metadata key still reads as it did (see ColorClearCheck::cpu_checked).
+bool TextureCache::ColorClearKeysUnchanged(const Image::ColorClearCheck::Keys& keys) {
+	for (uint32_t i = 0; i < keys.count; i++) {
+		uint8_t code = 0;
+		if (!LibKernel::Memory::TryReadBacking(keys.addresses[i], &code, sizeof(code)) ||
+		    code != keys.codes[i]) {
+			return false;
+		}
+	}
+	return true;
 }
 
 // Most lookups bind a color surface whose metadata was already checked, with nothing to apply:
@@ -1368,8 +1396,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (skip && !verify) {
 		return;
 	}
-	bool       changed = false;
-	const auto outcome = MaterializeColorClearNow(id, desc, metadata_base_layer, changed);
+	bool                         changed = false;
+	Image::ColorClearCheck::Keys keys;
+	const auto outcome = MaterializeColorClearNow(id, desc, metadata_base_layer, changed, keys);
 	if (skip) {
 		static std::atomic<uint64_t> checked {0};
 		static std::atomic<uint64_t> missed {0};
@@ -1403,6 +1432,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	check.binding_type            = static_cast<uint8_t>(desc.type);
 	check.valid                   = true;
 	check.gpu_checked             = outcome == ColorClearOutcome::GpuChecked;
+	check.cpu_checked             = outcome == ColorClearOutcome::CpuChecked;
+	check.keys                    = keys;
 	check.surface_meta_generation = m_surface_meta_generation.load(std::memory_order_relaxed);
 	check.gpu_dirty_generation    = m_buffer_cache.GpuDirtyGeneration();
 	check.dcc_checked_generation  = m_dcc_checked_generation.load(std::memory_order_acquire);
@@ -1410,7 +1441,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 
 TextureCache::ColorClearOutcome
 TextureCache::MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
-                                       uint32_t metadata_base_layer, bool& changed) {
+                                       uint32_t metadata_base_layer, bool& changed,
+                                       Image::ColorClearCheck::Keys& keys) {
+	keys.count = 0;
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
@@ -1470,16 +1503,26 @@ TextureCache::MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
 			}
 		}
 	} check_record {gpu_written, cleared_slices};
+	// Metadata the GPU has not written, whose first keys are no clear, gets the same result while
+	// those keys stay (see ColorClearCheck::cpu_checked).
+	bool settled = !gpu_written && count <= keys.addresses.size();
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
+		if (settled) {
+			keys.addresses[keys.count] = address;
+			keys.codes[keys.count]     = code;
+			keys.count++;
+		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
+		// The slice's other keys decide, and they can change without this one.
+		settled = false;
 		std::vector<uint8_t> bytes(slice_size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 			EXIT("TextureCache: failed to read color metadata slice\n");
@@ -1500,6 +1543,10 @@ TextureCache::MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
 			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
 		}
 	}
+	if (settled && cleared_slices == 0) {
+		return ColorClearOutcome::CpuChecked;
+	}
+	keys.count = 0;
 	return ColorClearOutcome::Other;
 }
 
@@ -1934,7 +1981,11 @@ bool TextureCache::IsTextureCurrent(ImageId id, uint64_t generation) const noexc
 	if (owner == nullptr || generation == 0 || generation != RangeGeneration(owner->info.data)) {
 		return false;
 	}
-	const auto& image = *owner;
+	return IsTextureClean(id);
+}
+
+bool TextureCache::IsTextureClean(ImageId id) const noexcept {
+	const auto& image = m_slot_images[id];
 	// FindTexture's RefreshImage and stencil refresh would do nothing: the image is tracked over
 	// its whole range and neither CPU nor buffer writes made it dirty.
 	return image.registered && !image.depth_id && !image.binding.needs_rebind &&

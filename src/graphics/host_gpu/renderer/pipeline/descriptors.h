@@ -32,6 +32,14 @@ struct PreparedBindings {
 		uint64_t size    = 0;
 		BufferId id;
 	};
+	// A view FindTexture returned for a binding of `image` with `info`, and the image set's
+	// generation then (see TextureCache::IsTextureCurrent); generation 0: none.
+	struct ViewMemo {
+		vk::ImageView view;
+		ImageId       image;
+		ImageViewInfo info;
+		uint64_t      generation = 0;
+	};
 	// What an image binding was resolved from, so that the next draw binding the same descriptor
 	// can keep it (see TextureCache::RefindImage).
 	struct ImageSource {
@@ -39,6 +47,9 @@ struct PreparedBindings {
 		ShaderRecompiler::IR::DescriptorValue value;
 		ImageId                               found;          // FindImage's result.
 		uint64_t                              generation = 0; // 0: not reusable.
+		// A null descriptor's binding: the texture cache's null image for the resource's format,
+		// which lives as long as the cache and has no guest memory to refresh.
+		bool                                  null_image = false;
 		uint32_t                              metadata_base_layer = 0;
 		// The view FindTexture last returned for a sampled binding of view_image, and the image
 		// set's generation then (see TextureCache::IsTextureCurrent); generation 0: none.
@@ -46,6 +57,11 @@ struct PreparedBindings {
 		ImageId                               view_image;
 		ImageViewInfo                         view_info;
 		uint64_t                              view_generation = 0;
+		// The same memo kept with the texture description that resolved this binding, so another
+		// slot or draw resolving that description starts from the view (see ResolveTextureInto).
+		// The entry may describe another texture by now: a memo is only used for its own image
+		// and view, and IsTextureCurrent checks it as the slot's own.
+		ViewMemo*                             view_memo = nullptr;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
@@ -63,6 +79,20 @@ struct PreparedBindings {
 	std::vector<uint32_t>                 shader_data;
 	// KYTY_DEBUG_DRAW_PHASES: the previous draw's program and descriptor hashes (see
 	// NoteBindingRepeat).
+	// The stage's images as its last draw left them, for a draw with the same program and image
+	// descriptors (see RenderExecutor::ReuseImageGroup): the bindings and views stand while no
+	// lookup could find another image (TextureCache::CurrentTargetState) and each image stays
+	// clean. program nullptr: no group (a storage image, or a view that is not kept).
+	struct ImageGroup {
+		const void*                                        program = nullptr;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> images;
+		std::vector<uint32_t>                              mip_counters;
+		TextureCache::TargetState                          state {};
+	} image_group;
+	// This draw kept the group so far: PrepareBindings resolved nothing, and RebindImages keeps
+	// the views if the group still stands then.
+	bool image_group_kept = false;
+
 	struct RepeatKey {
 		const void* program  = nullptr;
 		uint64_t    images   = 0;

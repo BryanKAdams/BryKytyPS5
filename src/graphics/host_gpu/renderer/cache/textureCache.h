@@ -74,6 +74,14 @@ public:
 	// image and its views still live, and it needs no refresh. Reads the image without m_lock, as
 	// GetImage does.
 	[[nodiscard]] bool          IsTextureCurrent(ImageId id, uint64_t generation) const noexcept;
+	// IsTextureCurrent's conditions on the image itself, for a caller that knows no image was
+	// registered or unregistered since it took the generation (see CurrentTargetState): the slot
+	// still holds the image, and the range's generation needs no lookup.
+	[[nodiscard]] bool          IsTextureClean(ImageId id) const noexcept;
+	// Whether FinishFind's color clear for this request on `id` would do nothing: the surface has
+	// no color metadata, or its last check was for the same request and still holds.
+	[[nodiscard]] bool IsColorClearCurrent(ImageId id, const ImageDesc& desc,
+	                                       uint32_t metadata_base_layer) const;
 	// The same for FindRenderTarget: the target is also GPU-owned already, so marking it written
 	// changes nothing.
 	[[nodiscard]] bool IsRenderTargetCurrent(ImageId id, uint64_t generation) const noexcept;
@@ -95,6 +103,17 @@ public:
 	[[nodiscard]] uint64_t SurfaceMetaGeneration() const noexcept {
 		return m_surface_meta_generation.load(std::memory_order_acquire);
 	}
+	// What a successful RefindImage depends on besides its request: the image set, and the tick
+	// and GC tick its bookkeeping keys on. While this is unchanged, repeating a request that
+	// RefindImage accepted succeeds again and changes nothing, except for FinishFind's color clear
+	// (see IsColorClearCurrent). Thread_Gpu only.
+	struct TargetState {
+		uint64_t image_set = 0;
+		uint64_t tick      = 0;
+		uint64_t gc_tick   = 0;
+		bool     operator==(const TargetState&) const = default;
+	};
+	[[nodiscard]] TargetState CurrentTargetState() const noexcept;
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -204,13 +223,16 @@ private:
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	// What MaterializeColorClearNow did: nothing it would repeat for the same surface (no
-	// single-mip metadata slices, or GPU-written slices already checked), or something else.
-	enum class ColorClearOutcome : uint8_t { NoSlices, GpuChecked, Other };
+	// single-mip metadata slices, GPU-written slices already checked, or metadata the GPU had not
+	// written whose keys, in `keys`, hold no clear), or something else.
+	enum class ColorClearOutcome : uint8_t { NoSlices, GpuChecked, CpuChecked, Other };
 	[[nodiscard]] ColorClearOutcome MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
 	                                                         uint32_t metadata_base_layer,
-	                                                         bool&    changed);
+	                                                         bool&    changed,
+	                                                         Image::ColorClearCheck::Keys& keys);
 	[[nodiscard]] bool              ColorClearUnchanged(const Image& image, const ImageDesc& desc,
 	                                                    uint32_t metadata_base_layer) const;
+	[[nodiscard]] static bool ColorClearKeysUnchanged(const Image::ColorClearCheck::Keys& keys);
 	void                        FinishFind(ImageId id, const ImageDesc& desc,
 	                                       uint32_t metadata_base_layer);
 	// Applies clears found in GPU-written color metadata (DCC or CMASK keys) with conditional

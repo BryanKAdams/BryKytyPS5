@@ -755,6 +755,8 @@ public:
 		uint64_t                              generation = 0;
 		ImageId                               found;
 		ImageId                               bound;
+		// The view RebindImages acquired for a binding of this description.
+		PreparedBindings::ViewMemo            view;
 	};
 
 	// The entry stays valid until the next call.
@@ -791,6 +793,7 @@ public:
 		victim->value       = value;
 		victim->resource    = resource;
 		victim->generation  = 0;
+		victim->view        = {};
 		return *victim;
 	}
 
@@ -812,6 +815,20 @@ bool TextureReuseEnabled() {
 	return enabled && !(ab && AbFeatureOff());
 }
 
+// A null texture binding keeps its image and view while its descriptor repeats;
+// KYTY_DEBUG_AB=nullreuse alternates.
+bool NullReuseEnabled() {
+	static const bool ab = AbSelected("nullreuse");
+	return TextureReuseEnabled() && !(ab && AbFeatureOff());
+}
+
+// A resolved binding starts from the view its description's last binding acquired;
+// KYTY_DEBUG_AB=viewmemo alternates.
+bool ViewMemoEnabled() {
+	static const bool ab = AbSelected("viewmemo");
+	return TextureReuseEnabled() && !(ab && AbFeatureOff());
+}
+
 } // namespace
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
@@ -828,6 +845,8 @@ void RenderExecutor::ResolveTextureInto(const ShaderRecompiler::IR::ImageResourc
                                         TextureBinding&                              out) {
 	if (source != nullptr) {
 		source->generation = 0;
+		source->null_image = false;
+		source->view_memo  = nullptr;
 	}
 	out.image_view = nullptr;
 	out.layout     = vk::ImageLayout::eUndefined;
@@ -843,6 +862,12 @@ void RenderExecutor::ResolveTextureInto(const ShaderRecompiler::IR::ImageResourc
 		out.desc     = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                 : TextureCache::BindingType::Texture);
 		out.image_id = texture_cache.FindImage(out.desc);
+		if (source != nullptr && !storage) {
+			source->resource   = resource;
+			source->value      = value;
+			source->found      = out.image_id;
+			source->null_image = true;
+		}
 		return;
 	}
 
@@ -880,10 +905,24 @@ void RenderExecutor::ResolveTextureInto(const ShaderRecompiler::IR::ImageResourc
 		if ((depth_id ? depth_id : entry.found) == entry.bound) {
 			remember(entry.found, entry.generation);
 			out.image_id = entry.bound;
+			if (source != nullptr) {
+				source->view_memo = &entry.view;
+				// A binding of this description acquired a view before, maybe in another slot.
+				if (const auto& memo = entry.view;
+				    ViewMemoEnabled() && memo.generation != 0 && memo.image == entry.bound) {
+					source->view            = memo.view;
+					source->view_image      = memo.image;
+					source->view_info       = memo.info;
+					source->view_generation = memo.generation;
+				}
+			}
 			return;
 		}
 	}
 	entry.generation = 0;
+	if (source != nullptr) {
+		source->view_memo = &entry.view;
+	}
 
 	uint64_t generation = 0;
 	ImageId  id;
@@ -992,6 +1031,11 @@ static bool ReuseTexture(TextureCache& cache, const PreparedBindings::ImageSourc
                          const TextureBinding&                        binding,
                          const ShaderRecompiler::IR::ImageResource&   resource,
                          const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (source.null_image) {
+		// The same resource's null descriptor finds the same null image, which never changes.
+		return NullReuseEnabled() && source.value == value && source.resource == resource &&
+		       source.found == binding.image_id;
+	}
 	if (!TextureReuseEnabled() || source.generation == 0 || !(source.value == value) ||
 	    !(source.resource == resource) ||
 	    !cache.RefindImage(source.found, source.generation, binding.desc,
@@ -1000,6 +1044,98 @@ static bool ReuseTexture(TextureCache& cache, const PreparedBindings::ImageSourc
 	}
 	const auto depth_id = cache.GetImage(source.found).depth_id;
 	return (depth_id ? depth_id : source.found) == binding.image_id;
+}
+
+// KYTY_DEBUG_IMAGE_GROUPS=0 checks every image of every draw; KYTY_DEBUG_AB=imagegroups
+// alternates.
+static bool ImageGroupsEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_IMAGE_GROUPS");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	static const bool ab = AbSelected("imagegroups");
+	return enabled && TextureReuseEnabled() && !(ab && AbFeatureOff());
+}
+
+// KYTY_VERIFY_IMAGE_GROUPS=1: a draw keeping its stage's image group also resolves each image and
+// acquires its view, and reports what came out differently.
+static bool VerifyImageGroups() {
+	static const bool enabled = std::getenv("KYTY_VERIFY_IMAGE_GROUPS") != nullptr;
+	return enabled;
+}
+
+static void ReportImageGroupCheck(bool same, uint64_t address) {
+	static std::atomic<uint64_t> checked {0};
+	static std::atomic<uint64_t> missed {0};
+	const auto                   count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (!same && missed.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("image-group verify: 0x%016" PRIx64 " kept binding differs\n", address);
+	}
+	if (count % 100000 == 0) {
+		std::printf("image-group verify: images=%" PRIu64 " missed=%" PRIu64 "\n", count,
+		            missed.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+	}
+}
+
+// Whether the stage's recorded images still stand: no image was registered or unregistered and
+// the tick and GC tick are the ones they were checked under, so every lookup and view acquisition
+// would repeat itself (RefindImage, IsTextureCurrent), and each image is still clean, bound for
+// the image its lookup finds, and has no color clear to apply for its request.
+static bool ImageGroupStands(TextureCache& cache, const PreparedBindings& prepared) {
+	if (!(prepared.image_group.state == cache.CurrentTargetState())) {
+		return false;
+	}
+	for (size_t i = 0; i < prepared.images.size(); i++) {
+		const auto& source = prepared.image_sources[i];
+		const auto  bound  = prepared.images[i].image_id;
+		if (source.null_image) {
+			continue; // The null image never changes (see ReuseTexture).
+		}
+		const auto depth = cache.GetImage(source.found).depth_id;
+		if ((depth ? depth : source.found) != bound || !cache.IsTextureClean(bound) ||
+		    !cache.IsColorClearCurrent(source.found, prepared.images[i].desc,
+		                               source.metadata_base_layer)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Records the stage's images as RebindImages left them, for the next draw of the same program and
+// image descriptors (see PreparedBindings::ImageGroup). Only sampled textures that a lookup can
+// repeat (or null textures) and that keep their views qualify; ImageGroupStands also asks each
+// color-compressed surface whether its color clear check for the request still holds.
+static void RecordImageGroup(RenderContext& context, PreparedBindings& prepared,
+                             const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                             const std::vector<ShaderRecompiler::IR::DescriptorValue>& values) {
+	auto& group   = prepared.image_group;
+	auto& cache   = context.GetTextureCache();
+	group.program = nullptr;
+	if (!ImageGroupsEnabled()) {
+		return;
+	}
+	group.mip_counters.clear();
+	for (size_t i = 0; i < prepared.images.size(); i++) {
+		const auto& binding = prepared.images[i];
+		const auto& source  = prepared.image_sources[i];
+		if (binding.desc.type != TextureCache::BindingType::Texture ||
+		    (source.generation == 0 && !(source.null_image && NullReuseEnabled())) ||
+		    source.view_generation == 0 || source.view_image != binding.image_id ||
+		    source.view != binding.image_view ||
+		    program.info.images[i].mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+			return;
+		}
+		if (values[i].dword_count >= 8) {
+			const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(values[i]);
+			if (descriptor.MipStatsCntEn()) {
+				group.mip_counters.push_back(descriptor.MipStatsCntId());
+			}
+		}
+	}
+	group.images.assign(values.begin(), values.end());
+	group.state   = cache.CurrentTargetState();
+	group.program = &program;
 }
 
 // Debugging aid for the draw-phases line: counts stages whose program and descriptors repeat the
@@ -1051,7 +1187,32 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	auto& texture_cache = m_context.GetTextureCache();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+	// A draw repeating the stage's program and image descriptors binds its last images while they
+	// stand (see ImageGroupStands); RebindImages checks them again.
+	const auto& group = prepared.image_group;
+	prepared.image_group_kept =
+	    ImageGroupsEnabled() && group.program == &program &&
+	    std::ranges::equal(snapshot.images, group.images) && ImageGroupStands(texture_cache, prepared);
+	if (prepared.image_group_kept) {
+		for (const auto counter: group.mip_counters) {
+			m_context.MarkMipStatsCounter(counter);
+		}
+		for (const auto& binding: prepared.images) {
+			BindImage(binding.image_id, false);
+		}
+		if (VerifyImageGroups()) [[unlikely]] {
+			for (uint32_t i = 0; i < program.info.images.size(); i++) {
+				auto           source = prepared.image_sources[i];
+				TextureBinding check;
+				ResolveTextureInto(program.info.images[i], snapshot.images[i], &source, check);
+				const auto& kept = prepared.images[i];
+				ReportImageGroupCheck(check.image_id == kept.image_id &&
+				                          check.desc.view_info == kept.desc.view_info,
+				                      kept.desc.info.data.address);
+			}
+		}
+	}
+	for (uint32_t i = 0; !prepared.image_group_kept && i < program.info.images.size(); i++) {
 		MarkMipStats(m_context, program.info.images[i], snapshot.images[i]);
 		// Consecutive draws mostly bind the same textures.
 		auto& previous = prepared.images[i];
@@ -1167,7 +1328,15 @@ static bool VerifyStorageReuse() {
 	return enabled;
 }
 
-static void CheckStorageReuse(TextureCache& cache, const TextureBinding& binding) {
+// KYTY_VERIFY_VIEW_REUSE=1: the same for sampled textures, including views that another slot's
+// binding of the description acquired (the view memo, see ResolveTextureInto).
+static bool VerifyViewReuse() {
+	static const bool enabled = std::getenv("KYTY_VERIFY_VIEW_REUSE") != nullptr;
+	return enabled;
+}
+
+static void CheckViewReuse(TextureCache& cache, const TextureBinding& binding) {
+	const bool  storage         = binding.desc.type == TextureCache::BindingType::Storage;
 	const auto& image           = cache.GetImage(binding.image_id);
 	const bool  gpu_modified    = image.IsGpuModified();
 	const bool  buffer_modified = image.IsBufferModified();
@@ -1177,15 +1346,22 @@ static void CheckStorageReuse(TextureCache& cache, const TextureBinding& binding
 	const bool  same            = view == binding.image_view &&
 	                  after.IsGpuModified() == gpu_modified &&
 	                  after.IsBufferModified() == buffer_modified && after.IsCpuDirty() == cpu_dirty;
-	static std::atomic<uint64_t> checked {0};
-	static std::atomic<uint64_t> missed {0};
-	const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+	static std::atomic<uint64_t> checked_counts[2] {};
+	static std::atomic<uint64_t> missed_counts[2] {};
+	auto&       checked = checked_counts[storage ? 1 : 0];
+	auto&       missed  = missed_counts[storage ? 1 : 0];
+	const char* kind    = storage ? "storage" : "texture";
+	const auto  count   = checked.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (!same && missed.fetch_add(1, std::memory_order_relaxed) < 32) {
-		std::printf("storage-reuse verify: 0x%016" PRIx64 " kept view would have missed a change\n",
-		            image.info.data.address);
+		std::printf("%s-reuse verify: 0x%016" PRIx64
+		            " kept view would have missed a change (view %s, gpu %d->%d, buffer %d->%d, "
+		            "cpu %d->%d)\n",
+		            kind, image.info.data.address, view == binding.image_view ? "same" : "differs",
+		            gpu_modified, after.IsGpuModified(), buffer_modified, after.IsBufferModified(),
+		            cpu_dirty, after.IsCpuDirty());
 	}
 	if (count % 100000 == 0) {
-		std::printf("storage-reuse verify: reuses=%" PRIu64 " missed=%" PRIu64 "\n", count,
+		std::printf("%s-reuse verify: reuses=%" PRIu64 " missed=%" PRIu64 "\n", kind, count,
 		            missed.load(std::memory_order_relaxed));
 		std::fflush(stdout);
 	}
@@ -1201,6 +1377,17 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	// Bindings assembled without PrepareBindings have no recorded sources.
 	prepared.image_sources.resize(images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// PrepareBindings kept the group; BDA synchronization since may have dirtied an image.
+	const bool group_kept     = prepared.image_group_kept;
+	prepared.image_group_kept = false;
+	if (group_kept && ImageGroupStands(texture_cache, prepared)) {
+		if (VerifyImageGroups()) [[unlikely]] {
+			for (const auto& binding: images) {
+				CheckViewReuse(texture_cache, binding);
+			}
+		}
+		return;
+	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
@@ -1233,16 +1420,18 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		           TextureReuseEnabled() && source.view_image == binding.image_id &&
 		           source.view_info == binding.desc.view_info &&
 		           (binding.desc.type == TextureCache::BindingType::Texture
-		                ? texture_cache.IsTextureCurrent(binding.image_id, source.view_generation)
+		                ? (source.null_image && source.view_generation != 0 && NullReuseEnabled()) ||
+		                      texture_cache.IsTextureCurrent(binding.image_id, source.view_generation)
 		                : binding.desc.type == TextureCache::BindingType::Storage &&
 		                      StorageReuseEnabled() &&
 		                      texture_cache.IsStorageCurrent(binding.image_id,
 		                                                     source.view_generation))) {
 			// A clean image keeps the view FindTexture returned for this binding before.
 			binding.image_view = source.view;
-			if (binding.desc.type == TextureCache::BindingType::Storage &&
-			    VerifyStorageReuse()) [[unlikely]] {
-				CheckStorageReuse(texture_cache, binding);
+			if (binding.desc.type == TextureCache::BindingType::Storage ? VerifyStorageReuse()
+			                                                              : VerifyViewReuse())
+			    [[unlikely]] {
+				CheckViewReuse(texture_cache, binding);
 			}
 		} else {
 			const auto generation = texture_cache.ImageGeneration(binding.image_id);
@@ -1255,12 +1444,17 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			source.view       = binding.image_view;
 			source.view_image = binding.image_id;
 			source.view_info  = binding.desc.view_info;
+			if (source.view_memo != nullptr && source.view_generation != 0) {
+				*source.view_memo = {source.view, source.view_image, source.view_info,
+				                     source.view_generation};
+			}
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
 	}
+	RecordImageGroup(m_context, prepared, program, snapshot.images);
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,

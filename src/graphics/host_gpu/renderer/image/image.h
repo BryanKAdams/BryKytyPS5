@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <array>
 #include <compare>
 #include <limits>
 #include <optional>
@@ -167,6 +168,15 @@ public:
 		// A GPU-written metadata check that found every slice checked (or no key it could
 		// apply); otherwise a surface without single-mip metadata slices.
 		bool              gpu_checked             = false;
+		// A check of metadata the GPU had not written that found no slice's first key to be a
+		// clear: it holds while those keys are unchanged and no GPU write came since
+		// (gpu_dirty_generation), so the metadata is still not GPU-written.
+		bool              cpu_checked             = false;
+		struct Keys {
+			uint32_t                count = 0;
+			std::array<uint64_t, 4> addresses {};
+			std::array<uint8_t, 4>  codes {};
+		} keys;
 		uint64_t          surface_meta_generation = 0;
 		uint64_t          gpu_dirty_generation    = 0;
 		uint64_t          dcc_checked_generation  = 0;
