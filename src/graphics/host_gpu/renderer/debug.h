@@ -36,6 +36,11 @@ inline RenderDebugCounters g_render_debug_counters;
 // views checked against the images over their own range rather than the whole image set),
 // streamreuse (a range copied into the stream ring earlier in the BDA epoch bound again).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
+// KYTY_DEBUG_FULL_BARRIERS=1: every draw and dispatch waits for all earlier GPU work and sees all
+// its memory writes (RecordFullBarrier). Slow; it tells synchronization bugs (a result that changes)
+// from bugs that do not depend on timing.
+[[nodiscard]] bool DebugFullBarriers() noexcept;
+void               RecordFullBarrier(vk::CommandBuffer command) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
 inline std::atomic<uint64_t> g_gpu_busy_ns {0};
