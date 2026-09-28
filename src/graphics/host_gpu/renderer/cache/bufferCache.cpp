@@ -42,9 +42,8 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 // Copies the chunks of a large upload on a few threads at once, the caller among them, and
 // returns when all are done. An upload's ranges are scattered guest pages, so one thread spends
-// most of its copy waiting on memory. Workers read the backing, which never faults, and only
-// for chunks the caller found clean of GPU writes; a chunk whose backing read fails is left for
-// the caller (Chunk::done stays false).
+// most of its copy waiting on memory. Workers read the backing, which never faults; a chunk
+// whose backing read fails is left for the caller (Chunk::done stays false).
 class UploadCopyPool {
 public:
 	struct Chunk {
@@ -743,16 +742,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address),
 				            copy.size);
 			} else {
+				// Upload ranges are bytes the CPU wrote, on pages the guest can read, and the memory
+				// tracker's lock is held here (a guest read that faulted would take it again).
+				// Their backing therefore holds the bytes a guest read gets.
 				for (uint64_t offset = 0; offset < copy.size; offset += ChunkBytes) {
-					const auto piece  = std::min(ChunkBytes, copy.size - offset);
-					auto*      target = mapped + copy.srcOffset + offset;
-					if (HasGpuDirtyBytes(address + offset, piece) ||
-					    m_texture_cache.IsRegionGpuModified(address + offset, piece)) {
-						// Its guest read may fault into a readback, which only this thread serves.
-						std::memcpy(target, reinterpret_cast<const void*>(address + offset), piece);
-					} else {
-						chunks.push_back({target, address + offset, piece});
-					}
+					const auto piece = std::min(ChunkBytes, copy.size - offset);
+					chunks.push_back({mapped + copy.srcOffset + offset, address + offset, piece});
 				}
 			}
 			copy.srcOffset += base_offset;
