@@ -763,8 +763,11 @@ bool AbSelected(const char* feature) noexcept {
 	return false;
 }
 
+// KYTY_DEBUG_AB_OFF=1 keeps the selected features off for the whole run instead of alternating
+// (to see a scene without them, e.g. for visual bisection).
 bool AbFeatureOff() noexcept {
-	return g_ab_off.load(std::memory_order_relaxed);
+	static const bool forced = std::getenv("KYTY_DEBUG_AB_OFF") != nullptr;
+	return forced || g_ab_off.load(std::memory_order_relaxed);
 }
 
 namespace {
