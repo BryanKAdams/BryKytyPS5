@@ -205,27 +205,14 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
-	const auto bits      = state.builder.AllocateId();
-	const auto abs_bits  = state.builder.AllocateId();
-	const auto sign_bits = state.builder.AllocateId();
-	const auto non_zero  = state.builder.AllocateId();
-	const auto subnormal = state.builder.AllocateId();
-	const auto flush     = state.builder.AllocateId();
-	const auto selected  = state.builder.AllocateId();
-	const auto ret       = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
-	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits,
-	                          ConstantU32(state, 0x7fffffffu));
-	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), sign_bits, bits,
-	                          ConstantU32(state, 0x80000000u));
-	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), non_zero, abs_bits,
-	                          ConstantU32(state, 0));
-	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), subnormal, abs_bits,
-	                          ConstantU32(state, 0x00800000u));
-	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), flush, non_zero, subnormal);
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, flush, sign_bits, bits);
-	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), ret, selected);
-	return ret;
+	// A zero exponent field means a zero or a denormal. Keeping only the sign bit gives the same
+	// zero for a zero and flushes a denormal to the zero of its sign, so no zero test is needed.
+	const auto bits          = Unary(state, spv::OpBitcast, TypeU32(state), value);
+	const auto exponent_zero = EmitCompareU32Constant(
+	    state, spv::OpIEqual, EmitAndConstant(state, bits, 0x7f800000u), 0);
+	const auto selected = EmitSelectValueU32(state, exponent_zero,
+	                                         EmitAndConstant(state, bits, 0x80000000u), bits);
+	return Unary(state, spv::OpBitcast, TypeF32(state), selected);
 }
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {
