@@ -342,31 +342,55 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+// Callers hold m_lock, so there is one writer at a time. The regions are stamped first and the
+// new generation published after them: a reader that sees a generation also sees every stamp up
+// to it (RangeGeneration's memo relies on this).
 void TextureCache::AdvanceImageSetGeneration(GuestRange range) noexcept {
-	const auto stamp = m_image_set_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+	const auto stamp = m_image_set_generation.load(std::memory_order_relaxed) + 1;
 	const auto first = range.address >> RegionGenerationBits;
 	const auto last  = (range.End() - 1) >> RegionGenerationBits;
 	for (auto region = first; region <= last; region++) {
 		m_region_generations[region % RegionGenerationBuckets].store(stamp,
-		                                                            std::memory_order_release);
+		                                                            std::memory_order_relaxed);
 	}
+	m_image_set_generation.store(stamp, std::memory_order_release);
 }
 
 // KYTY_DEBUG_AB=regiongen uses the whole image set's generation for every range in every other
 // window. The two agree on what they call unchanged: the whole set's generation is at least every
 // range's, and equals a range's only when that range saw the newest change.
 uint64_t TextureCache::RangeGeneration(GuestRange range) const noexcept {
-	static const bool ab = AbSelected("regiongen");
+	static const bool ab    = AbSelected("regiongen");
+	const auto        whole = m_image_set_generation.load(std::memory_order_acquire);
 	if ((ab && AbFeatureOff()) || range.size == 0) {
-		return m_image_set_generation.load(std::memory_order_acquire);
+		return whole;
+	}
+	// Draws ask about the same ranges draw after draw, and while the whole set's generation is
+	// unchanged no range's is: the answer is kept with the generation it was computed under. A
+	// render target spans many regions, and their buckets are scattered over the table.
+	// KYTY_DEBUG_AB=rangememo computes every answer in every other window.
+	struct Memo {
+		const TextureCache* cache      = nullptr;
+		uint64_t            address    = 0;
+		uint64_t            size       = 0;
+		uint64_t            whole      = 0;
+		uint64_t            generation = 0;
+	};
+	thread_local std::array<Memo, 1024> memos {};
+	static const bool memo_ab = AbSelected("rangememo");
+	auto& memo = memos[((range.address >> 12u) ^ (range.address >> 24u) ^ range.size) % memos.size()];
+	if (memo.cache == this && memo.whole == whole && memo.address == range.address &&
+	    memo.size == range.size && !(memo_ab && AbFeatureOff())) {
+		return memo.generation;
 	}
 	uint64_t   generation = m_image_set_base;
 	const auto first      = range.address >> RegionGenerationBits;
 	const auto last       = (range.End() - 1) >> RegionGenerationBits;
 	for (auto region = first; region <= last; region++) {
 		generation = std::max(generation, m_region_generations[region % RegionGenerationBuckets].load(
-		                                      std::memory_order_acquire));
+		                                      std::memory_order_relaxed));
 	}
+	memo = {this, range.address, range.size, whole, generation};
 	return generation;
 }
 
