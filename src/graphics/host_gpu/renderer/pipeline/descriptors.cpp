@@ -155,7 +155,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	auto range = size + adjustment;
+	if (graphics.hardware_storage_buffer_bounds) {
+		// The device checks word accesses against the range, which the shader's own checks took
+		// in whole dwords: a trailing partial dword is out of range. A range without one whole
+		// dword is a null descriptor, which the device treats as empty.
+		range &= ~vk::DeviceSize {sizeof(uint32_t) - 1};
+		if (range == 0) {
+			buffer_offset = 0;
+			return {nullptr, 0, VK_WHOLE_SIZE};
+		}
+	}
+	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
 	if (resource.written) {
 		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::BufferInvalidate);
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
@@ -1281,7 +1292,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					case BindingKind::Buffers:
 						for (const auto resource: binding.resources) {
 							const auto& view = descriptors.buffers.at(resource);
-							EXIT_IF(view.buffer == nullptr);
+							// With hardware bounds, a range without a whole dword is a null
+							// descriptor (see NativeStorageBuffer).
+							EXIT_IF(view.buffer == nullptr &&
+							        !m_context.GetGraphics().hardware_storage_buffer_bounds);
 							m_descriptor_buffers.push_back(view);
 						}
 						break;

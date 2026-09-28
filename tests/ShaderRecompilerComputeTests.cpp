@@ -1202,6 +1202,10 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
+// --hardware-buffer-bounds: the cases run with storage buffer word accesses left to the
+// device's robustBufferAccess2 (ShaderRecompiler::SetHardwareStorageBufferBounds).
+bool g_hardware_buffer_bounds_requested = false;
+
 // Payload calls (ReserveRecordedCall/CommitRecordedCall) run on the stream's consumer in order
 // with pushed work, with the routed buffer and their whole payload; other threads and buffers
 // that are not routed get no room. No GPU: the command buffer is only a handle.
@@ -16434,6 +16438,8 @@ private:
         m_provoking_vertex_supported;
     m_runtime_context.conditional_rendering_enabled =
         m_conditional_rendering_supported;
+    m_runtime_context.hardware_storage_buffer_bounds =
+        g_hardware_buffer_bounds_requested && m_hardware_buffer_bounds_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -16582,9 +16588,11 @@ private:
     available_conditional_rendering.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
     available_min_lod.pNext = &available_conditional_rendering;
+    vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
+    available_robustness2.pNext = &available_min_lod;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_min_lod;
+    available_features2.pNext = &available_robustness2;
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
@@ -16665,6 +16673,18 @@ private:
     m_conditional_rendering_supported =
         available_conditional_rendering.conditionalRendering &&
         has_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+    // As the emulator does: robustBufferAccess2 and null descriptors when available.
+    m_robustness2_supported = has_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) &&
+                              available_robustness2.robustBufferAccess2 &&
+                              available_robustness2.nullDescriptor;
+    if (m_robustness2_supported) {
+      vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties{};
+      vk::PhysicalDeviceProperties2 properties2{};
+      properties2.pNext = &robustness2_properties;
+      m_physical_device.getProperties2(&properties2);
+      m_hardware_buffer_bounds_supported =
+          robustness2_properties.robustStorageBufferAccessSizeAlignment <= sizeof(u32);
+    }
     std::printf("[host] Optional features: attachment feedback=%s, dynamic "
                 "feedback=%s, provoking vertex last=%s, conditional rendering=%s\n",
                 m_feedback_loop_supported ? "yes" : "no",
@@ -16805,12 +16825,27 @@ private:
       device_info.pNext = &executable_info;
       device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }
+    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
+    if (m_robustness2_supported) {
+      robustness2.robustBufferAccess2 = true;
+      robustness2.nullDescriptor = true;
+      robustness2.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &robustness2;
+      device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
+    if (g_hardware_buffer_bounds_requested) {
+      if (!m_hardware_buffer_bounds_supported) {
+        std::printf("[host] hardware storage buffer bounds are not supported; skipped\n");
+        std::exit(0);
+      }
+      ShaderRecompiler::SetHardwareStorageBufferBounds(true);
+    }
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
@@ -17139,6 +17174,8 @@ private:
   bool m_feedback_dynamic_supported = false;
   bool m_provoking_vertex_supported = false;
   bool m_conditional_rendering_supported = false;
+  bool m_robustness2_supported = false;
+  bool m_hardware_buffer_bounds_supported = false;
   bool m_executable_info_supported = false;
   bool m_subgroup_size_control_supported = false;
   std::unique_ptr<RenderContext> m_renderer;
@@ -35220,6 +35257,12 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckAttachmentFeedbackPipelineKeys();
+  if (argc >= 2 && std::strcmp(argv[1], "--hardware-buffer-bounds") == 0) {
+    g_hardware_buffer_bounds_requested = true;
+    argv[1] = argv[0];
+    ++argv;
+    --argc;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--command-stream-only") == 0) {
     CheckCommandStreamPayloads();
     return 0;

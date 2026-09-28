@@ -669,6 +669,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME command_stream_payloads
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --command-stream-only)
+	add_test(NAME shader_recompiler_compute_hw_bounds
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hardware-buffer-bounds)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_context_state
