@@ -653,13 +653,18 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 
 // The constructor leaves vertex_info unconstructed: GetGraphicsPrograms constructs the entries it
 // uses (ResetVertexInputInfo) before any use. Constructing all three on every draw cost the GPU
-// thread about 1.5% in Sky Garden.
+// thread about 1.5% in Sky Garden. Likewise only color_info's first color_constructed entries are
+// constructed (PrepareDrawRenderState constructs each before resolving a target into it): a draw
+// uses one or two of the eight, and each carries a whole image description.
 struct DrawRenderState {
-	DrawRenderState() {} // NOLINT(modernize-use-equals-default)
+	DrawRenderState() { std::construct_at(&color_info[0]); }
 	RenderDepthInfo       depth_info {};
-	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t              color_count                              = 0;
-	bool                  ps_active                                = true;
+	union {
+		RenderColorInfo color_info[RENDER_COLOR_ATTACHMENTS_MAX];
+	};
+	uint32_t              color_constructed = 1;
+	uint32_t              color_count       = 0;
+	bool                  ps_active         = true;
 	union {
 		std::array<ShaderVertexInputInfo, 3> vertex_info;
 	};
@@ -667,6 +672,7 @@ struct DrawRenderState {
 	PipelineCache::GraphicsPrograms programs {};
 };
 static_assert(std::is_trivially_destructible_v<ShaderVertexInputInfo>);
+static_assert(std::is_trivially_destructible_v<RenderColorInfo>);
 
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
@@ -1227,6 +1233,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((mrt_mask & (1u << slot)) != 0) {
+			if (state.color_count == state.color_constructed) {
+				std::construct_at(&state.color_info[state.color_constructed++]);
+			}
 			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
 			                         render_target_slice_offset, slot);
 			if (state.color_info[state.color_count].image_id) {
