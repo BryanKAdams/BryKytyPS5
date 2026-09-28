@@ -18,11 +18,92 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/debug.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <mutex>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// VMA fetches the memory budget from the driver again once 30 allocations or frees have passed
+// since the last fetch (VmaAllocator_T::GetHeapBudgets), and a fetch took the AMD driver about a
+// millisecond: with Sky Garden's buffer and image churn, about 1% of the GPU thread. Budget
+// queries are answered from a fetch younger than FetchInterval instead, with each heap's usage
+// moved by the device memory VMA allocated and freed since, as VMA itself estimates usage between
+// its fetches. Only the other processes' usage is then up to FetchInterval old.
+// KYTY_DEBUG_AB=budgetcache fetches every time in every other window.
+struct BudgetCache {
+	static constexpr auto FetchInterval = std::chrono::milliseconds(500);
+
+	std::mutex                                            mutex;
+	PFN_vkGetPhysicalDeviceMemoryProperties2              fetch = nullptr;
+	bool                                                  valid = false;
+	std::chrono::steady_clock::time_point                 fetched;
+	VkPhysicalDeviceMemoryProperties                      memory {};
+	std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS>         usage {};
+	std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS>         budget {};
+	std::array<int64_t, VK_MAX_MEMORY_HEAPS>              allocated_at_fetch {};
+	// VMA's device memory per heap, kept by its allocate and free callbacks.
+	std::array<std::atomic<int64_t>, VK_MAX_MEMORY_HEAPS> allocated {};
+	std::array<uint32_t, VK_MAX_MEMORY_TYPES>             type_heap {};
+};
+
+BudgetCache g_budget_cache;
+
+void VKAPI_PTR CountAllocation(VmaAllocator /*allocator*/, uint32_t memory_type,
+                               VkDeviceMemory /*memory*/, VkDeviceSize size, void* /*user_data*/) {
+	g_budget_cache.allocated[g_budget_cache.type_heap[memory_type]].fetch_add(
+	    static_cast<int64_t>(size), std::memory_order_relaxed);
+}
+
+void VKAPI_PTR CountFree(VmaAllocator /*allocator*/, uint32_t memory_type, VkDeviceMemory /*memory*/,
+                         VkDeviceSize size, void* /*user_data*/) {
+	g_budget_cache.allocated[g_budget_cache.type_heap[memory_type]].fetch_sub(
+	    static_cast<int64_t>(size), std::memory_order_relaxed);
+}
+
+void VKAPI_PTR CachedMemoryProperties2(VkPhysicalDevice                     physical_device,
+                                       VkPhysicalDeviceMemoryProperties2* properties) {
+	auto& cache  = g_budget_cache;
+	auto* budget = static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(properties->pNext);
+	static const bool ab = AbSelected("budgetcache");
+	if (budget == nullptr ||
+	    budget->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT ||
+	    budget->pNext != nullptr || (ab && AbFeatureOff())) {
+		cache.fetch(physical_device, properties);
+		return;
+	}
+	std::scoped_lock lock(cache.mutex);
+	const auto       now = std::chrono::steady_clock::now();
+	if (!cache.valid || now - cache.fetched >= BudgetCache::FetchInterval) {
+		cache.fetch(physical_device, properties);
+		cache.memory = properties->memoryProperties;
+		for (uint32_t heap = 0; heap < VK_MAX_MEMORY_HEAPS; heap++) {
+			cache.usage[heap]              = budget->heapUsage[heap];
+			cache.budget[heap]             = budget->heapBudget[heap];
+			cache.allocated_at_fetch[heap] = cache.allocated[heap].load(std::memory_order_relaxed);
+		}
+		cache.fetched = now;
+		cache.valid   = true;
+		return;
+	}
+	properties->memoryProperties = cache.memory;
+	for (uint32_t heap = 0; heap < VK_MAX_MEMORY_HEAPS; heap++) {
+		const auto delta =
+		    cache.allocated[heap].load(std::memory_order_relaxed) - cache.allocated_at_fetch[heap];
+		const auto usage = static_cast<int64_t>(cache.usage[heap]) + delta;
+		budget->heapUsage[heap]  = static_cast<VkDeviceSize>(std::max<int64_t>(usage, 0));
+		budget->heapBudget[heap] = cache.budget[heap];
+	}
+}
+
+} // namespace
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -40,8 +121,23 @@ bool GraphicContext::CreateAllocator() {
 	info.pVulkanFunctions = &functions;
 	info.vulkanApiVersion = VULKAN_TARGET_API_VERSION;
 	info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+	VmaDeviceMemoryCallbacks memory_callbacks {};
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+		auto& cache = g_budget_cache;
+		cache.fetch = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+		    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr(
+		        static_cast<VkInstance>(instance), "vkGetPhysicalDeviceMemoryProperties2"));
+		EXIT_IF(cache.fetch == nullptr);
+		cache.valid = false;
+		const auto& properties = physical_device.getMemoryProperties();
+		for (uint32_t type = 0; type < properties.memoryTypeCount; type++) {
+			cache.type_heap[type] = properties.memoryTypes[type].heapIndex;
+		}
+		functions.vkGetPhysicalDeviceMemoryProperties2KHR = CachedMemoryProperties2;
+		memory_callbacks.pfnAllocate = CountAllocation;
+		memory_callbacks.pfnFree     = CountFree;
+		info.pDeviceMemoryCallbacks  = &memory_callbacks;
 	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));

@@ -34,6 +34,8 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -45,10 +47,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -1353,6 +1358,193 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// KYTY_DEBUG_IMAGE_USERS=<guest address, hex> prints, every 5 s, each kind of draw that binds an
+// image over that address: the pixel and vertex shaders, how the image is bound (texture,
+// storage, color or depth target, with the stage and slot), and its format, size and view. It
+// finds the shaders reading a given surface and whether a draw also renders to it.
+static uint64_t ImageUsersAddress() {
+	static const uint64_t address = [] {
+		const char* text = std::getenv("KYTY_DEBUG_IMAGE_USERS");
+		return text != nullptr ? std::strtoull(text, nullptr, 16) : uint64_t {0};
+	}();
+	return address;
+}
+
+// KYTY_DEBUG_IMAGE_USERS_SHADER=<hash>[,<hash>...]: every image and buffer binding of the draws
+// and dispatches with one of these pixel, vertex or compute shaders is listed too, whatever its
+// address.
+static const std::vector<uint64_t>& ImageUsersShaders() {
+	static const std::vector<uint64_t> shaders = [] {
+		std::vector<uint64_t> list;
+		const char*           text = std::getenv("KYTY_DEBUG_IMAGE_USERS_SHADER");
+		while (text != nullptr && *text != '\0') {
+			char* end = nullptr;
+			list.push_back(std::strtoull(text, &end, 16));
+			text = (end != nullptr && *end == ',') ? end + 1 : nullptr;
+		}
+		return list;
+	}();
+	return shaders;
+}
+
+bool ImageUsersEnabled() {
+	return ImageUsersAddress() != 0 || !ImageUsersShaders().empty();
+}
+
+void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stages,
+                    std::span<const RenderColorInfo> colors, const RenderDepthInfo* depth,
+                    uint64_t pixel_hash, uint64_t vertex_hash) {
+	static std::map<std::string, uint64_t> counts;
+	static auto window_start = std::chrono::steady_clock::now();
+	const auto  address      = ImageUsersAddress();
+	const auto& shaders      = ImageUsersShaders();
+	const bool  every        = std::ranges::find(shaders, pixel_hash) != shaders.end() ||
+	                   std::ranges::find(shaders, vertex_hash) != shaders.end();
+	// KYTY_DEBUG_IMAGE_USERS_TRACE=1 also prints each draw's or dispatch's uses in order, one line
+	// per call, with a run of identical calls collapsed into a count: the order of the passes
+	// sharing the surface (image-churn lines from the texture cache interleave).
+	static const bool trace = std::getenv("KYTY_DEBUG_IMAGE_USERS_TRACE") != nullptr;
+	static std::string previous_call;
+	static uint64_t    repeats = 0;
+	std::string        call;
+	// The binding's guest request (desc.info) and the cache image it resolved to (id), which can
+	// be a larger image holding the request.
+	const auto note = [&](const char* role, uint32_t stage, uint32_t slot, ImageId id,
+	                      const TextureCache::ImageDesc& desc, const char* extra) {
+		if (!id) {
+			return;
+		}
+		const auto& image     = cache.GetImage(id);
+		const auto& request   = desc.info.data;
+		const bool  requested = address >= request.address && address < request.End();
+		if (!every && !requested &&
+		    (address < image.info.data.address || address >= image.info.data.End())) {
+			return;
+		}
+		const auto& view = desc.view_info;
+		call += fmt::format(" | {} {}/{} {} {}x{}", role, stage, slot,
+		                    vk::to_string(image.info.pixel_format), desc.info.extent.width,
+		                    desc.info.extent.height);
+		counts[fmt::format("ps={:016x} vs={:016x} {} stage={} slot={}{} req=0x{:x}+0x{:x} {} "
+		                   "guest_fmt={} tile={} {}x{} view={}+{} layers {}+{} -> image=0x{:x}+0x{:x} {} "
+		                   "tile={} {}x{} cpu_dirty={} buf_mod={} gpu_mod={}",
+		                   pixel_hash, vertex_hash, role, stage, slot, extra, request.address,
+		                   request.size, vk::to_string(desc.info.pixel_format),
+		                   static_cast<uint32_t>(desc.info.guest_format),
+		                   static_cast<uint32_t>(desc.info.tile_mode), desc.info.extent.width,
+		                   desc.info.extent.height, view.base_level, view.level_count,
+		                   view.base_layer, view.layer_count, image.info.data.address,
+		                   image.info.data.size, vk::to_string(image.info.pixel_format),
+		                   static_cast<uint32_t>(image.info.tile_mode), image.info.extent.width,
+		                   image.info.extent.height, image.IsCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+		                   image.IsGpuModified() ? 1 : 0)]++;
+	};
+	for (const auto* stage: stages) {
+		const auto& program    = *stage->runtime->program;
+		const auto  stage_type = static_cast<uint32_t>(program.stage);
+		// Storage buffers over the address: a written one makes the texture cache drop the GPU
+		// contents of every image there (InvalidateMemoryFromGPU). The chosen shaders' other
+		// buffers (mostly constant ranges, one line each) only with KYTY_DEBUG_IMAGE_USERS_BUFFERS=1.
+		static const bool every_buffer = [] {
+			const char* text = std::getenv("KYTY_DEBUG_IMAGE_USERS_BUFFERS");
+			return text != nullptr && std::strcmp(text, "0") != 0;
+		}();
+		const auto buffer_count = std::min(program.info.buffers.size(), stage->buffer_sources.size());
+		for (uint32_t i = 0; i < buffer_count; i++) {
+			const auto& source = stage->buffer_sources[i];
+			if (source.size != 0 &&
+			    ((every && every_buffer) ||
+			     (address >= source.address && address < source.address + source.size))) {
+				const auto& resource = program.info.buffers[i];
+				counts[fmt::format("ps={:016x} vs={:016x} buffer stage={} slot={} range=0x{:x}+0x{:x}"
+				                   " written={} stored={} atomic={}",
+				                   pixel_hash, vertex_hash, stage_type, i, source.address, source.size,
+				                   resource.written ? 1 : 0, resource.stored ? 1 : 0,
+				                   resource.atomic ? 1 : 0)]++;
+			}
+		}
+		for (uint32_t i = 0; i < stage->images.size(); i++) {
+			const auto& binding = stage->images[i];
+			note(binding.desc.type == TextureCache::BindingType::Storage ? "storage" : "texture",
+			     stage_type, i, binding.image_id, binding.desc, "");
+		}
+	}
+	for (const auto& color: colors) {
+		note("color", 0, color.target_slot, color.image_id, color.desc, "");
+	}
+	if (depth != nullptr) {
+		const auto extra = fmt::format(
+		    " test={} write={} clear={} load_clear={} htile={}", depth->depth_test_enable ? 1 : 0,
+		    depth->depth_write_enable ? 1 : 0, depth->depth_clear_enable ? 1 : 0,
+		    depth->depth_load_clear_enable ? 1 : 0,
+		    depth->desc.info.metadata.kind == ImageMetadataKind::Htile ? 1 : 0);
+		note("depth", 0, 0, depth->image_id, depth->desc, extra.c_str());
+	}
+	if (trace && !call.empty()) {
+		call = fmt::format("ps={:016x} vs={:016x}{}", pixel_hash, vertex_hash, call);
+		if (call == previous_call) {
+			repeats++;
+		} else {
+			if (repeats != 0) {
+				std::printf("image-trace   x%" PRIu64 " more\n", repeats);
+			}
+			std::printf("image-trace %s\n", call.c_str());
+			previous_call = std::move(call);
+			repeats       = 0;
+		}
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - window_start < std::chrono::seconds(5)) {
+		return;
+	}
+	window_start = now;
+	std::printf("image-users 0x%" PRIx64 ": %zu kinds\n", address, counts.size());
+	for (const auto& [key, count]: counts) {
+		std::printf("image-users   %6" PRIu64 " %s\n", count, key.c_str());
+	}
+	std::fflush(stdout);
+	counts.clear();
+}
+
+// KYTY_DEBUG_MESH_RESTART=0 draws a mesh-emulated strip or fan with primitive restart as one
+// draw, reading its restart markers as vertices, as before restart was handled there.
+static bool MeshRestartSplitEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_MESH_RESTART");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Calls segment(first, count) for each run of the `count` guest indices at `address` between
+// restart markers (all bits set, the only marker ResolvePrimitiveRestart leaves enabled), in order.
+template <typename Segment>
+static void ForEachRestartSegment(uint64_t address, uint32_t element_size, uint32_t count,
+                                  Segment&& segment) {
+	const auto scan = [&](const auto* indices) {
+		using Index         = std::remove_cvref_t<decltype(*indices)>;
+		constexpr auto mark = static_cast<Index>(~Index {0});
+		uint32_t       first = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			if (indices[i] == mark) {
+				if (i > first) {
+					segment(first, i - first);
+				}
+				first = i + 1;
+			}
+		}
+		if (count > first) {
+			segment(first, count - first);
+		}
+	};
+	switch (element_size) {
+		case 1: scan(reinterpret_cast<const uint8_t*>(address)); break;
+		case 2: scan(reinterpret_cast<const uint16_t*>(address)); break;
+		case 4: scan(reinterpret_cast<const uint32_t*>(address)); break;
+		default: EXIT("unsupported index size for primitive restart: %u\n", element_size);
+	}
+}
+
 // Whether a draw may read buffer bytes that pending writes changed: any buffer binding, vertex,
 // index or argument range overlapping them, or a shader reading memory through addresses. Only
 // atomics on both sides need no barrier: atomics on the same memory are coherent without one.
@@ -1459,7 +1651,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		static std::atomic_bool restart_warned = false;
-		if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
+		if (primitive_restart_enable && (!draw.IsIndexed() || !MeshRestartSplitEnabled()) &&
+		    !restart_warned.exchange(true, std::memory_order_relaxed)) {
 			std::printf("Warning: primitive restart is not implemented for mesh shaders; "
 			            "continuing draw (primitive=%u indexed=%u)\n",
 			            static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed());
@@ -1518,6 +1711,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                            state.depth_info, feedback_aspects, stages);
 	g_draw_phases.Mark(DrawPhaseTimer::RenderTargets);
+	if (ImageUsersEnabled()) [[unlikely]] {
+		NoteImageUsers(m_context.GetTextureCache(), stages,
+		               std::span<const RenderColorInfo> {state.color_info, state.color_count},
+		               &state.depth_info,
+		               state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+		               state.vertex_info[0].stage.program->shader_hash);
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1562,23 +1762,67 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    draw.indirect_args, MeshIndirectArgs::ArgumentsSize, false);
 	} else if (mesh_active) {
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		ForEachMeshDispatch(
-		    mesh_groups, draw.instance_count, limits.maxMeshWorkGroupCount[0],
-		    limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount,
-		    [&](const MeshDispatchSlice& slice) {
-			    const uint32_t draw_data[] {
-			        draw.index_count,
-			        draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-			        emit.first_instance + slice.instance_offset,
-			        index_source.guest_element_size,
-			        static_cast<uint32_t>(index_source.address),
-			        static_cast<uint32_t>(index_source.address >> 32u),
-			        slice.group_offset};
-			    static_assert(std::size(draw_data) ==
-			                  ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-			    const auto offset = records.Copy(draw_data, sizeof(draw_data), 16);
-			    mesh_slices.emplace_back(slice, records.BufferDeviceAddress() + offset);
-		    });
+		const auto& mesh   = state.vertex_info[0].mesh;
+		// Dispatches drawing `index_count` indices from `index_address` as one draw.
+		const auto record_dispatches = [&](uint32_t index_count, uint64_t index_address) {
+			const auto primitives = mesh.InputPrimitiveCount(index_count);
+			if (primitives == 0) {
+				return;
+			}
+			ForEachMeshDispatch(
+			    (primitives - 1u) / mesh.primitives_per_group + 1u, draw.instance_count,
+			    limits.maxMeshWorkGroupCount[0], limits.maxMeshWorkGroupCount[1],
+			    limits.maxMeshWorkGroupTotalCount, [&](const MeshDispatchSlice& slice) {
+				    const uint32_t draw_data[] {
+				        index_count,
+				        draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+				        emit.first_instance + slice.instance_offset,
+				        index_source.guest_element_size,
+				        static_cast<uint32_t>(index_address),
+				        static_cast<uint32_t>(index_address >> 32u),
+				        slice.group_offset};
+				    static_assert(std::size(draw_data) ==
+				                  ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+				    const auto offset = records.Copy(draw_data, sizeof(draw_data), 16);
+				    mesh_slices.emplace_back(slice, records.BufferDeviceAddress() + offset);
+			    });
+		};
+		// Indices the GPU wrote may not have reached guest memory, where the split reads them.
+		const bool gpu_indices =
+		    primitive_restart_enable && draw.IsIndexed() &&
+		    m_context.GetBufferCache().IsRegionGpuModified(
+		        index_source.address, uint64_t {draw.index_count} * index_source.guest_element_size);
+		if (gpu_indices) {
+			static std::atomic_bool gpu_indices_warned = false;
+			if (!gpu_indices_warned.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Warning: mesh draw with primitive restart reads GPU-written indices; "
+				            "drawn without restart (primitive=%u)\n",
+				            static_cast<uint32_t>(ucfg.GetPrimType()));
+			}
+		}
+		if (primitive_restart_enable && draw.IsIndexed() && !gpu_indices &&
+		    MeshRestartSplitEnabled()) {
+			// The mesh shader assembles strips and fans from the draw's first index on (a fan's
+			// center is its vertex 0, a strip's winding follows its primitive number) and knows
+			// nothing of restart. So each run of indices between restart markers is drawn as a
+			// draw of its own, which restarts both, and the markers are never read as vertices.
+			uint32_t segments = 0;
+			ForEachRestartSegment(index_source.address, index_source.guest_element_size,
+			                      draw.index_count, [&](uint32_t first, uint32_t count) {
+				                      record_dispatches(count, index_source.address +
+				                                                   uint64_t {first} *
+				                                                       index_source.guest_element_size);
+				                      segments++;
+			                      });
+			static std::atomic_uint split_logs = 0;
+			if (split_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::printf("mesh restart: prim=%u indices=%u index_bytes=%u split into %u draws\n",
+				            static_cast<uint32_t>(ucfg.GetPrimType()), draw.index_count,
+				            index_source.guest_element_size, segments);
+			}
+		} else {
+			record_dispatches(draw.index_count, index_source.address);
+		}
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::Records);
 	if (draw_logged) [[unlikely]] {

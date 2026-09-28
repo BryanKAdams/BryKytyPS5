@@ -68,6 +68,13 @@ struct SpeculatedDraw {
 	// A stage without a source was not speculated.
 	std::array<SpeculatedStage, 2> stages;
 	PreparedGraphicsStages         prepared;
+	// Recorded by the speculation thread before its reads: the BDA epoch (0: epochs off), and how
+	// many draws the GPU thread had finished.
+	uint64_t read_epoch = 0;
+	uint64_t read_after = 0;
+	// Set by DrawSpeculator::Take: the epoch is unchanged and no buffer or image became
+	// GPU-written since the reads, so they need not be made again (see there).
+	bool reads_current = false;
 };
 
 // The GPU thread's current draw, when it was speculated: set around the draw packet's handler.

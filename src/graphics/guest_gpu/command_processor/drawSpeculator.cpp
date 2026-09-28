@@ -7,16 +7,19 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <immintrin.h>
 
 namespace Libs::Graphics {
 
@@ -149,6 +152,7 @@ void DrawSpeculator::Restart(const CommandProcessor& processor, std::span<const 
 		snapshot.epoch = epoch;
 		snapshot.seq   = m_gpu_seq;
 		m_restart      = true;
+		m_restart_pending.store(true, std::memory_order_release);
 	}
 	m_wake.notify_one();
 	Signal();
@@ -178,12 +182,38 @@ SpeculatedDraw* DrawSpeculator::Take(const uint32_t* packet) {
 		return nullptr;
 	}
 	m_stats.taken.fetch_add(1, std::memory_order_relaxed);
+	slot.draw.reads_current = ReadsCurrent(slot.draw);
 	return &slot.draw;
+}
+
+// Draws of one BDA epoch need not see CPU writes made during it (see RenderContext::PrepareBda):
+// when the speculation read guest memory in the current epoch, what it read is what the draw may
+// read, as for stream copies kept within an epoch (BufferCache::ObtainBuffer). GPU writes are not
+// CPU writes: the reads must also have been made after the last buffer or image became
+// GPU-written, since the readers refuse (or read around) GPU-written memory. A write counted at
+// the Release of draw k happened before the walk read draw k's release count only if k is lower
+// than it. KYTY_DEBUG_AB=specreads makes the reads again in every other window.
+bool DrawSpeculator::ReadsCurrent(const SpeculatedDraw& draw) {
+	static const bool ab = AbSelected("specreads");
+	if (ab && AbFeatureOff()) {
+		return false;
+	}
+	const auto epoch = m_renderer.CurrentBdaEpoch();
+	return epoch != 0 && draw.read_epoch == epoch && m_last_write_seq < draw.read_after &&
+	       m_renderer.GetBufferCache().GpuDirtyGeneration() == m_seen_buffer_writes &&
+	       m_renderer.GetTextureCache().GpuModifiedGeneration() == m_seen_image_writes;
 }
 
 void DrawSpeculator::Release(SpeculatedDraw* draw) {
 	if (draw != nullptr) {
 		m_ring[m_gpu_seq % RingSize].state.store(Free, std::memory_order_release);
+	}
+	const auto buffer_writes = m_renderer.GetBufferCache().GpuDirtyGeneration();
+	const auto image_writes  = m_renderer.GetTextureCache().GpuModifiedGeneration();
+	if (buffer_writes != m_seen_buffer_writes || image_writes != m_seen_image_writes) {
+		m_seen_buffer_writes = buffer_writes;
+		m_seen_image_writes  = image_writes;
+		m_last_write_seq     = m_gpu_seq;
 	}
 	m_gpu_seq++;
 	m_gpu_next.store(m_gpu_seq, std::memory_order_release);
@@ -293,6 +323,24 @@ void DrawSpeculator::Run() {
 	for (;;) {
 		uint64_t epoch = 0;
 		uint64_t seq   = 0;
+		// The GPU thread restarts the walk when it reaches the packet the walk stopped at, a few
+		// hundred microseconds later at most (the walk runs up to a ring of draws ahead). Waking
+		// from a sleep took about as long as the GPU thread needs for a dozen draws, which it then
+		// prepares itself (the walk counts them behind): spin for the restart first.
+		// KYTY_DEBUG_AB=specspin sleeps at once in every other window.
+		static const bool spin_ab = AbSelected("specspin");
+		if (!(spin_ab && AbFeatureOff())) {
+			constexpr auto SpinTime = std::chrono::microseconds(500);
+			const auto     deadline = std::chrono::steady_clock::now() + SpinTime;
+			for (uint32_t i = 1; !m_restart_pending.load(std::memory_order_acquire) &&
+			                     !m_quitting.load(std::memory_order_acquire);
+			     i++) {
+				_mm_pause();
+				if (i % 64 == 0 && std::chrono::steady_clock::now() >= deadline) {
+					break;
+				}
+			}
+		}
 		{
 			std::unique_lock lock(m_mutex);
 			m_wake.wait(lock, [&] { return m_restart || m_quit; });
@@ -300,6 +348,7 @@ void DrawSpeculator::Run() {
 				return;
 			}
 			m_restart = false;
+			m_restart_pending.store(false, std::memory_order_relaxed);
 			std::swap(m_snapshot, m_spare);
 		}
 		// The GPU thread fills the other snapshot meanwhile.
@@ -478,8 +527,15 @@ void DrawSpeculator::Walk(CommandProcessor& shadow, std::vector<Cursor> stack, u
 			}
 			default:
 				if (IsDrawPacket(opcode)) {
-					if (seq < m_gpu_next.load(std::memory_order_acquire)) {
-						// Behind the GPU thread: not worth speculating.
+					// Preparing a draw takes the walk about as long as the GPU thread takes for one,
+					// so a draw the GPU thread is about to reach is lost to it: skip such draws, and
+					// the walk gets ahead after a restart instead of racing for the next draw each
+					// time. KYTY_DEBUG_AB=speclead races for every draw not yet reached in every
+					// other window.
+					static const bool lead_ab = AbSelected("speclead");
+					const uint64_t    lead    = lead_ab && AbFeatureOff() ? 0u : SpeculationLead;
+					if (seq < m_gpu_next.load(std::memory_order_acquire) + lead) {
+						// Behind the GPU thread, or too close to it: not worth speculating.
 						m_stats.behind.fetch_add(1, std::memory_order_relaxed);
 					} else if (opcode != Pm4::IT_DISPATCH_DRAW_PREAMBLE) {
 						auto* slot = AcquireSlot(seq, epoch);
@@ -487,6 +543,9 @@ void DrawSpeculator::Walk(CommandProcessor& shadow, std::vector<Cursor> stack, u
 							return;
 						}
 						m_stats.walked.fetch_add(1, std::memory_order_relaxed);
+						// Before any read (acquire loads): see ReadsCurrent.
+						slot->draw.read_epoch = m_renderer.CurrentBdaEpoch();
+						slot->draw.read_after = m_gpu_next.load(std::memory_order_acquire);
 						if (pipelines.SpeculateGraphicsPrograms(shadow.m_ctx, shadow.m_sh_ctx,
 						                                        shadow.m_ucfg, buffers, slot->draw)) {
 							slot->epoch  = epoch;

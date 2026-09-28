@@ -554,6 +554,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	g_allocation_counters.game_buffers_joined.fetch_add(1, std::memory_order_relaxed);
 	DeleteBuffer(overlap_id);
 }
 
@@ -563,6 +564,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
+	g_allocation_counters.game_buffers_created.fetch_add(1, std::memory_order_relaxed);
 
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
@@ -982,6 +984,7 @@ void BufferCache::RunGarbageCollector() {
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			g_allocation_counters.game_buffers_collected.fetch_add(1, std::memory_order_relaxed);
 			DeleteBuffer(id);
 		}
 		return ++retire_count == limit;
@@ -1002,6 +1005,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT("BufferCache: garbage collection retained GPU ownership\n");
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		g_allocation_counters.game_buffers_collected.fetch_add(1, std::memory_order_relaxed);
 		Unregister(id);
 		m_slot_buffers.erase(id);
 	}

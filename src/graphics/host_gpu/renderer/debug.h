@@ -37,7 +37,11 @@ inline RenderDebugCounters g_render_debug_counters;
 // streamreuse (a range copied into the stream ring earlier in the BDA epoch bound again),
 // metamemo (the last depth surface clear-state answer kept without the texture cache lock),
 // storagereuse (a clean storage image keeping its view between draws), rangememo (range
-// generations kept while the whole image set is unchanged).
+// generations kept while the whole image set is unchanged), budgetcache (VMA's memory budget
+// fetched from the driver at most every 500 ms), specspin (the draw speculation thread spinning
+// for a restart before sleeping), speclead (draws within SpeculationLead of the GPU thread left to
+// it), specreads (a speculation's guest reads kept without making them again while its BDA epoch
+// lasts and nothing became GPU-written).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 // KYTY_DEBUG_FULL_BARRIERS=1: every draw and dispatch waits for all earlier GPU work and sees all
 // its memory writes (RecordFullBarrier). Slow; it tells synchronization bugs (a result that changes)
@@ -49,8 +53,11 @@ void               RecordFullBarrier(vk::CommandBuffer command) noexcept;
 inline std::atomic<uint64_t> g_gpu_busy_ns {0};
 // GPU buffers and images created and destroyed, for the draw-phases line's allocation churn.
 struct AllocationCounters {
-	std::atomic<uint64_t> buffers_created {0};
+	std::atomic<uint64_t> buffers_created {0}; // Every Buffer, temporary staging included.
 	std::atomic<uint64_t> buffers_destroyed {0};
+	std::atomic<uint64_t> game_buffers_created {0};   // BufferCache::CreateBuffer.
+	std::atomic<uint64_t> game_buffers_joined {0};    // Merged into a larger one (JoinOverlap).
+	std::atomic<uint64_t> game_buffers_collected {0}; // Deleted by garbage collection.
 	std::atomic<uint64_t> images_created {0};
 	std::atomic<uint64_t> images_destroyed {0};
 };
