@@ -1062,11 +1062,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    m_speculator != nullptr && IsDrawOpcode(opcode) && DrawSpeculator::Enabled();
 		if (speculated) {
 			t_speculated_draw = m_speculator->Take(packet);
-			// KYTY_DEBUG_AB=specprefetch skips the prefetch in every other window.
-			static const bool ab_prefetch = AbSelected("specprefetch"); // AB-TEMP
-			if (t_speculated_draw != nullptr && !(ab_prefetch && AbFeatureOff())) {
-				PrefetchSpeculatedDraw(*t_speculated_draw);
-			}
 		}
 		uint64_t handler_start = 0;
 		if (timed) [[unlikely]] {

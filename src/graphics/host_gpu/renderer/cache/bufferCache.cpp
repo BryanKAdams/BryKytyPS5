@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -631,6 +632,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// Copying on several threads measured no faster (A/B 2026-09-28): the staging memory's
+		// write bandwidth, not one thread's latency, bounds it.
+		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::UploadCopy);
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);

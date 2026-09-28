@@ -1492,6 +1492,35 @@ static void CaptureGraphicsStageRegisters(
 	registers.pixel_active     = pixel_active;
 }
 
+// Whether the live registers would capture to the same bytes as `captured`
+// (CaptureGraphicsStageRegisters), compared in place instead of through a copy.
+static bool SameGraphicsStageRegisters(
+    const GraphicsStageRegisters& captured, const HW::VertexShaderInfo& vertex_regs,
+    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+    const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    bool pixel_active) {
+	const auto same = [](const auto& a, const auto& b) {
+		static_assert(sizeof(a) == sizeof(b));
+		return std::memcmp(&a, &b, sizeof(a)) == 0;
+	};
+	const auto& viewport = context.GetScreenViewport().viewports[0];
+	const std::array<float, 4> viewport0 {viewport.xscale, viewport.yscale, viewport.xoffset,
+	                                      viewport.yoffset};
+	return captured.shader_stages == context.GetShaderStages() &&
+	       captured.prim_type == static_cast<uint32_t>(user_config.GetPrimType()) &&
+	       captured.pixel_active == pixel_active &&
+	       captured.rt0_blend_bypass == context.GetRenderTarget(0).info.blend_bypass &&
+	       same(captured.viewport0, viewport0) && same(captured.vertex, vertex_regs) &&
+	       same(captured.pixel, pixel_regs) && same(captured.shader, sh) &&
+	       same(captured.blend0, context.GetBlendControl(0)) &&
+	       same(captured.clip, context.GetClipControl()) &&
+	       same(captured.mode, context.GetModeControl()) &&
+	       same(captured.ge, user_config.GetGeControl()) &&
+	       std::memcmp(captured.export_mapping.data(), target_export_mapping.data(),
+	                   sizeof(captured.export_mapping)) == 0;
+}
+
 // GetGraphicsPrograms' stage inputs and lookup parameters for these registers.
 static std::array<ShaderParams, 3> PrepareGraphicsStages(
     const GraphicContext& graphics, const HW::VertexShaderInfo& vertex_regs,
@@ -1590,10 +1619,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 		const bool unchanged = [&] {
 			DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::InputsCheck);
-			thread_local GraphicsStageRegisters registers;
-			CaptureGraphicsStageRegisters(registers, vertex_regs, pixel_regs, sh, context,
-			                              user_config, target_export_mapping, pixel_active);
-			return std::memcmp(&registers, &prepared.registers, sizeof(registers)) == 0 &&
+			return SameGraphicsStageRegisters(prepared.registers, vertex_regs, pixel_regs, sh,
+			                                  context, user_config, target_export_mapping,
+			                                  pixel_active) &&
 			       ShaderMapVersion() == prepared.shader_map_version &&
 			       VertexTableReadsUnchanged(prepared.vertex_tables);
 		}();
