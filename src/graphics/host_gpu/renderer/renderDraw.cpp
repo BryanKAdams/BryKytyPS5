@@ -34,6 +34,8 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -45,10 +47,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -1354,6 +1358,71 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// KYTY_DEBUG_IMAGE_USERS=<guest address, hex> prints, every 5 s, each kind of draw that binds an
+// image over that address: the pixel and vertex shaders, how the image is bound (texture,
+// storage, color or depth target, with the stage and slot), and its format, size and view. It
+// finds the shaders reading a given surface and whether a draw also renders to it.
+static uint64_t ImageUsersAddress() {
+	static const uint64_t address = [] {
+		const char* text = std::getenv("KYTY_DEBUG_IMAGE_USERS");
+		return text != nullptr ? std::strtoull(text, nullptr, 16) : uint64_t {0};
+	}();
+	return address;
+}
+
+bool ImageUsersEnabled() {
+	return ImageUsersAddress() != 0;
+}
+
+void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stages,
+                    std::span<const RenderColorInfo> colors, const RenderDepthInfo* depth,
+                    uint64_t pixel_hash, uint64_t vertex_hash) {
+	static std::map<std::string, uint64_t> counts;
+	static auto window_start = std::chrono::steady_clock::now();
+	const auto  address      = ImageUsersAddress();
+	const auto  note         = [&](const char* role, uint32_t stage, uint32_t slot, ImageId id,
+                              const ImageViewInfo& view) {
+		if (!id) {
+			return;
+		}
+		const auto& image = cache.GetImage(id);
+		if (address < image.info.data.address || address >= image.info.data.End()) {
+			return;
+		}
+		counts[fmt::format("ps={:016x} vs={:016x} {} stage={} slot={} image=0x{:x}+0x{:x} {} "
+		                   "{}x{} view={}+{} layers {}+{}",
+		                   pixel_hash, vertex_hash, role, stage, slot, image.info.data.address,
+		                   image.info.data.size, vk::to_string(image.info.pixel_format),
+		                   image.info.extent.width, image.info.extent.height, view.base_level,
+		                   view.level_count, view.base_layer, view.layer_count)]++;
+	};
+	for (const auto* stage: stages) {
+		const auto stage_type = static_cast<uint32_t>(stage->runtime->program->stage);
+		for (uint32_t i = 0; i < stage->images.size(); i++) {
+			const auto& binding = stage->images[i];
+			note(binding.desc.type == TextureCache::BindingType::Storage ? "storage" : "texture",
+			     stage_type, i, binding.image_id, binding.desc.view_info);
+		}
+	}
+	for (const auto& color: colors) {
+		note("color", 0, color.target_slot, color.image_id, color.desc.view_info);
+	}
+	if (depth != nullptr) {
+		note("depth", 0, 0, depth->image_id, depth->desc.view_info);
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - window_start < std::chrono::seconds(5)) {
+		return;
+	}
+	window_start = now;
+	std::printf("image-users 0x%" PRIx64 ": %zu kinds\n", address, counts.size());
+	for (const auto& [key, count]: counts) {
+		std::printf("image-users   %6" PRIu64 " %s\n", count, key.c_str());
+	}
+	std::fflush(stdout);
+	counts.clear();
+}
+
 // KYTY_DEBUG_MESH_RESTART=0 draws a mesh-emulated strip or fan with primitive restart as one
 // draw, reading its restart markers as vertices, as before restart was handled there.
 static bool MeshRestartSplitEnabled() {
@@ -1559,6 +1628,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                            state.depth_info, feedback_aspects, stages);
 	g_draw_phases.Mark(DrawPhaseTimer::RenderTargets);
+	if (ImageUsersEnabled()) [[unlikely]] {
+		NoteImageUsers(m_context.GetTextureCache(), stages,
+		               std::span<const RenderColorInfo> {state.color_info, state.color_count},
+		               &state.depth_info,
+		               state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+		               state.vertex_info[0].stage.program->shader_hash);
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}

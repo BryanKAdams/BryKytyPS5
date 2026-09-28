@@ -378,6 +378,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	if (ImageUsersEnabled()) [[unlikely]] {
+		PreparedBindings* const compute_stages[] {&bindings};
+		NoteImageUsers(m_context.GetTextureCache(), compute_stages, {}, nullptr, 0,
+		               input_info.stage.program->shader_hash);
+	}
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
@@ -444,6 +449,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	if (ImageUsersEnabled()) [[unlikely]] {
+		PreparedBindings* const compute_stages[] {&bindings};
+		NoteImageUsers(m_context.GetTextureCache(), compute_stages, {}, nullptr, 0,
+		               input_info.stage.program->shader_hash);
+	}
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);

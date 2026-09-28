@@ -39,6 +39,13 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
+// KYTY_DEBUG_IMAGE_USERS=<guest address> (see renderDraw.cpp): whether it is set, and a draw's or
+// dispatch's bindings to count (pixel_hash 0 and no targets for a dispatch).
+[[nodiscard]] bool ImageUsersEnabled();
+void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stages,
+                    std::span<const RenderColorInfo> colors, const RenderDepthInfo* depth,
+                    uint64_t pixel_hash, uint64_t vertex_hash);
+
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
