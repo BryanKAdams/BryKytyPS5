@@ -234,7 +234,11 @@ void CommandScheduler::Wait(uint64_t tick) {
 	}
 }
 
-void CommandScheduler::PopPendingOperations() {
+void CommandScheduler::PopPendingOperations(bool wait_for_priority) {
+	// KYTY_DEBUG_AB=prioritywait: draw and dispatch entry wait as the draining callers do, in
+	// alternate windows.
+	static const bool wait_ab = AbSelected("prioritywait");
+	wait_for_priority |= wait_ab && AbFeatureOff();
 	// Draws arrive every few microseconds, the GPU completes submissions every few milliseconds,
 	// and no one waits on these operations (deletions, recycling, fault processing): query the
 	// GPU's progress at most once per interval. IsFree and the command pool query on demand.
@@ -253,10 +257,19 @@ void CommandScheduler::PopPendingOperations() {
 			    !m_master.IsFree(m_pending_operations.front().tick)) {
 				return;
 			}
+			const auto tick = m_pending_operations.front().tick;
+			if (!wait_for_priority &&
+			    ((m_priority_active && m_priority_active_tick <= tick) ||
+			     (!m_priority_operations.empty() && m_priority_operations.front().tick <= tick))) {
+				// The priority thread is still publishing this tick: a later call runs it.
+				return;
+			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
-		WaitPriorityOperations(operation.tick);
+		if (wait_for_priority) {
+			WaitPriorityOperations(operation.tick);
+		}
 		RunOperation(std::move(operation.callback));
 	}
 }
