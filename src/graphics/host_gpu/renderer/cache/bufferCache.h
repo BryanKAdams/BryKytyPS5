@@ -52,12 +52,14 @@ public:
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
-			case MemoryUsage::Stream: return m_stream_buffer;
+			case MemoryUsage::Stream: return ActiveStream();
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
+	// The ring that per-draw stream copies go to (see bufferCache.cpp).
+	[[nodiscard]] StreamBuffer& ActiveStream() noexcept;
 	// Device-addressable ring for per-draw parameter records that shaders load by address.
 	[[nodiscard]] StreamBuffer& GetDrawRecordBuffer() noexcept { return m_draw_record_buffer; }
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
@@ -157,6 +159,8 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	StreamBuffer                                      m_draw_record_buffer;
+	// KYTY_DEBUG_AB=streamhost: a stream ring in device memory for the A/B (see ActiveStream).
+	std::unique_ptr<StreamBuffer> m_stream_device;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

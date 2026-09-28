@@ -3658,6 +3658,7 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 }
 
 int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp) {
+	COUNT_CALL();
 	// Called constantly by Python frame/timer code.
 
 	if (tp == nullptr) {
@@ -3689,6 +3690,7 @@ int KYTY_SYSV_ABI KernelClockGettime(KernelClockid clock_id, KernelTimespec* tp)
 }
 
 int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
+	COUNT_CALL();
 	// PRINT_NAME();
 
 	if (tp == nullptr) {
@@ -3807,14 +3809,17 @@ int KYTY_SYSV_ABI KernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_t
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetTscFrequency() {
+	COUNT_CALL();
 	return KernelGetTscFrequencyNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelReadTsc() {
+	COUNT_CALL();
 	return KernelReadTscNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
+	COUNT_CALL();
 	const auto frequency = KernelGetTscFrequencyNative();
 	if (frequency == 0) {
 		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
@@ -3826,10 +3831,12 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {
+	COUNT_CALL();
 	return KernelGetElapsedTsc();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency() {
+	COUNT_CALL();
 	return KernelGetTscFrequencyNative();
 }
 
@@ -3844,6 +3851,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	COUNT_CALL();
 	Common::Timer t;
 	t.Start();
 	SleepMicroWithSignalPoll(microseconds);
@@ -3864,6 +3872,7 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	COUNT_CALL();
 	PRINT_NAME();
 
 	if (rqtp == nullptr) {

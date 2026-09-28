@@ -75,6 +75,36 @@ static void LogTimestampWrite(const char* kind, uint32_t event, uint64_t dst, ui
 // values never drift from it by more than a frame's stretch.
 static std::atomic<uint64_t> g_timestamp_anchor {0};
 
+// Debugging aid: KYTY_DEBUG_FRAME_LIMIT_MS=<ms> makes each flip wait until <ms> have passed since
+// the previous one, as a slow render thread would, to see how the game's timing copes with low
+// frame rates. With KYTY_DEBUG_FRAME_LIMIT_FILE=<path> it applies only while that file exists.
+static void DebugFrameLimit() {
+	static const double limit_ms = [] {
+		const char* value = std::getenv("KYTY_DEBUG_FRAME_LIMIT_MS");
+		return value != nullptr ? std::atof(value) : 0.0;
+	}();
+	if (limit_ms <= 0.0) {
+		return;
+	}
+	static const char* file   = std::getenv("KYTY_DEBUG_FRAME_LIMIT_FILE");
+	static uint32_t    flips  = 0;
+	static bool        active = false;
+	if (flips++ % 15 == 0) {
+		FILE* probe = file != nullptr ? std::fopen(file, "rb") : nullptr;
+		active      = file == nullptr || probe != nullptr;
+		if (probe != nullptr) {
+			std::fclose(probe);
+		}
+	}
+	static auto last = std::chrono::steady_clock::now();
+	if (active) {
+		std::this_thread::sleep_until(
+		    last + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		               std::chrono::duration<double, std::milli>(limit_ms)));
+	}
+	last = std::chrono::steady_clock::now();
+}
+
 static uint64_t GuestGpuTimestamp() {
 	const uint64_t percent = Config::GetGpuTimestampScalePercent();
 	const auto     now     = Sync::ReadReferenceClock();
@@ -1974,6 +2004,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip() {
+	DebugFrameLimit();
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
@@ -1990,6 +2021,7 @@ void CommandProcessor::Flip() {
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
+	DebugFrameLimit();
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -2010,6 +2042,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
                                          void* dst_gpu_addr, uint32_t value) {
+	DebugFrameLimit();
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {

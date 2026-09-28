@@ -542,6 +542,7 @@ void CommandScheduler::ReadTimestamps(uint32_t slot) {
 	const auto from = std::max(start, m_gpu_last_end);
 	if (end > from) {
 		DrainStats::Record(DrainStats::Kind::GpuBusy, to_ns(end - from));
+		g_gpu_busy_ns.fetch_add(to_ns(end - from), std::memory_order_relaxed);
 	}
 	m_gpu_last_end = std::max(m_gpu_last_end, end);
 }
