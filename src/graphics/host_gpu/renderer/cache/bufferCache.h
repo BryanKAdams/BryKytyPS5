@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <chrono>
 #include <deque>
 #include <map>
 #include <span>
@@ -213,6 +214,14 @@ private:
 	std::vector<StreamCopy> m_stream_copies = std::vector<StreamCopy>(StreamCopySlots);
 	// KYTY_VERIFY_STREAM_REUSE=1: whether to copy again anyway (after comparing; see there).
 	[[nodiscard]] static bool VerifyStreamReuse(const StreamCopy& copy);
+	// ObtainBufferForImage's staged uploads, by range, with the time of the latest.
+	struct ImageStage {
+		uint64_t                              vaddr = 0;
+		uint64_t                              size  = 0;
+		std::chrono::steady_clock::time_point time {};
+	};
+	std::array<ImageStage, 256> m_image_stages {};
+	[[nodiscard]] bool          IsRepeatedImageStage(uint64_t vaddr, uint64_t size);
 };
 
 } // namespace Libs::Graphics

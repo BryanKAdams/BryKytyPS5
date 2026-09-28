@@ -790,6 +790,26 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+// Streamed textures (Sky Garden: 2048x2048 and 4096x4096 BC textures, 5-22 MB) are written by
+// the CPU a part at a time, and each draw that finds one changed re-uploads it whole, several
+// times a second, though only ~1-6% of its bytes changed (KYTY_DEBUG_UPLOADS, 2026-09-28). From
+// the second staged upload of a range within two seconds on, a buffer holds the range instead:
+// the memory tracker then copies only the pages written since, and the image uploads from the
+// buffer. KYTY_DEBUG_AB=imagebuf stages every upload in alternate windows.
+bool BufferCache::IsRepeatedImageStage(uint64_t vaddr, uint64_t size) {
+	static constexpr uint64_t MinSize = 1024 * 1024;
+	static constexpr auto     Window  = std::chrono::seconds(2);
+	static const bool         ab      = AbSelected("imagebuf");
+	if (size < MinSize || (ab && AbFeatureOff())) {
+		return false;
+	}
+	const auto now   = std::chrono::steady_clock::now();
+	auto&      stage = m_image_stages[(vaddr >> 16u) % m_image_stages.size()];
+	const bool hit   = stage.vaddr == vaddr && stage.size == size && now - stage.time <= Window;
+	stage            = {.vaddr = vaddr, .size = size, .time = now};
+	return hit;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
@@ -804,7 +824,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}
-	if (IsRegionGpuModified(vaddr, size)) {
+	if (IsRegionGpuModified(vaddr, size) || IsRepeatedImageStage(vaddr, size)) {
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
