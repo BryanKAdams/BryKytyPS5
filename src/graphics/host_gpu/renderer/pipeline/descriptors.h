@@ -61,6 +61,14 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	std::vector<uint32_t>                 shader_data;
+	// KYTY_DEBUG_DRAW_PHASES: the previous draw's program and descriptor hashes (see
+	// NoteBindingRepeat).
+	struct RepeatKey {
+		const void* program  = nullptr;
+		uint64_t    images   = 0;
+		uint64_t    buffers  = 0;
+		uint64_t    samplers = 0;
+	} repeat_key;
 };
 
 [[nodiscard]] vk::DescriptorType
