@@ -676,6 +676,53 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+// KYTY_VERIFY_DEPTH_REUSE=1: a draw that keeps its depth target's view acquires it anyway and
+// reports what the full acquisition changed or returned differently (see IsDepthTargetCurrent).
+static bool VerifyDepthReuse() {
+	static const bool enabled = std::getenv("KYTY_VERIFY_DEPTH_REUSE") != nullptr;
+	return enabled;
+}
+
+static void CheckDepthReuse(TextureCache& cache, const RenderDepthInfo& depth,
+                            vk::ImageView kept) {
+	const auto& image           = cache.GetImage(depth.image_id);
+	const bool  gpu_modified    = image.IsGpuModified();
+	const bool  depth_target    = image.usage.depth_target;
+	const bool  buffer_modified = image.IsBufferModified();
+	const bool  cpu_dirty       = image.IsCpuDirty();
+	const auto  stencil         = image.info.stencil;
+	const auto  metadata        = image.info.metadata;
+	const auto  meta_generation = cache.SurfaceMetaGeneration();
+	const auto  set_generation  = cache.ImageSetGeneration();
+	const auto  view            = cache.FindDepthTarget(depth.image_id, depth.desc);
+	const auto& after           = cache.GetImage(depth.image_id);
+	const char* field           = nullptr;
+	if (view != kept) {
+		field = "view";
+	} else if (after.IsGpuModified() != gpu_modified || after.usage.depth_target != depth_target) {
+		field = "gpu-modified or usage";
+	} else if (after.IsBufferModified() != buffer_modified || after.IsCpuDirty() != cpu_dirty) {
+		field = "dirty state";
+	} else if (!(after.info.stencil == stencil) || !(after.info.metadata == metadata)) {
+		field = "stencil or metadata";
+	} else if (cache.SurfaceMetaGeneration() != meta_generation ||
+	           cache.ImageSetGeneration() != set_generation) {
+		field = "surface metadata or image set";
+	}
+	static std::atomic<uint64_t> checked {0};
+	static std::atomic<uint64_t> missed {0};
+	const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (field != nullptr && missed.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("depth-reuse verify: 0x%016" PRIx64 " kept view would have missed a change: %s\n",
+		            image.info.data.address, field);
+	}
+	if (count % 100000 == 0) {
+		std::printf("depth-reuse verify: reuses=%" PRIu64 " missed=%" PRIu64 "\n", count,
+		            missed.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+	}
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -748,6 +795,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    cache.IsDepthTargetCurrent(depth.image_id, acquired.view_generation,
 		                               acquired.view_meta_generation, depth.desc)) {
 			image_view = acquired.view;
+			if (VerifyDepthReuse()) [[unlikely]] {
+				CheckDepthReuse(cache, depth, image_view);
+			}
 		} else {
 			// Both generations from before the acquisition: its own changes make the next draw
 			// acquire again rather than trust a state it did not check.

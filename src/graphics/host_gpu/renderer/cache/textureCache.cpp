@@ -1755,6 +1755,33 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 				break;
 			}
 		}
+		// KYTY_VERIFY_IMAGE_MEMO=1: a remembered lookup is looked up again and must agree.
+		static const bool verify_memo = std::getenv("KYTY_VERIFY_IMAGE_MEMO") != nullptr;
+		if (remembered != nullptr && verify_memo) [[unlikely]] {
+			const auto remembered_id = remembered->id;
+			lookup();
+			const bool same = result == remembered_id && backing_matches == 1 && view_mip < 0 &&
+			                  view_layer < 0;
+			static std::atomic<uint64_t> checked {0};
+			static std::atomic<uint64_t> missed {0};
+			const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (!same && missed.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::printf("image-memo verify: 0x%016" PRIx64 " size 0x%" PRIx64
+				            " remembered a different lookup (matches %d, mip %d, layer %d)\n",
+				            desc.info.data.address, desc.info.data.size, backing_matches, view_mip,
+				            view_layer);
+			}
+			if (count % 100000 == 0) {
+				std::printf("image-memo verify: hits=%" PRIu64 " missed=%" PRIu64 "\n", count,
+				            missed.load(std::memory_order_relaxed));
+				std::fflush(stdout);
+			}
+			// Go on with the lookup's own result, as without the memo.
+			remembered = nullptr;
+			if (!same) {
+				result = {};
+			}
+		}
 		if (remembered != nullptr) {
 			remembered->last_use = ++m_image_lookup_clock;
 			result               = remembered->id;
