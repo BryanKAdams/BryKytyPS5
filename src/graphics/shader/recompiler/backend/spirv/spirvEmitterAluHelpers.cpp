@@ -100,22 +100,24 @@ uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	return ret;
 }
 
-F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
+// OpIsNan holds for every NaN encoding, signaling ones included, and is one comparison where the
+// exponent and mantissa tests took five instructions: the module preserves NaN
+// (SignedZeroInfNanPreserve), so the driver may not fold it away.
+static F32Class EmitClassifyF32Value(EmitterState& state, uint32_t value, uint32_t bits) {
 	F32Class cls;
-	cls.bits                 = bits;
-	const auto abs_bits      = EmitAndConstant(state, cls.bits, 0x7fffffffu);
-	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
-	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
-	const auto exponent_max =
-	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0x7f800000u);
-	const auto mantissa_nonzero = EmitCompareU32Constant(state, spv::OpINotEqual, mantissa_bits, 0);
-	cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
-	cls.zero                    = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
+	cls.bits = bits;
+	cls.nan  = Unary(state, spv::OpIsNan, TypeBool(state), value);
+	cls.zero = EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, bits, 0x7fffffffu),
+	                                  0);
 	return cls;
 }
 
+F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
+	return EmitClassifyF32Value(state, EmitBitcastU32ToF32(state, bits), bits);
+}
+
 F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
-	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
+	return EmitClassifyF32Value(state, value, EmitBitcastF32ToU32(state, value));
 }
 
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
@@ -188,7 +190,10 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	const auto ordered_bits =
 	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
 
-	const auto both_zero    = EmitLogicalAndBool(state, lhs_class.zero, rhs_class.zero);
+	// Both are zeros when neither has a bit set besides the sign.
+	const auto both_zero    = EmitCompareU32Constant(
+	    state, spv::OpIEqual,
+	    EmitAndConstant(state, EmitOrU32(state, lhs_class.bits, rhs_class.bits), 0x7fffffffu), 0);
 	const auto zero_bits    = max_value ? EmitAndU32(state, lhs_class.bits, rhs_class.bits)
 	                                    : EmitOrU32(state, lhs_class.bits, rhs_class.bits);
 	const auto numeric_bits = EmitSelectValueU32(state, both_zero, zero_bits, ordered_bits);
