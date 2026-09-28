@@ -1036,7 +1036,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
-	prepared.buffer_sources.clear();
+	// buffer_sources keeps the previous draw's entries of this program's slots for FindBuffers,
+	// which replaces them all.
+	prepared.buffer_sources.resize(program.info.buffers.size());
 	prepared.buffers.clear();
 	prepared.images.resize(program.info.images.size());
 	prepared.image_sources.resize(program.info.images.size());
@@ -1085,18 +1087,23 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot = *prepared.runtime->resources;
 	auto&       cache    = m_context.GetBufferCache();
 
-	prepared.buffer_sources.clear();
-	prepared.buffer_sources.reserve(program.info.buffers.size());
+	// The previous draw's sources of this stage: consecutive draws mostly bind buffers the same
+	// cached buffer still covers, which RefindBuffer confirms without the page table.
+	auto& sources = prepared.buffer_sources;
+	const auto previous_count = sources.size();
+	sources.resize(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
 		const auto address = descriptor.Base48();
 		const auto requested_size = descriptor.GetSize();
 		if (address == 0 || requested_size == 0) {
-			prepared.buffer_sources.push_back({});
+			sources[i] = {};
 			continue;
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
-		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		const auto id   = i < previous_count && sources[i].id ? sources[i].id : BufferId {};
+		sources[i]      = {address, size,
+		                   id ? cache.RefindBuffer(id, address, size) : cache.FindBuffer(address, size)};
 	}
 }
 

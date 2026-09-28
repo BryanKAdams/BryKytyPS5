@@ -45,6 +45,13 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// FindBuffer, keeping `id` while it is a live buffer covering the range (as ObtainBuffer does):
+	// buffers never overlap, so a live buffer over the range is the one FindBuffer would find.
+	[[nodiscard]] BufferId RefindBuffer(BufferId id, uint64_t vaddr, uint64_t size) {
+		return !IsBufferInvalid(id) && m_slot_buffers[id].IsInBounds(vaddr, size)
+		           ? id
+		           : FindBuffer(vaddr, size);
+	}
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
