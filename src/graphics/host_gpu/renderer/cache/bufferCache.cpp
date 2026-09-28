@@ -18,6 +18,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
@@ -663,6 +664,46 @@ StreamBuffer& BufferCache::ActiveStream() noexcept {
 	return m_stream_device != nullptr && AbFeatureOff() ? *m_stream_device : m_stream_buffer;
 }
 
+// KYTY_DEBUG_STREAM_REUSE=0 copies every stream range every time; KYTY_DEBUG_AB=streamreuse
+// alternates.
+static bool StreamReuseEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DEBUG_STREAM_REUSE");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	static const bool ab = AbSelected("streamreuse");
+	return enabled && !(ab && AbFeatureOff());
+}
+
+// With KYTY_VERIFY_STREAM_REUSE=1 a copy that would be bound again is compared with the guest
+// memory it came from, and the range is copied again as without reuse. It reports how often the
+// bytes changed within the epoch: the draws that reuse would have shown older CPU writes.
+bool BufferCache::VerifyStreamReuse(const StreamCopy& copy) {
+	static const bool verify = std::getenv("KYTY_VERIFY_STREAM_REUSE") != nullptr;
+	if (!verify) {
+		return false;
+	}
+	thread_local std::vector<uint8_t> bytes;
+	bytes.resize(copy.size);
+	const bool  read = Libs::LibKernel::Memory::TryReadBacking(copy.vaddr, bytes.data(), copy.size);
+	const auto* kept = copy.stream->Mapped().data() + copy.offset;
+	static std::atomic<uint64_t> checked {0};
+	static std::atomic<uint64_t> changed {0};
+	const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((!read || std::memcmp(bytes.data(), kept, copy.size) != 0) &&
+	    changed.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("stream-reuse verify: 0x%016" PRIx64 " size 0x%" PRIx64
+		            " changed within the epoch\n",
+		            copy.vaddr, copy.size);
+	}
+	if (count % 100000 == 0) {
+		std::printf("stream-reuse verify: reuses=%" PRIu64 " changed=%" PRIu64 "\n", count,
+		            changed.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+	}
+	return true;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -674,6 +715,26 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// Draws bind most buffers read-only and unchanged since their last upload: the lock-free
 	// summary then answers what the locked tracker passes below would find (nothing to copy).
 	const bool cpu_clean = !is_written && m_memory_tracker.IsRegionCpuCleanHint(vaddr, size);
+	// Draws of one BDA epoch need not see CPU writes made during it (see
+	// RenderContext::PrepareBda), so a range this epoch already copied into the stream ring is
+	// bound again rather than copied again (Sky Garden binds most such ranges several times an
+	// epoch): while the copy's command buffer is current and no buffer or image became
+	// GPU-written since. KYTY_DEBUG_STREAM_REUSE=0 copies every time.
+	StreamCopy* copy_slot = nullptr;
+	uint64_t    epoch     = 0;
+	if (!is_written && !cpu_clean && size <= CACHING_PAGESIZE && StreamReuseEnabled()) {
+		epoch     = m_scheduler.Context().CurrentBdaEpoch();
+		copy_slot = &m_stream_copies[((vaddr >> 4u) ^ (vaddr >> 16u) ^ size) % StreamCopySlots];
+		const auto& copy = *copy_slot;
+		if (epoch != 0 && copy.epoch == epoch && copy.vaddr == vaddr && copy.size == size &&
+		    copy.tick == m_scheduler.CurrentTick() && copy.gpu_writes == m_gpu_dirty_generation &&
+		    copy.image_writes == m_texture_cache.GpuModifiedGeneration() &&
+		    copy.stream == &ActiveStream()) {
+			if (!VerifyStreamReuse(copy)) {
+				return {copy.stream, copy.offset};
+			}
+		}
+	}
 	if (!is_written && !cpu_clean && size <= CACHING_PAGESIZE &&
 	    m_memory_tracker.IsRegionOnlyCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
@@ -684,6 +745,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
 			stream.Commit();
 			RecordUpload(UploadSource::Stream, vaddr, size);
+			if (copy_slot != nullptr && epoch != 0) {
+				*copy_slot = {.vaddr        = vaddr,
+				              .size         = size,
+				              .epoch        = epoch,
+				              .tick         = m_scheduler.CurrentTick(),
+				              .gpu_writes   = m_gpu_dirty_generation,
+				              .image_writes = m_texture_cache.GpuModifiedGeneration(),
+				              .stream       = &stream,
+				              .offset       = offset};
+			}
 			return {&stream, offset};
 		}
 	}

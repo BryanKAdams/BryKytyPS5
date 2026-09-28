@@ -63,6 +63,8 @@ public:
 	// Starts a new epoch for PrepareBda (see there): the next draw that reads memory through
 	// addresses uploads every CPU write made so far.
 	void AdvanceBdaEpoch() noexcept { m_bda_epoch.fetch_add(1, std::memory_order_release); }
+	// The current epoch, or 0 while epochs are off (KYTY_DEBUG_BDA_EPOCH=0 and its A/B).
+	[[nodiscard]] uint64_t CurrentBdaEpoch() const noexcept;
 	// The GPU thread wrote guest memory itself: a page that is not write-protected takes the
 	// write without a fault, so the write starts an epoch.
 	void AdvanceBdaEpochForGpuWrite() noexcept;

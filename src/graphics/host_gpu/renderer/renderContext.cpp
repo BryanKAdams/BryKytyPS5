@@ -185,6 +185,10 @@ static bool BdaEpochEnabled() {
 	return enabled && !(ab && AbFeatureOff());
 }
 
+uint64_t RenderContext::CurrentBdaEpoch() const noexcept {
+	return BdaEpochEnabled() ? m_bda_epoch.load(std::memory_order_acquire) : 0;
+}
+
 // KYTY_DEBUG_AB=cpwrite alternates.
 void RenderContext::AdvanceBdaEpochForGpuWrite() noexcept {
 	static const bool ab = AbSelected("cpwrite");

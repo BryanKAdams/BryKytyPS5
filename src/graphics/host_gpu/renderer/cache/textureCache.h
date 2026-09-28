@@ -84,6 +84,10 @@ public:
 	[[nodiscard]] bool     IsDepthTargetCurrent(ImageId id, uint64_t generation,
 	                                            uint64_t meta_generation,
 	                                            const ImageDesc& desc) const noexcept;
+	// Bumped whenever an image becomes GPU-modified.
+	[[nodiscard]] uint64_t GpuModifiedGeneration() const noexcept {
+		return m_gpu_modified_generation.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] uint64_t SurfaceMetaGeneration() const noexcept {
 		return m_surface_meta_generation.load(std::memory_order_acquire);
 	}

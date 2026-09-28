@@ -191,6 +191,21 @@ private:
 	};
 	std::array<CleanPage, 64> m_clean_pages {};
 	uint64_t                  m_gpu_dirty_generation = 1;
+	// ObtainBuffer's stream-ring copies of the current BDA epoch, by range (see there).
+	struct StreamCopy {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t epoch        = 0; // 0: none.
+		uint64_t tick         = 0;
+		uint64_t gpu_writes   = 0; // m_gpu_dirty_generation.
+		uint64_t image_writes = 0; // TextureCache::GpuModifiedGeneration.
+		Buffer*  stream       = nullptr;
+		uint64_t offset       = 0;
+	};
+	static constexpr size_t StreamCopySlots = 4096;
+	std::vector<StreamCopy> m_stream_copies = std::vector<StreamCopy>(StreamCopySlots);
+	// KYTY_VERIFY_STREAM_REUSE=1: whether to copy again anyway (after comparing; see there).
+	[[nodiscard]] static bool VerifyStreamReuse(const StreamCopy& copy);
 };
 
 } // namespace Libs::Graphics
