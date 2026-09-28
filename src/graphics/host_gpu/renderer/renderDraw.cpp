@@ -646,17 +646,22 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_dual_export_enable || db.shader_execute_on_noop;
 }
 
-// Default-initialize it (`DrawRenderState state;`): value initialization would also zero the
-// three 10 KB vertex_info entries, which GetGraphicsPrograms prepares before any use.
+// The constructor leaves vertex_info unconstructed: GetGraphicsPrograms constructs the entries it
+// uses (ResetVertexInputInfo) before any use. Constructing all three on every draw cost the GPU
+// thread about 1.5% in Sky Garden.
 struct DrawRenderState {
+	DrawRenderState() {} // NOLINT(modernize-use-equals-default)
 	RenderDepthInfo       depth_info {};
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	uint32_t              color_count                              = 0;
 	bool                  ps_active                                = true;
-	std::array<ShaderVertexInputInfo, 3> vertex_info;
+	union {
+		std::array<ShaderVertexInputInfo, 3> vertex_info;
+	};
 	ShaderPixelInputInfo  ps_input_info {};
 	PipelineCache::GraphicsPrograms programs {};
 };
+static_assert(std::is_trivially_destructible_v<ShaderVertexInputInfo>);
 
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;

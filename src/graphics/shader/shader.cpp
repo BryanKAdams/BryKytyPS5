@@ -19,6 +19,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -435,6 +436,35 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
 
+	// The tables can share a tracker page with GPU-written data (Astro Bot's do, once a frame);
+	// read them without faulting on that page. One read per table covers the entries used: a
+	// read per attribute cost the GPU thread about 1.7% in Sky Garden.
+	uint32_t first_semantic = UINT32_MAX;
+	uint32_t last_semantic  = 0;
+	for (uint32_t i = 0; i < num_input_semantics; i++) {
+		first_semantic = std::min(first_semantic, uint32_t {input_semantics[i].semantic});
+		last_semantic  = std::max(last_semantic, uint32_t {input_semantics[i].semantic});
+	}
+	std::array<uint32_t, 256> attributes; // By semantic, from first_semantic.
+	if (num_input_semantics != 0) {
+		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(attrib + first_semantic),
+		                                        attributes.data(),
+		                                        (last_semantic - first_semantic + 1) * sizeof(uint32_t));
+	}
+	uint32_t first_index = UINT32_MAX;
+	uint32_t last_index  = 0;
+	for (uint32_t i = 0; i < num_input_semantics; i++) {
+		const uint32_t index = attributes[input_semantics[i].semantic - first_semantic] & 0x1fu;
+		first_index          = std::min(first_index, index);
+		last_index           = std::max(last_index, index);
+	}
+	std::array<uint32_t, 4 * ShaderVertexInputInfo::RES_MAX> sharps; // By index, from first_index.
+	if (num_input_semantics != 0) {
+		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(buffer + first_index * 4),
+		                                        sharps.data(),
+		                                        (last_index - first_index + 1) * 4 * sizeof(uint32_t));
+	}
+
 	for (uint32_t i = 0; i < num_input_semantics; i++) {
 		const auto& in = input_semantics[i];
 
@@ -443,11 +473,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
-		// The tables can share a tracker page with GPU-written data (Astro Bot's do, once a
-		// frame); read them without faulting on that page.
-		uint32_t attribute = 0;
-		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(&attrib[in.semantic]),
-		                                        &attribute, sizeof(attribute));
+		const uint32_t attribute = attributes[in.semantic - first_semantic];
 
 		if (debug_dump) {
 			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attribute);
@@ -460,9 +486,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
-		uint32_t sharp[4] {};
-		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(&buffer[index * 4]),
-		                                        sharp, sizeof(sharp));
+		const uint32_t* sharp = &sharps[(index - first_index) * 4];
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 

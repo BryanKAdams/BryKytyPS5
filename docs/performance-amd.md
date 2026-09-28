@@ -532,6 +532,13 @@ attribute lists (8 KB) are now left uninitialized: only the first `attr_num` ent
 The draw state is default-initialized, and `GetGraphicsPrograms` prepares each stage it uses
 before anything reads it.
 
+Their other fields (about 1.2 KB each, with strided initializers) were still constructed three
+times a draw, about 1.5% of Thread_Gpu. The draw state now leaves all three unconstructed, since
+`GetGraphicsPrograms` constructs each entry it uses (`ResetVertexInputInfo`). The vertex stage
+also read its attribute table and buffer table twice per attribute (1.7% of Thread_Gpu); it now
+reads the used range of each table once. In-run A/Bs on Sky Garden: `setup` 0.62 to 0.52 µs and
+`vs-params` 0.42 to 0.32 µs a draw.
+
 With `KYTY_DEBUG_DRAW_PHASES=all` on the level start with dense grass, base 11.83 us and new
 10.57 us per draw:
 
