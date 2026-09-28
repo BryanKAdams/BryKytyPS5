@@ -1471,11 +1471,20 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 			    ((every && every_buffer) ||
 			     (address >= source.address && address < source.address + source.size))) {
 				const auto& resource = program.info.buffers[i];
+				// The guest descriptor's own range fields, next to the range bound for it.
+				const auto descriptor =
+				    i < stage->runtime->resources->buffers.size()
+				        ? DecodeNativeDescriptor<ShaderBufferResource>(
+				              stage->runtime->resources->buffers[i])
+				        : ShaderBufferResource {};
 				counts[fmt::format("ps={:016x} vs={:016x} buffer stage={} slot={} range=0x{:x}+0x{:x}"
-				                   " written={} stored={} atomic={}",
+				                   " written={} stored={} atomic={} stride={} records=0x{:x} oob={}"
+				                   " swizzle={} fmt={}",
 				                   pixel_hash, vertex_hash, stage_type, i, source.address, source.size,
 				                   resource.written ? 1 : 0, resource.stored ? 1 : 0,
-				                   resource.atomic ? 1 : 0)]++;
+				                   resource.atomic ? 1 : 0, descriptor.Stride(), descriptor.NumRecords(),
+				                   descriptor.OutOfBounds(), descriptor.SwizzleEnabled() ? 1 : 0,
+				                   descriptor.RawFormat())]++;
 			}
 		}
 		for (uint32_t i = 0; i < stage->images.size(); i++) {
