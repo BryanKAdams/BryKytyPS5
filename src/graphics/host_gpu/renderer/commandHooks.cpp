@@ -406,22 +406,9 @@ struct CommandStream::Impl {
 	std::atomic<uint64_t> read {0};  // Consumer: bytes run.
 	std::atomic<uint64_t> signal {0};
 	std::atomic<bool>     sleeping {false};
-	// Held by the thread appending a packet. Recording into a command buffer is externally
-	// synchronized already; this also orders descriptor updates from the routing thread.
-	std::atomic<bool>     appending {false};
-	uint64_t              pending_write = 0; // Appending thread: bytes reserved, not yet published.
+	// Only the stream's owner (see Slot) appends.
+	uint64_t              pending_write = 0; // Owner: bytes reserved, not yet published.
 	uint64_t              wake_mark     = 0;
-
-	void BeginAppend() {
-		while (appending.exchange(true, std::memory_order_acquire)) {
-			while (appending.load(std::memory_order_relaxed)) {
-				_mm_pause();
-			}
-		}
-	}
-	void EndAppend() {
-		appending.store(false, std::memory_order_release);
-	}
 
 	// Reserves a packet of `bytes` (header and closure included) and returns its start.
 	uint8_t* Reserve(size_t bytes) {
@@ -453,11 +440,18 @@ struct CommandStream::Impl {
 		EXIT_IF(start != ring.data() + pending_write % RingBytes);
 		pending_write += bytes;
 		packets.store(packets.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-		// Sequentially consistent with the consumer's "sleeping, then check write", so a
-		// consumer about to sleep either sees this packet or is seen asleep.
-		write.store(pending_write, std::memory_order_seq_cst);
-		if (pending_write - wake_mark >= WakeBytes && sleeping.load(std::memory_order_seq_cst)) {
+		// A plain store: a consumer about to sleep is checked for only every WakeBytes (and on
+		// Wake and Drain), each after a fence ordering it with the consumer's "sleeping, then
+		// check write".
+		write.store(pending_write, std::memory_order_release);
+		if (pending_write - wake_mark >= WakeBytes) {
 			wake_mark = pending_write;
+			WakeIfSleeping();
+		}
+	}
+	void WakeIfSleeping() {
+		std::atomic_thread_fence(std::memory_order_seq_cst);
+		if (sleeping.load(std::memory_order_relaxed)) {
 			Signal();
 		}
 	}
@@ -477,10 +471,14 @@ struct CommandStream::Impl {
 
 // Streams by the command buffer each routes. A slot's stream is created once and kept for the
 // process, so any thread may look one up while a scheduler goes away.
+// The owner, the thread that routed last, is the stream's only producer: other threads recording
+// into the routed buffer wait for the stream and record directly. Routing happens where the
+// scheduler begins and submits buffers, which its users already order with their recording.
 struct CommandStream::Slot {
 	std::atomic<bool>                 in_use {false};
 	std::atomic<VkCommandBuffer>      buffer {VK_NULL_HANDLE};
 	std::atomic<CommandStream::Impl*> stream {nullptr};
+	std::atomic<const void*>          owner {nullptr};
 };
 
 namespace {
@@ -490,6 +488,8 @@ std::atomic<uint64_t>              g_fallback_calls {0};
 
 // The stream the current routed call appends to.
 thread_local CommandStream::Impl* t_stream = nullptr;
+// Identifies this thread as a slot's owner.
+thread_local const char t_owner_token = 0;
 // The stream this thread routes buffers through (it begins and submits them), if any.
 thread_local CommandStream::Slot* t_home = nullptr;
 // The stream this thread runs, if it is a consumer.
@@ -497,20 +497,36 @@ thread_local CommandStream::Impl* t_consuming = nullptr;
 
 // The stream `buffer` records through, if it is routed. The thread recording into a buffer owns
 // it (Vulkan requires external synchronization), so it sees the routing ordered before that.
-[[nodiscard]] CommandStream::Impl* StreamFor(VkCommandBuffer buffer) {
+[[nodiscard]] CommandStream::Slot* SlotFor(VkCommandBuffer buffer) {
 	if (buffer != VK_NULL_HANDLE) {
 		for (auto& slot: g_slots) {
 			if (slot.buffer.load(std::memory_order_relaxed) == buffer) {
-				return slot.stream.load(std::memory_order_relaxed);
+				return &slot;
 			}
 		}
 	}
 	return nullptr;
 }
 
+[[nodiscard]] CommandStream::Impl* StreamFor(VkCommandBuffer buffer) {
+	auto* slot = SlotFor(buffer);
+	return slot != nullptr ? slot->stream.load(std::memory_order_relaxed) : nullptr;
+}
+
+// Whether a call into `buffer` goes into the stream (t_stream). Another thread recording into a
+// routed buffer records directly, after what the stream holds.
 [[nodiscard]] bool Routed(VkCommandBuffer buffer) {
-	t_stream = StreamFor(buffer);
-	return t_stream != nullptr;
+	auto* slot = SlotFor(buffer);
+	if (slot == nullptr) {
+		return false;
+	}
+	t_stream = slot->stream.load(std::memory_order_relaxed);
+	if (slot->owner.load(std::memory_order_relaxed) == &t_owner_token) {
+		return true;
+	}
+	g_fallback_calls.fetch_add(1, std::memory_order_relaxed);
+	t_stream->Drain();
+	return false;
 }
 
 // A direct call on a thread that routes a stream: run everything queued first.
@@ -534,14 +550,12 @@ void DrainAll() {
 
 void CommandStream::Impl::Drain() {
 	// A consumer has already run everything before what it is running now.
-	const auto target = write.load(std::memory_order_seq_cst);
+	const auto target = write.load(std::memory_order_acquire);
 	if (t_consuming == this || read.load(std::memory_order_acquire) >= target) {
 		return;
 	}
 	drains.fetch_add(1, std::memory_order_relaxed);
-	if (sleeping.load(std::memory_order_seq_cst)) {
-		Signal();
-	}
+	WakeIfSleeping();
 	// The consumer takes a while to wake: waking it again on every spin would cost a kernel
 	// call each. Re-wake only now and then, for a consumer that went back to sleep.
 	for (uint32_t spins = 1; read.load(std::memory_order_acquire) < target; spins++) {
@@ -567,10 +581,7 @@ public:
 	Packet(CommandStream::Impl& stream, size_t array_bytes)
 	    : m_stream(stream), m_size(CommandStream::Impl::HeaderBytes + array_bytes +
 	                               CommandStream::Impl::ClosureBytes),
-	      m_start(Start(stream, m_size)), m_next(m_start + CommandStream::Impl::HeaderBytes) {}
-	~Packet() {
-		m_stream.EndAppend();
-	}
+	      m_start(stream.Reserve(m_size)), m_next(m_start + CommandStream::Impl::HeaderBytes) {}
 	KYTY_CLASS_NO_COPY(Packet);
 
 	template <typename T>
@@ -600,11 +611,6 @@ public:
 	}
 
 private:
-	static uint8_t* Start(CommandStream::Impl& stream, size_t bytes) {
-		stream.BeginAppend();
-		return stream.Reserve(bytes);
-	}
-
 	CommandStream::Impl& m_stream;
 	size_t               m_size;
 	uint8_t*             m_start;
@@ -709,7 +715,8 @@ VkResult VKAPI_PTR HookEndCommandBuffer(VkCommandBuffer buffer) {
 void VKAPI_PTR HookUpdateDescriptorSets(VkDevice device, uint32_t write_count,
                                         const VkWriteDescriptorSet* writes, uint32_t copy_count,
                                         const VkCopyDescriptorSet* copies) {
-	if (t_home != nullptr && t_home->buffer.load(std::memory_order_relaxed) != VK_NULL_HANDLE) {
+	if (t_home != nullptr && t_home->buffer.load(std::memory_order_relaxed) != VK_NULL_HANDLE &&
+	    t_home->owner.load(std::memory_order_relaxed) == &t_owner_token) {
 		// While this thread's stream records: in order with the binds recorded around it.
 		t_stream = t_home->stream.load(std::memory_order_relaxed);
 		Packet packet(*t_stream, WritesBytes(write_count, writes) +
@@ -1500,6 +1507,7 @@ CommandStream::~CommandStream() {
 void CommandStream::Route(VkCommandBuffer buffer) {
 	// The routing thread keeps its stream between buffers: its direct calls then drain it too.
 	t_home = m_slot;
+	m_slot->owner.store(&t_owner_token, std::memory_order_relaxed);
 	m_slot->buffer.store(buffer, std::memory_order_release);
 }
 
@@ -1514,9 +1522,7 @@ void CommandStream::Push(Common::UniqueFunction<void>&& call) {
 
 void CommandStream::Wake() {
 	auto& impl = *m_impl;
-	if (impl.sleeping.load(std::memory_order_seq_cst)) {
-		impl.Signal();
-	}
+	impl.WakeIfSleeping();
 	static const bool stats = Enabled("KYTY_DEBUG_STREAM_STATS");
 	if (stats) {
 		using Clock = std::chrono::steady_clock;

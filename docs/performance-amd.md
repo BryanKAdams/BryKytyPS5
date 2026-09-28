@@ -647,12 +647,14 @@ asynchronous submission on, these calls now go to the submit thread instead.
 `InstallCommandHooks` replaces the command functions in the default Vulkan dispatcher. The render
 scheduler routes each command buffer it begins through a 64 MB ring (`CommandStream`). The 48
 commands the renderer uses, and the GPU thread's descriptor updates, are deep-copied into it:
-arrays, barriers, rendering info and descriptor writes by type. Any thread may record into the
-routed buffer, since Vulkan already requires that to be synchronized. The submit thread replays
+arrays, barriers, rendering info and descriptor writes by type. The thread that routed the buffer
+is the ring's only producer, and it publishes with plain stores (the fence that decides whether
+to wake the submit thread runs every 16 KB, at submits and at waits). The submit thread replays
 the calls in order and submits each buffer when it reaches the submit.
 
 The ring must be empty before these calls, which then go to Vulkan directly:
-- any other command into the routed buffer (about 230 functions, and command buffer resets);
+- any other command into the routed buffer (about 230 functions, and command buffer resets),
+  and any command another thread records into it;
 - command pool calls (every stream);
 - on the GPU thread, direct queue submits, descriptor updates outside a routed buffer, and
   recording into any other command buffer.

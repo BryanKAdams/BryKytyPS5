@@ -13,10 +13,10 @@ namespace Libs::Graphics {
 // buffer and pool calls, queue submits) in the default dispatcher. Install once the device
 // dispatcher is initialized. Without either mode below the dispatcher is left alone.
 // - Deferred recording (Config::RecordThreadEnabled(); KYTY_RECORD_THREAD=0 or 1 overrides it):
-//   commands any thread records into a stream's routed command buffer are copied into that
-//   CommandStream and recorded by its consumer (the render scheduler's submit thread) in the
-//   same order, together with the submits. Other commands into that buffer run after what the
-//   stream holds, recorded directly.
+//   commands the routing thread records into its stream's routed command buffer are copied into
+//   that CommandStream and recorded by its consumer (the render scheduler's submit thread) in the
+//   same order, together with the submits. Other threads' commands into that buffer, and
+//   commands without a copying hook, run after what the stream holds, recorded directly.
 // - Otherwise KYTY_DEBUG_VK_TIME=1: the GPU thread's calls are timed; a line every 5 s says how
 //   much of the thread they took.
 void InstallCommandHooks();
@@ -32,18 +32,18 @@ void MarkCommandHookThread();
 // taking the queue lock.
 void DrainGpuThreadCommands();
 
-// An ordered stream of recorded Vulkan calls and other work, from the thread that routes it (and
-// any thread recording into its routed buffer) to one consumer. At most four exist at a time.
+// An ordered stream of recorded Vulkan calls and other work, from the thread that routed it last
+// to one consumer. At most four exist at a time.
 class CommandStream {
 public:
 	CommandStream();
 	~CommandStream();
 	KYTY_CLASS_NO_COPY(CommandStream);
 
-	// From now on, Vulkan commands recorded into `buffer` (and this thread's descriptor updates)
-	// go into this stream; a null buffer ends the routing.
+	// From now on, Vulkan commands this thread records into `buffer` (and its descriptor updates)
+	// go into this stream; a null buffer ends the routing. This thread becomes its producer.
 	void Route(VkCommandBuffer buffer);
-	// Appends a call to run in order with the recorded commands.
+	// Producer (the thread that routed last): appends a call to run in order with the commands.
 	void Push(Common::UniqueFunction<void>&& call);
 	// Wakes the consumer if it sleeps (after a submit, or with much work queued).
 	void Wake();
