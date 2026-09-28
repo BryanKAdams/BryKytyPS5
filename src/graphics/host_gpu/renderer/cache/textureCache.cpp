@@ -1742,10 +1742,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 			const char* text = std::getenv("KYTY_DEBUG_IMAGE_MEMO");
 			return text == nullptr || std::strcmp(text, "0") != 0;
 		}();
-		auto& remembered = m_image_lookups[ImageLookupSlot(desc.info, exact_format)];
-		if (memo_enabled && remembered.generation == m_image_set_generation &&
-		    remembered.Matches(desc.info, exact_format)) {
-			result = remembered.id;
+		auto* const  lookups    = ImageLookupSet(desc.info, exact_format);
+		ImageLookup* remembered = nullptr;
+		for (size_t way = 0; memo_enabled && way < ImageLookupWays; way++) {
+			if (lookups[way].generation == m_image_set_generation &&
+			    lookups[way].Matches(desc.info, exact_format)) {
+				remembered = &lookups[way];
+				break;
+			}
+		}
+		if (remembered != nullptr) {
+			remembered->last_use = ++m_image_lookup_clock;
+			result               = remembered->id;
 			if (unique_generation != nullptr) {
 				*unique_generation = m_image_set_generation;
 			}
@@ -1772,17 +1780,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 					inserted.MarkBufferModified();
 				}
 			} else if (backing_matches == 1 && view_mip < 0 && view_layer < 0) {
-				remembered = {.generation      = m_image_set_generation,
-				              .data            = desc.info.data,
-				              .extent          = desc.info.extent,
-				              .resources       = desc.info.resources,
-				              .samples         = desc.info.samples,
-				              .bytes_per_block = desc.info.bytes_per_block,
-				              .tile_mode       = desc.info.tile_mode,
-				              .pixel_format    = desc.info.pixel_format,
-				              .type            = desc.info.type,
-				              .exact_format    = exact_format,
-				              .id              = result};
+				auto* victim = lookups;
+				for (size_t way = 0; way < ImageLookupWays; way++) {
+					if (lookups[way].generation != m_image_set_generation) {
+						victim = &lookups[way];
+						break;
+					}
+					if (lookups[way].last_use < victim->last_use) {
+						victim = &lookups[way];
+					}
+				}
+				*victim = {.generation      = m_image_set_generation,
+				           .last_use        = ++m_image_lookup_clock,
+				           .data            = desc.info.data,
+				           .extent          = desc.info.extent,
+				           .resources       = desc.info.resources,
+				           .samples         = desc.info.samples,
+				           .bytes_per_block = desc.info.bytes_per_block,
+				           .tile_mode       = desc.info.tile_mode,
+				           .pixel_format    = desc.info.pixel_format,
+				           .type            = desc.info.type,
+				           .exact_format    = exact_format,
+				           .id              = result};
 				if (unique_generation != nullptr) {
 					*unique_generation = m_image_set_generation;
 				}

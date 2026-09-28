@@ -265,8 +265,12 @@ private:
 	// every request field SameBacking and the lookup's checks read. A lookup only sees registered
 	// images, whose fields SameBacking reads never change, so a result stays right until an image
 	// is registered or unregistered, which bumps m_image_set_generation. Caller holds m_lock.
+	// A scene looks up more distinct textures than a small direct-mapped table holds (Sky Garden
+	// missed 55% of lookups in 512 entries), so the table is set-associative and replaces entries
+	// of an older image set first, then the least recently used.
 	struct ImageLookup {
 		uint64_t            generation = 0;
+		uint64_t            last_use   = 0;
 		GuestRange          data;
 		vk::Extent3D        extent;
 		ImageSubresources   resources;
@@ -285,16 +289,20 @@ private:
 			       type == info.type && exact_format == exact;
 		}
 	};
-	[[nodiscard]] static size_t ImageLookupSlot(const ImageInfo& info, bool exact) noexcept {
+	static constexpr size_t ImageLookupWays = 4;
+	static constexpr size_t ImageLookupSets = 1024;
+	// The first entry of the request's set.
+	[[nodiscard]] ImageLookup* ImageLookupSet(const ImageInfo& info, bool exact) noexcept {
 		auto hash = info.data.address ^ (info.data.size * 0x9e3779b97f4a7c15ull) ^
 		            (static_cast<uint64_t>(info.pixel_format) << 1u) ^ (exact ? 1u : 0u);
 		hash ^= hash >> 29u;
 		hash *= 0xbf58476d1ce4e5b9ull;
 		hash ^= hash >> 32u;
-		return static_cast<size_t>(hash % ImageLookupCount);
+		return &m_image_lookups[static_cast<size_t>(hash % ImageLookupSets) * ImageLookupWays];
 	}
-	static constexpr size_t              ImageLookupCount = 512;
-	std::array<ImageLookup, ImageLookupCount> m_image_lookups {};
+	std::vector<ImageLookup> m_image_lookups =
+	    std::vector<ImageLookup>(ImageLookupSets * ImageLookupWays);
+	uint64_t m_image_lookup_clock = 0;
 	// Each cache counts from its own base, so a generation remembered from one cache (a test's
 	// earlier context, say) never matches another's.
 	[[nodiscard]] static uint64_t        NextGenerationBase() noexcept {
