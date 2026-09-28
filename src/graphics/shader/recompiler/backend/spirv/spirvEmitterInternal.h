@@ -288,6 +288,14 @@ bool     WaveHalvesInHostSubgroup(const EmitterState& state);
 uint32_t EmitOwnWaveHalfWord(EmitterState& state, uint32_t ballot);
 // 32 in host lanes 32-63 when WaveHalvesInHostSubgroup, else 0.
 uint32_t EmitOwnWaveHalfBase(EmitterState& state);
+// The lane that V_READLANE and V_PERMLANE(X)16 read for guest lane `lane`: the lane itself if the
+// host launched it, else the highest launched lane below it in the same guest wave. A partly
+// filled host wave has no invocations for its last lanes, which the guest still has: a shader can
+// switch them on (S_OR/S_ORN2_SAVEEXEC) and read them back, and a host shuffle from them is
+// undefined. Those lanes are outside every guest live mask, so a wave-wide OR/AND/MIN/MAX (row
+// scans with DPP row_shr, V_PERMLANEX16, V_READLANE of each row's last lane) leaves them holding
+// what the highest launched lane below holds.
+uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

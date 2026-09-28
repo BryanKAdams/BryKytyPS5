@@ -492,9 +492,11 @@ void Translator::V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16) {
 	    .fetch_inactive = inst.dst.op_sel,
 	    .bound_control  = inst.dst.op_sel_hi,
 	};
-	const auto result =
-	    ir.Emit(IR::ValueOpcode::Permlane16U32,
-	            {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec()}, flags);
+	// The scalar EXEC copy also holds the bits of lanes the host did not launch.
+	const auto result = ir.Emit(IR::ValueOpcode::Permlane16U32,
+	                            {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2),
+	                             ir.GetExec(), ir.GetExecLo(), ir.GetExecHi()},
+	                            flags);
 	auto dst      = DestinationOperand(inst);
 	dst.op_sel    = false;
 	dst.op_sel_hi = false;

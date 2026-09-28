@@ -198,7 +198,7 @@ VALUE_OPCODE(Ballot, U32x4, U1)
 VALUE_OPCODE(ReadFirstLane, U32, U32, U1)
 VALUE_OPCODE(ReadLane, U32, U32, U32)
 VALUE_OPCODE(WriteLane, U32, U32, U32, U32)
-VALUE_OPCODE(Permlane16U32, U32, U32, U32, U32, U1)
+VALUE_OPCODE(Permlane16U32, U32, U32, U32, U32, U1, U32, U32)
 VALUE_OPCODE(BpermuteU32, U32, U32, U32, U1)
 
 // Typed shader resources and memory operations. Descriptor state is represented by SSA values;

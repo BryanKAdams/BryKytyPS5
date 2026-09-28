@@ -154,6 +154,64 @@ uint32_t EmitOwnWaveHalfWord(EmitterState& state, uint32_t ballot) {
 	return word;
 }
 
+uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane) {
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+	const auto low      = state.builder.AllocateId();
+	const auto in_row   = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
+	const auto excluded = EmitBinaryU32(state, spv::OpShiftLeftLogical,
+	                                    ConstantU32(state, 0xfffffffeu), in_row);
+	const auto below    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpNot, TypeU32(state), below, excluded);
+	uint32_t word = 0;
+	uint32_t base = 0;
+	if (state.program.wave_size == 64u && state.lane_count == 1) {
+		// A search from the high word falls back to the low one when no high lane launched.
+		const auto high      = state.builder.AllocateId();
+		const auto in_high   = state.builder.AllocateId();
+		const auto high_hit  = state.builder.AllocateId();
+		const auto use_high  = state.builder.AllocateId();
+		const auto low_word  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+		const auto high_below = EmitBinaryU32(state, spv::OpBitwiseAnd, high, below);
+		state.builder.AddFunction(
+		    spv::OpINotEqual, TypeBool(state), in_high,
+		    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32)),
+		    ConstantU32(state, 0));
+		state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), high_hit, high_below,
+		                          ConstantU32(state, 0));
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), use_high, in_high, high_hit);
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), low_word, in_high, low,
+		                          EmitBinaryU32(state, spv::OpBitwiseAnd, low, below));
+		word = state.builder.AllocateId();
+		base = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), word, use_high, high_below,
+		                          low_word);
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), base, use_high,
+		                          ConstantU32(state, 32), ConstantU32(state, 0));
+	} else {
+		// One word: a wave32 in its own subgroup, the invocation's own half of a 64-lane one, or
+		// both halves of a wave64 emulated two lanes per invocation (launched together).
+		const auto launched = WaveHalvesInHostSubgroup(state) ? EmitOwnWaveHalfWord(state, ballot)
+		                                                      : low;
+		word = EmitBinaryU32(state, spv::OpBitwiseAnd, launched, below);
+		base = state.program.wave_size == 64u || WaveHalvesInHostSubgroup(state)
+		           ? EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32))
+		           : ConstantU32(state, 0);
+	}
+	const auto highest = state.builder.AllocateId();
+	const auto any     = state.builder.AllocateId();
+	const auto result  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), highest, GlslStd450(state),
+	                          GLSLstd450FindUMsb, word);
+	const auto launched = EmitAddU32(state, base, highest);
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), any, word, ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, any, launched, lane);
+	return result;
+}
+
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");

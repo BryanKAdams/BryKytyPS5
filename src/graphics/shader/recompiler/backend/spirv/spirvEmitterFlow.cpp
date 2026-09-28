@@ -691,9 +691,11 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 		// invocation's own half.
 		const auto lane =
 		    EmitBinaryU32(state, spv::OpBitwiseAnd, ctx.Arg(inst, 1), ConstantU32(state, 31));
-		return ctx.Shuffle(inst, 0, EmitAddU32(state, lane, EmitOwnWaveHalfBase(state)));
+		return ctx.Shuffle(inst, 0,
+		                   EmitAddU32(state, EmitLaunchedLaneAtOrBelow(state, lane),
+		                              EmitOwnWaveHalfBase(state)));
 	}
-	const auto shuffled = ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	const auto shuffled = ctx.Shuffle(inst, 0, EmitLaunchedLaneAtOrBelow(state, ctx.Arg(inst, 1)));
 	const auto result   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst,
 	                          TypeId(state, inst.Arg(0).GetType()), result,
@@ -750,11 +752,34 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), index, shifted,
 	                          ConstantU32(state, 15));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row_value, index);
-	const auto shuffled = ctx.Shuffle(inst, 0, target);
+	const auto launched = EmitLaunchedLaneAtOrBelow(state, target);
+	const auto shuffled = ctx.Shuffle(inst, 0, launched);
 	uint32_t   result   = shuffled;
 	if (!flags.fetch_inactive) {
-		const auto source_exec = ctx.Shuffle(inst, 3, target);
-		result                 = state.builder.AllocateId();
+		// A lane the host did not launch is active if the guest switched it on, which only the
+		// scalar EXEC copy records.
+		const auto in_high = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpLogicalAnd, TypeBool(state), in_high,
+		    ConstantBool(state, state.program.wave_size == 64u),
+		    Binary(state, spv::OpINotEqual, TypeBool(state),
+		                   EmitBinaryU32(state, spv::OpBitwiseAnd, target, ConstantU32(state, 32)),
+		                   ConstantU32(state, 0)));
+		const auto exec_word = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), exec_word, in_high,
+		                          ctx.Arg(inst, 5), ctx.Arg(inst, 4));
+		const auto exec_bit = EmitBinaryU32(
+		    state, spv::OpBitwiseAnd,
+		    EmitBinaryU32(state, spv::OpShiftRightLogical, exec_word,
+		                  EmitBinaryU32(state, spv::OpBitwiseAnd, target, ConstantU32(state, 31))),
+		    ConstantU32(state, 1));
+		const auto was_launched = state.builder.AllocateId();
+		const auto source_exec  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), was_launched, launched, target);
+		state.builder.AddFunction(
+		    spv::OpSelect, TypeBool(state), source_exec, was_launched, ctx.Shuffle(inst, 3, launched),
+		    Binary(state, spv::OpINotEqual, TypeBool(state), exec_bit, ConstantU32(state, 0)));
+		result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, source_exec, shuffled,
 		                          ConstantU32(state, 0));
 	}
