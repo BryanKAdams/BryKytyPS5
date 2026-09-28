@@ -611,8 +611,11 @@ struct PipelineCache::ProgramCache {
 	// worker threads, and the result is empty with `*pending` set; the same lookup later picks
 	// it up. Defer jobs go ahead of queued prefetches.
 	template <typename InputInfo>
+	// known_source: the entry the draw speculation found for these very stage inputs (see
+	// PreparedGraphicsStages), which spares building the key and looking it up.
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
-	                  ProgramWait wait = ProgramWait::Wait, bool* pending = nullptr) {
+	                  ProgramWait wait = ProgramWait::Wait, bool* pending = nullptr,
+	                  const void* known_source = nullptr) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -627,16 +630,7 @@ struct PipelineCache::ProgramCache {
 		const bool urgent     = wait == ProgramWait::Defer;
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		lookup_key.stage           = stage;
-		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = params.user_data_count;
-		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
-		if (entry != programs.end() && entry->second.skip_dispatch) {
-			return {};
-		}
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryOnGpuThread,
@@ -645,8 +639,9 @@ struct PipelineCache::ProgramCache {
 		    .specialization_block_reads = true,
 		    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,
 		};
-		if (entry != programs.end()) {
-			auto& source = entry->second;
+		// Refreshes a known source and returns its permutation for the refreshed specialization,
+		// if it has one yet.
+		const auto existing = [&](SourceEntry& source) -> std::optional<ShaderProgram> {
 			if (!AdoptSpeculation(source, stage, user_data, params.Base(), runtime, wait)) {
 				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 				    source.resource_plan, runtime, source.resources, source.specialization,
@@ -681,6 +676,33 @@ struct PipelineCache::ProgramCache {
 				input_info.stage = {.program = &permutation.program, .resources = &source.resources};
 				permutation.program.bindings.AdvancePushData(push_data_cursor);
 				return permutation.handle;
+			}
+			return std::nullopt;
+		};
+		// Refreshed below without a permutation yet: the lookup finds it again, to compile one.
+		const SourceEntry* refreshed = nullptr;
+		if (known_source != nullptr) {
+			auto& source = *static_cast<SourceEntry*>(const_cast<void*>(known_source));
+			if (source.skip_dispatch) {
+				return {};
+			}
+			if (auto program = existing(source)) {
+				return *program;
+			}
+			refreshed = &source;
+		}
+		lookup_key.stage           = stage;
+		lookup_key.hash            = params.hash;
+		lookup_key.user_data_count = params.user_data_count;
+		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, lookup_key.static_state);
+		auto entry = programs.find(lookup_key);
+		if (entry != programs.end() && entry->second.skip_dispatch) {
+			return {};
+		}
+		if (entry != programs.end() && &entry->second != refreshed) {
+			if (auto program = existing(entry->second)) {
+				return *program;
 			}
 		}
 
@@ -904,13 +926,15 @@ struct PipelineCache::ProgramCache {
 		}
 		if (speculation_stats && (++speculation.stages % 100000u) == 0) {
 			std::printf("draw-speculation: stages=%llu adopted=%llu changed=%llu mismatched=%llu "
-			            "unspeculated=%llu skipped=%llu\n",
+			            "unspeculated=%llu skipped=%llu inputs taken=%llu changed=%llu\n",
 			            static_cast<unsigned long long>(speculation.stages),
 			            static_cast<unsigned long long>(speculation.adopted),
 			            static_cast<unsigned long long>(speculation.changed),
 			            static_cast<unsigned long long>(speculation.mismatched),
 			            static_cast<unsigned long long>(speculation.unspeculated),
-			            static_cast<unsigned long long>(speculation.skipped));
+			            static_cast<unsigned long long>(speculation.skipped),
+			            static_cast<unsigned long long>(speculation.inputs_taken),
+			            static_cast<unsigned long long>(speculation.inputs_changed));
 		}
 		return adopted;
 	}
@@ -1062,6 +1086,9 @@ struct PipelineCache::ProgramCache {
 		uint64_t mismatched   = 0;
 		uint64_t unspeculated = 0;
 		uint64_t skipped      = 0;
+		// Prepared stage inputs (see PreparedGraphicsStages) taken, and found changed.
+		uint64_t inputs_taken   = 0;
+		uint64_t inputs_changed = 0;
 	} speculation;
 	bool speculation_stats  = false;
 	bool verify_speculation = false;
@@ -1421,6 +1448,31 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+// Copies what preparing a non-tessellated draw's stage inputs reads (see GraphicsStageRegisters).
+static void CaptureGraphicsStageRegisters(
+    GraphicsStageRegisters& registers, const HW::VertexShaderInfo& vertex_regs,
+    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+    const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    bool pixel_active) {
+	std::memset(&registers, 0, sizeof(registers));
+	std::memcpy(&registers.vertex, &vertex_regs, sizeof(registers.vertex));
+	std::memcpy(&registers.pixel, &pixel_regs, sizeof(registers.pixel));
+	std::memcpy(&registers.shader, &sh, sizeof(registers.shader));
+	std::memcpy(&registers.blend0, &context.GetBlendControl(0), sizeof(registers.blend0));
+	std::memcpy(&registers.clip, &context.GetClipControl(), sizeof(registers.clip));
+	std::memcpy(&registers.mode, &context.GetModeControl(), sizeof(registers.mode));
+	std::memcpy(&registers.ge, &user_config.GetGeControl(), sizeof(registers.ge));
+	const auto& viewport = context.GetScreenViewport().viewports[0];
+	registers.viewport0  = {viewport.xscale, viewport.yscale, viewport.xoffset, viewport.yoffset};
+	std::memcpy(registers.export_mapping.data(), target_export_mapping.data(),
+	            sizeof(registers.export_mapping));
+	registers.shader_stages    = context.GetShaderStages();
+	registers.prim_type        = static_cast<uint32_t>(user_config.GetPrimType());
+	registers.rt0_blend_bypass = context.GetRenderTarget(0).info.blend_bypass;
+	registers.pixel_active     = pixel_active;
+}
+
 // GetGraphicsPrograms' stage inputs and lookup parameters for these registers.
 static std::array<ShaderParams, 3> PrepareGraphicsStages(
     const GraphicContext& graphics, const HW::VertexShaderInfo& vertex_regs,
@@ -1501,10 +1553,75 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	WaitForPrecompile();
 	const bool   tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	ShaderParams pixel_params;
-	const auto   vertex_params =
-	    PrepareGraphicsStages(m_graphics, vertex_regs, pixel_regs, sh, context, user_config,
-	                          target_export_mapping, pixel_active, vertex_info, pixel_info,
-	                          pixel_params);
+	std::array<ShaderParams, 3> vertex_params;
+	// The draw speculation's prepared stage inputs, when the registers they were prepared from, the
+	// shader map and the vertex tables are unchanged (see PreparedGraphicsStages).
+	// KYTY_DEBUG_AB=stageinputs prepares them here in every other window.
+	const auto take_prepared = [&]() -> SpeculatedDraw* {
+		auto* draw = t_speculated_draw;
+		if (tess_active || wait == ProgramWait::Prefetch || draw == nullptr ||
+		    !draw->prepared.valid) {
+			return nullptr;
+		}
+		auto& prepared = draw->prepared;
+		prepared.valid = false;
+		static const bool ab = AbSelected("stageinputs"); // AB-TEMP
+		if (ab && AbFeatureOff()) {
+			return nullptr;
+		}
+		thread_local GraphicsStageRegisters registers;
+		CaptureGraphicsStageRegisters(registers, vertex_regs, pixel_regs, sh, context, user_config,
+		                              target_export_mapping, pixel_active);
+		if (std::memcmp(&registers, &prepared.registers, sizeof(registers)) != 0 ||
+		    ShaderMapVersion() != prepared.shader_map_version ||
+		    !VertexTableReadsUnchanged(prepared.vertex_tables)) {
+			m_program_cache->speculation.inputs_changed++;
+			return nullptr;
+		}
+		CopyVertexInputInfo(vertex_info[0], prepared.vertex_info);
+		vertex_params[0] = prepared.vertex_params;
+		if (pixel_active) {
+			pixel_info   = prepared.pixel_info;
+			pixel_params = prepared.pixel_params;
+		}
+		if (m_program_cache->verify_speculation) {
+			// KYTY_VERIFY_SPEC=1: the taken inputs must equal inputs prepared now.
+			thread_local std::array<ShaderVertexInputInfo, 3> check_vertex;
+			thread_local ShaderPixelInputInfo                 check_pixel;
+			check_pixel = {};
+			ShaderParams check_pixel_params;
+			const auto   check_vertex_params =
+			    PrepareGraphicsStages(m_graphics, vertex_regs, pixel_regs, sh, context, user_config,
+			                          target_export_mapping, pixel_active, check_vertex, check_pixel,
+			                          check_pixel_params);
+			const auto same_params = [](const ShaderParams& a, const ShaderParams& b) {
+				return a.code.data() == b.code.data() && a.code.size() == b.code.size() &&
+				       a.back_code.data() == b.back_code.data() &&
+				       a.back_code.size() == b.back_code.size() && a.hash == b.hash &&
+				       a.user_data_count == b.user_data_count && a.user_data == b.user_data;
+			};
+			if (!SameVertexInputInfo(vertex_info[0], check_vertex[0]) ||
+			    !same_params(vertex_params[0], check_vertex_params[0]) ||
+			    (pixel_active && (!SamePixelInputInfo(pixel_info, check_pixel) ||
+			                      !same_params(pixel_params, check_pixel_params)))) {
+				EXIT("draw speculation: prepared stage inputs differ from inputs prepared now\n");
+			}
+		}
+		g_draw_phases.Mark(DrawPhaseTimer::VertexParams);
+		g_draw_phases.Mark(DrawPhaseTimer::PixelParams);
+		m_program_cache->speculation.inputs_taken++;
+		return draw;
+	};
+	const auto* prepared = take_prepared();
+	if (prepared == nullptr) {
+		vertex_params = PrepareGraphicsStages(m_graphics, vertex_regs, pixel_regs, sh, context,
+		                                      user_config, target_export_mapping, pixel_active,
+		                                      vertex_info, pixel_info, pixel_params);
+	}
+	const void* known_vertex =
+	    prepared != nullptr ? prepared->stages[SpeculatedDraw::Vertex].source : nullptr;
+	const void* known_pixel =
+	    prepared != nullptr ? prepared->stages[SpeculatedDraw::Pixel].source : nullptr;
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
@@ -1533,8 +1650,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		return result;
 	};
 	if (pixel_active) {
-		result.pixel =
-		    m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, wait, &result.pending);
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, wait,
+		                                    &result.pending, known_pixel);
 		if (result.pending) {
 			return translate_rest(0);
 		}
@@ -1542,7 +1659,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	g_draw_phases.Mark(DrawPhaseTimer::PixelProgram);
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor,
-		                                        wait, &result.pending);
+		                                        wait, &result.pending,
+		                                        i == 0 ? known_vertex : nullptr);
 		if (result.pending) {
 			return translate_rest(i + 1);
 		}
@@ -1879,15 +1997,30 @@ bool PipelineCache::SpeculateGraphicsPrograms(const HW::Context& ctx, const HW::
 		m_program_cache->speculation_failures[0].fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
-	// The draw path's stage inputs, prepared as GetGraphicsPrograms prepares them.
+	// The draw path's stage inputs, prepared as GetGraphicsPrograms prepares them, and kept with
+	// what they were prepared from for the GPU thread to take (see PreparedGraphicsStages).
 	thread_local std::array<ShaderVertexInputInfo, 3> vertex_info;
 	thread_local ShaderPixelInputInfo                 pixel_info;
 	pixel_info = {};
+	auto& prepared                = draw.prepared;
+	prepared.valid                = false;
+	prepared.shader_map_version   = ShaderMapVersion();
+	prepared.vertex_tables.count  = 0;
+	t_vertex_table_reads          = &prepared.vertex_tables;
 	ShaderParams pixel_params;
 	const auto   vertex_params =
 	    PrepareGraphicsStages(m_graphics, sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
 	                          user_config, export_mapping, ps_active, vertex_info, pixel_info,
 	                          pixel_params);
+	t_vertex_table_reads = nullptr;
+	CaptureGraphicsStageRegisters(prepared.registers, sh.GetVs(), sh.GetPs(),
+	                              ctx.GetShaderRegisters(), ctx, user_config, export_mapping,
+	                              ps_active);
+	CopyVertexInputInfo(prepared.vertex_info, vertex_info[0]);
+	prepared.vertex_params = vertex_params[0];
+	prepared.pixel_info    = pixel_info;
+	prepared.pixel_params  = pixel_params;
+	prepared.valid         = true;
 	bool speculated = m_program_cache->Speculate(vertex_params[0], vertex_info[0],
 	                                             vertex_info[0].logical_stage, buffers,
 	                                             draw.stages[SpeculatedDraw::Vertex]);

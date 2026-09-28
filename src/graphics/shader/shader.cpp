@@ -69,6 +69,11 @@ struct ShaderBinaryInfo {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+static std::atomic<uint64_t>                                           g_shader_map_version {0};
+
+uint64_t ShaderMapVersion() {
+	return g_shader_map_version.load(std::memory_order_acquire);
+}
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -84,6 +89,8 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	static uint64_t generation = 0;
+	// Before the entry changes: a reader that saw the old version before reading sees a new one.
+	g_shader_map_version.fetch_add(1, std::memory_order_acq_rel);
 	auto&           entry      = (*g_shader_map)[addr];
 	entry                      = data;
 	entry.generation           = ++generation;
@@ -446,10 +453,19 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		last_semantic  = std::max(last_semantic, uint32_t {input_semantics[i].semantic});
 	}
 	std::array<uint32_t, 256> attributes; // By semantic, from first_semantic.
+	const auto record = [](const uint32_t* address, const uint32_t* words, uint32_t dwords) {
+		if (auto* log = t_vertex_table_reads; log != nullptr) {
+			const uint32_t first = log->count == 0 ? 0u : log->reads[0].first + log->reads[0].dwords;
+			EXIT_IF(log->count >= log->reads.size() || first + dwords > log->words.size());
+			log->reads[log->count++] = {reinterpret_cast<uint64_t>(address), dwords, first};
+			std::copy_n(words, dwords, log->words.begin() + first);
+		}
+	};
 	if (num_input_semantics != 0) {
 		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(attrib + first_semantic),
 		                                        attributes.data(),
 		                                        (last_semantic - first_semantic + 1) * sizeof(uint32_t));
+		record(attrib + first_semantic, attributes.data(), last_semantic - first_semantic + 1);
 	}
 	uint32_t first_index = UINT32_MAX;
 	uint32_t last_index  = 0;
@@ -463,6 +479,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(buffer + first_index * 4),
 		                                        sharps.data(),
 		                                        (last_index - first_index + 1) * 4 * sizeof(uint32_t));
+		record(buffer + first_index * 4, sharps.data(), (last_index - first_index + 1) * 4);
 	}
 
 	for (uint32_t i = 0; i < num_input_semantics; i++) {
@@ -966,6 +983,122 @@ ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderR
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, "ShaderRecompiler CS",
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
+}
+
+bool VertexTableReadsUnchanged(const VertexTableReads& reads) {
+	std::array<uint32_t, 256> words;
+	for (uint32_t i = 0; i < reads.count; i++) {
+		const auto& read = reads.reads[i];
+		EXIT_IF(read.dwords > words.size());
+		LibKernel::Memory::ReadGuestOnGpuThread(read.address, words.data(),
+		                                        read.dwords * sizeof(uint32_t));
+		if (!std::equal(words.begin(), words.begin() + read.dwords,
+		                reads.words.begin() + read.first)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void CopyVertexInputInfo(ShaderVertexInputInfo& target, const ShaderVertexInputInfo& source) {
+	ResetVertexInputInfo(target);
+	std::copy_n(source.resources, source.resources_num, target.resources);
+	std::copy_n(source.resources_dst, source.resources_num, target.resources_dst);
+	for (int i = 0; i < source.buffers_num; i++) {
+		const auto& from = source.buffers[i];
+		auto&       to   = target.buffers[i];
+		to.addr          = from.addr;
+		to.stride        = from.stride;
+		to.num_records   = from.num_records;
+		to.fetch_index   = from.fetch_index;
+		to.attr_num      = from.attr_num;
+		std::copy_n(from.attr_indices, from.attr_num, to.attr_indices);
+		std::copy_n(from.attr_offsets, from.attr_num, to.attr_offsets);
+	}
+	target.stage               = source.stage;
+	target.logical_stage       = source.logical_stage;
+	target.resources_num       = source.resources_num;
+	target.fetch_attrib_reg    = source.fetch_attrib_reg;
+	target.fetch_buffer_reg    = source.fetch_buffer_reg;
+	target.buffers_num         = source.buffers_num;
+	target.wave_size           = source.wave_size;
+	target.scratch_size_dwords = source.scratch_size_dwords;
+	target.pa_cl_vs_out_cntl   = source.pa_cl_vs_out_cntl;
+	target.clip_space          = source.clip_space;
+	target.mesh                = source.mesh;
+	target.tess                = source.tess;
+	target.fetch_external      = source.fetch_external;
+	target.fetch_embedded      = source.fetch_embedded;
+}
+
+bool SameVertexInputInfo(const ShaderVertexInputInfo& a, const ShaderVertexInputInfo& b) {
+	if (a.logical_stage != b.logical_stage || a.resources_num != b.resources_num ||
+	    a.fetch_attrib_reg != b.fetch_attrib_reg || a.fetch_buffer_reg != b.fetch_buffer_reg ||
+	    a.buffers_num != b.buffers_num || a.wave_size != b.wave_size ||
+	    a.scratch_size_dwords != b.scratch_size_dwords ||
+	    a.pa_cl_vs_out_cntl != b.pa_cl_vs_out_cntl || a.fetch_external != b.fetch_external ||
+	    a.fetch_embedded != b.fetch_embedded || a.clip_space.enabled != b.clip_space.enabled ||
+	    !std::equal(std::begin(a.clip_space.scale), std::end(a.clip_space.scale),
+	                std::begin(b.clip_space.scale)) ||
+	    !std::equal(std::begin(a.clip_space.offset), std::end(a.clip_space.offset),
+	                std::begin(b.clip_space.offset)) ||
+	    !std::equal(std::begin(a.clip_space.half_extent), std::end(a.clip_space.half_extent),
+	                std::begin(b.clip_space.half_extent)) ||
+	    std::memcmp(&a.mesh, &b.mesh, sizeof(a.mesh)) != 0 ||
+	    std::memcmp(&a.tess, &b.tess, sizeof(a.tess)) != 0) {
+		return false;
+	}
+	for (int i = 0; i < a.resources_num; i++) {
+		const auto& da = a.resources_dst[i];
+		const auto& db = b.resources_dst[i];
+		if (!std::equal(std::begin(a.resources[i].fields), std::end(a.resources[i].fields),
+		                std::begin(b.resources[i].fields)) ||
+		    da.register_start != db.register_start || da.registers_num != db.registers_num ||
+		    da.attr_id != db.attr_id || da.fetch_index != db.fetch_index) {
+			return false;
+		}
+	}
+	for (int i = 0; i < a.buffers_num; i++) {
+		const auto& ba = a.buffers[i];
+		const auto& bb = b.buffers[i];
+		if (ba.addr != bb.addr || ba.stride != bb.stride || ba.num_records != bb.num_records ||
+		    ba.fetch_index != bb.fetch_index || ba.attr_num != bb.attr_num ||
+		    !std::equal(ba.attr_indices, ba.attr_indices + ba.attr_num, bb.attr_indices) ||
+		    !std::equal(ba.attr_offsets, ba.attr_offsets + ba.attr_num, bb.attr_offsets)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool SamePixelInputInfo(const ShaderPixelInputInfo& a, const ShaderPixelInputInfo& b) {
+	const auto same_mapping = [&] {
+		for (size_t i = 0; i < a.target_export_mapping.size(); i++) {
+			if (a.target_export_mapping[i].packed != b.target_export_mapping[i].packed) {
+				return false;
+			}
+		}
+		return true;
+	};
+	return std::equal(std::begin(a.interpolator_settings), std::end(a.interpolator_settings),
+	                  std::begin(b.interpolator_settings)) &&
+	       a.input_num == b.input_num && a.wave_size == b.wave_size &&
+	       a.ps_system_input_base == b.ps_system_input_base &&
+	       a.custom_interpolation_mask == b.custom_interpolation_mask &&
+	       a.ps_perspective_center_vgpr == b.ps_perspective_center_vgpr &&
+	       a.ps_perspective_centroid_vgpr == b.ps_perspective_centroid_vgpr &&
+	       std::equal(std::begin(a.target_output_mode), std::end(a.target_output_mode),
+	                  std::begin(b.target_output_mode)) &&
+	       same_mapping() && a.scratch_size_dwords == b.scratch_size_dwords &&
+	       a.ps_pos_x == b.ps_pos_x && a.ps_pos_y == b.ps_pos_y && a.ps_pos_z == b.ps_pos_z &&
+	       a.ps_pos_w == b.ps_pos_w && a.ps_front_face == b.ps_front_face &&
+	       a.ps_ancillary == b.ps_ancillary && a.ps_no_perspective == b.ps_no_perspective &&
+	       a.ps_pixel_kill_enable == b.ps_pixel_kill_enable &&
+	       a.ps_depth_export_enable == b.ps_depth_export_enable &&
+	       a.ps_sample_mask_export_enable == b.ps_sample_mask_export_enable &&
+	       a.ps_sample_shading == b.ps_sample_shading &&
+	       a.dual_source_blending == b.dual_source_blending && a.ps_early_z == b.ps_early_z &&
+	       a.ps_execute_on_noop == b.ps_execute_on_noop;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
