@@ -1220,8 +1220,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		// Asynchronous pipelines: a shader is still translating; skip the draw until it is ready.
 		return false;
 	}
-	if (DebugSkipShader(state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0) ||
-	    DebugSkipShader(state.vertex_info[0].stage.program->shader_hash)) [[unlikely]] {
+	if (DebugSkipShader(state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+	                    DebugShaderKind::Pixel) ||
+	    DebugSkipShader(state.vertex_info[0].stage.program->shader_hash, DebugShaderKind::Vertex))
+	    [[unlikely]] {
 		return false;
 	}
 	uint32_t mrt_mask = 0;

@@ -264,7 +264,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// Temporary until RT is implemented.
 		return;
 	}
-	if (DebugSkipShader(input_info.stage.program->shader_hash)) [[unlikely]] {
+	if (DebugSkipShader(input_info.stage.program->shader_hash, DebugShaderKind::Compute))
+	    [[unlikely]] {
 		return;
 	}
 	if (use_thread_dimensions) {
@@ -444,7 +445,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		// Temporary until RT is implemented.
 		return;
 	}
-	if (DebugSkipShader(input_info.stage.program->shader_hash)) [[unlikely]] {
+	if (DebugSkipShader(input_info.stage.program->shader_hash, DebugShaderKind::Compute))
+	    [[unlikely]] {
 		return;
 	}
 	buffer.EndRendering();

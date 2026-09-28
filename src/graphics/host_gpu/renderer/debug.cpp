@@ -650,36 +650,80 @@ bool DebugFullBarriers() noexcept {
 
 // KYTY_DEBUG_SKIP_SHADERS_FILE=<path> skips them only while that file exists (checked twice a
 // second), like KYTY_DEBUG_FULL_BARRIERS_FILE.
-bool DebugSkipShader(uint64_t shader_hash) noexcept {
-	static const std::vector<uint64_t> hashes = [] {
-		std::vector<uint64_t> list;
+// Each shader is printed the first time it is skipped ("skip-shader: ps <hash>"), so a bisection
+// ends with the list of the shaders in its last half.
+bool DebugSkipShader(uint64_t shader_hash, DebugShaderKind kind) noexcept {
+	struct Entry {
+		uint64_t value;
+		uint64_t mask;
+		bool     pixel;
+		bool     vertex;
+		bool     compute;
+	};
+	static const std::vector<Entry> entries = [] {
+		std::vector<Entry> list;
 		for (const char* text = std::getenv("KYTY_DEBUG_SKIP_SHADERS"); text != nullptr;) {
-			char*      end  = nullptr;
-			const auto hash = std::strtoull(text, &end, 16);
+			const bool only_pixel   = std::strncmp(text, "p:", 2) == 0;
+			const bool only_compute = std::strncmp(text, "c:", 2) == 0;
+			text += only_pixel || only_compute ? 2 : 0;
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
 			if (end == text) {
 				break;
 			}
-			list.push_back(hash);
+			Entry entry {value, ~uint64_t {0}, true, true, true};
+			if (*end == '/') {
+				text       = end + 1;
+				entry.mask = std::strtoull(text, &end, 16);
+				entry.value &= entry.mask;
+				entry.pixel   = !only_compute;
+				entry.vertex  = false;
+				entry.compute = !only_pixel;
+			}
+			list.push_back(entry);
 			text = *end == ',' ? end + 1 : nullptr;
 		}
 		return list;
 	}();
-	if (hashes.empty() || std::ranges::find(hashes, shader_hash) == hashes.end()) {
+	if (entries.empty() || shader_hash == 0) {
+		return false;
+	}
+	const bool listed = std::ranges::any_of(entries, [&](const Entry& entry) {
+		const bool kind_match = kind == DebugShaderKind::Pixel    ? entry.pixel
+		                        : kind == DebugShaderKind::Vertex ? entry.vertex
+		                                                          : entry.compute;
+		return kind_match && (shader_hash & entry.mask) == entry.value;
+	});
+	if (!listed) {
 		return false;
 	}
 	static const char* file = std::getenv("KYTY_DEBUG_SKIP_SHADERS_FILE");
-	if (file == nullptr) {
-		return true;
+	if (file != nullptr) {
+		static std::atomic<int64_t> next_check {0};
+		static std::atomic<bool>    present {false};
+		const auto                  now = std::chrono::steady_clock::now().time_since_epoch();
+		if (now.count() >= next_check.load(std::memory_order_relaxed)) {
+			next_check.store((now + std::chrono::milliseconds(500)).count(),
+			                 std::memory_order_relaxed);
+			std::error_code error;
+			present.store(std::filesystem::exists(file, error), std::memory_order_relaxed);
+		}
+		if (!present.load(std::memory_order_relaxed)) {
+			return false;
+		}
 	}
-	static std::atomic<int64_t> next_check {0};
-	static std::atomic<bool>    present {false};
-	const auto                  now = std::chrono::steady_clock::now().time_since_epoch();
-	if (now.count() >= next_check.load(std::memory_order_relaxed)) {
-		next_check.store((now + std::chrono::milliseconds(500)).count(), std::memory_order_relaxed);
-		std::error_code error;
-		present.store(std::filesystem::exists(file, error), std::memory_order_relaxed);
+	static std::mutex            mutex;
+	static std::vector<uint64_t> reported;
+	const std::lock_guard        lock(mutex);
+	if (std::ranges::find(reported, shader_hash) == reported.end()) {
+		reported.push_back(shader_hash);
+		std::printf("skip-shader: %s %016" PRIx64 "\n",
+		            kind == DebugShaderKind::Pixel    ? "ps"
+		            : kind == DebugShaderKind::Vertex ? "vs"
+		                                              : "cs",
+		            shader_hash);
 	}
-	return present.load(std::memory_order_relaxed);
+	return true;
 }
 
 // Outside rendering: all earlier commands finish, and their writes are visible to everything
