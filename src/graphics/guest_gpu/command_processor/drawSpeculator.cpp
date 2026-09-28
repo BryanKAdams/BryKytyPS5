@@ -182,12 +182,38 @@ SpeculatedDraw* DrawSpeculator::Take(const uint32_t* packet) {
 		return nullptr;
 	}
 	m_stats.taken.fetch_add(1, std::memory_order_relaxed);
+	slot.draw.reads_current = ReadsCurrent(slot.draw);
 	return &slot.draw;
+}
+
+// Draws of one BDA epoch need not see CPU writes made during it (see RenderContext::PrepareBda):
+// when the speculation read guest memory in the current epoch, what it read is what the draw may
+// read, as for stream copies kept within an epoch (BufferCache::ObtainBuffer). GPU writes are not
+// CPU writes: the reads must also have been made after the last buffer or image became
+// GPU-written, since the readers refuse (or read around) GPU-written memory. A write counted at
+// the Release of draw k happened before the walk read draw k's release count only if k is lower
+// than it. KYTY_DEBUG_AB=specreads makes the reads again in every other window.
+bool DrawSpeculator::ReadsCurrent(const SpeculatedDraw& draw) {
+	static const bool ab = AbSelected("specreads");
+	if (ab && AbFeatureOff()) {
+		return false;
+	}
+	const auto epoch = m_renderer.CurrentBdaEpoch();
+	return epoch != 0 && draw.read_epoch == epoch && m_last_write_seq < draw.read_after &&
+	       m_renderer.GetBufferCache().GpuDirtyGeneration() == m_seen_buffer_writes &&
+	       m_renderer.GetTextureCache().GpuModifiedGeneration() == m_seen_image_writes;
 }
 
 void DrawSpeculator::Release(SpeculatedDraw* draw) {
 	if (draw != nullptr) {
 		m_ring[m_gpu_seq % RingSize].state.store(Free, std::memory_order_release);
+	}
+	const auto buffer_writes = m_renderer.GetBufferCache().GpuDirtyGeneration();
+	const auto image_writes  = m_renderer.GetTextureCache().GpuModifiedGeneration();
+	if (buffer_writes != m_seen_buffer_writes || image_writes != m_seen_image_writes) {
+		m_seen_buffer_writes = buffer_writes;
+		m_seen_image_writes  = image_writes;
+		m_last_write_seq     = m_gpu_seq;
 	}
 	m_gpu_seq++;
 	m_gpu_next.store(m_gpu_seq, std::memory_order_release);
@@ -517,6 +543,9 @@ void DrawSpeculator::Walk(CommandProcessor& shadow, std::vector<Cursor> stack, u
 							return;
 						}
 						m_stats.walked.fetch_add(1, std::memory_order_relaxed);
+						// Before any read (acquire loads): see ReadsCurrent.
+						slot->draw.read_epoch = m_renderer.CurrentBdaEpoch();
+						slot->draw.read_after = m_gpu_next.load(std::memory_order_acquire);
 						if (pipelines.SpeculateGraphicsPrograms(shadow.m_ctx, shadow.m_sh_ctx,
 						                                        shadow.m_ucfg, buffers, slot->draw)) {
 							slot->epoch  = epoch;

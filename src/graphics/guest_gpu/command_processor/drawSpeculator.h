@@ -73,6 +73,8 @@ private:
 	// Waits until the GPU thread has finished draw `seq`; false when interrupted.
 	bool  WaitForGpu(uint64_t seq, uint64_t epoch);
 	[[nodiscard]] bool Interrupted(uint64_t epoch) const;
+	// GPU thread: whether `draw`'s reads still give what they gave (see Take).
+	[[nodiscard]] bool ReadsCurrent(const SpeculatedDraw& draw);
 
 	RenderContext& m_renderer;
 	const int      m_interrupt_event_id;
@@ -80,6 +82,11 @@ private:
 	std::array<Slot, RingSize> m_ring;
 	// GPU thread: the next draw's sequence number and the current epoch.
 	uint64_t                   m_gpu_seq = 0;
+	// GPU thread: the buffer cache's and texture cache's GPU-write generations at the last
+	// Release, and the last draw at whose Release either had changed (see Take).
+	uint64_t                   m_seen_buffer_writes = 0;
+	uint64_t                   m_seen_image_writes  = 0;
+	uint64_t                   m_last_write_seq     = 0;
 	std::atomic<uint64_t>      m_gpu_next {0};
 	std::atomic<uint64_t>      m_epoch {0};
 	// The worker's walk ended before this draw (NotStopped while walking or idle at the end).

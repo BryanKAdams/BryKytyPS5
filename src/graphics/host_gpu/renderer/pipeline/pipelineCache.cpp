@@ -915,6 +915,21 @@ struct PipelineCache::ProgramCache {
 		bool              adopted = false;
 		const auto        reads_unchanged = [&] {
 			DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::SpeculationReads);
+			if (draw->reads_current) {
+				// The reads stand (see DrawSpeculator::ReadsCurrent). KYTY_VERIFY_SPEC_READS=1
+				// makes them again anyway and reports differences.
+				speculation.reads_kept++;
+				if (verify_speculation_reads &&
+				    !ShaderRecompiler::IR::ReadsUnchanged(stage_result->reads, runtime)) {
+					const auto missed = ++speculation.reads_kept_changed;
+					if (missed <= 16 || missed % 1000 == 0) {
+						std::printf("speculation reads verify: kept reads changed (%llu of %llu)\n",
+						            static_cast<unsigned long long>(missed),
+						            static_cast<unsigned long long>(speculation.reads_kept));
+					}
+				}
+				return true;
+			}
 			return ShaderRecompiler::IR::ReadsUnchanged(stage_result->reads, runtime);
 		};
 		if (stage_result == nullptr || stage_result->source == nullptr) {
@@ -945,7 +960,8 @@ struct PipelineCache::ProgramCache {
 		}
 		if (speculation_stats && (++speculation.stages % 100000u) == 0) {
 			std::printf("draw-speculation: stages=%llu adopted=%llu changed=%llu mismatched=%llu "
-			            "unspeculated=%llu skipped=%llu inputs taken=%llu changed=%llu\n",
+			            "unspeculated=%llu skipped=%llu inputs taken=%llu changed=%llu reads kept=%llu "
+			            "kept-changed=%llu\n",
 			            static_cast<unsigned long long>(speculation.stages),
 			            static_cast<unsigned long long>(speculation.adopted),
 			            static_cast<unsigned long long>(speculation.changed),
@@ -953,7 +969,9 @@ struct PipelineCache::ProgramCache {
 			            static_cast<unsigned long long>(speculation.unspeculated),
 			            static_cast<unsigned long long>(speculation.skipped),
 			            static_cast<unsigned long long>(speculation.inputs_taken),
-			            static_cast<unsigned long long>(speculation.inputs_changed));
+			            static_cast<unsigned long long>(speculation.inputs_changed),
+			            static_cast<unsigned long long>(speculation.reads_kept),
+			            static_cast<unsigned long long>(speculation.reads_kept_changed));
 		}
 		return adopted;
 	}
@@ -1058,7 +1076,8 @@ struct PipelineCache::ProgramCache {
 		}
 		stats_enabled      = enabled("KYTY_SRT_STATS");
 		speculation_stats  = enabled("KYTY_DEBUG_SPEC_STATS");
-		verify_speculation = enabled("KYTY_VERIFY_SPEC");
+		verify_speculation       = enabled("KYTY_VERIFY_SPEC");
+		verify_speculation_reads = enabled("KYTY_VERIFY_SPEC_READS");
 		if (const char* runs = std::getenv("KYTY_DEBUG_SRT_RUNS");
 		    runs != nullptr && std::strcmp(runs, "0") == 0) {
 			ShaderRecompiler::IR::SetFlatRunReads(false);
@@ -1108,9 +1127,15 @@ struct PipelineCache::ProgramCache {
 		// Prepared stage inputs (see PreparedGraphicsStages) taken, and found changed.
 		uint64_t inputs_taken   = 0;
 		uint64_t inputs_changed = 0;
+		// Adoptions whose reads were kept without making them again (see
+		// DrawSpeculator::ReadsCurrent), and, with KYTY_VERIFY_SPEC_READS=1, how many would have
+		// read differently.
+		uint64_t reads_kept         = 0;
+		uint64_t reads_kept_changed = 0;
 	} speculation;
-	bool speculation_stats  = false;
-	bool verify_speculation = false;
+	bool speculation_stats        = false;
+	bool verify_speculation       = false;
+	bool verify_speculation_reads = false;
 	// See PipelineCache::SpeculationFailures (index 0 is counted there).
 	std::array<std::atomic<uint64_t>, 4> speculation_failures {};
 	// New sources translating on worker threads.
