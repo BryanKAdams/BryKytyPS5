@@ -1230,10 +1230,14 @@ namespace {
 // recording its command buffer (see ReserveRecordedCall): this header, then the writes of set 0
 // and set 1, then each write's image or buffer infos in turn.
 struct RecordedBindings {
+	VkDevice                       device      = VK_NULL_HANDLE;
 	VkPipelineLayout               layout      = VK_NULL_HANDLE;
 	VkPipelineBindPoint            bind_point  = VK_PIPELINE_BIND_POINT_GRAPHICS;
 	VkShaderStageFlags             push_stages = 0; // 0: no push constants.
 	std::array<uint32_t, 2>        set_writes {};
+	// A set that does not push: allocated by CommitBindings, updated and bound by the recording
+	// thread. VK_NULL_HANDLE: the set pushes.
+	std::array<VkDescriptorSet, 2> sets {};
 	ShaderRecompiler::IR::PushData push_data;
 };
 
@@ -1278,24 +1282,41 @@ void RunRecordedBindings(VkCommandBuffer command_buffer, const uint8_t* payload)
 		buffer.pushConstants(layout, static_cast<vk::ShaderStageFlags>(header.push_stages), 0,
 		                     sizeof(header.push_data), header.push_data.dwords.data());
 	}
-	if (header.set_writes[0] != 0) {
-		buffer.pushDescriptorSetKHR(bind_point, layout, 0, header.set_writes[0], vk_writes.data());
-	}
-	if (header.set_writes[1] != 0) {
-		buffer.pushDescriptorSetKHR(bind_point, layout, 1, header.set_writes[1],
-		                            vk_writes.data() + header.set_writes[0]);
+	auto* set_writes = vk_writes.data();
+	for (uint32_t set_index = 0; set_index < 2; set_index++) {
+		const auto count_in_set = header.set_writes[set_index];
+		if (count_in_set != 0) {
+			const vk::DescriptorSet set(header.sets[set_index]);
+			if (!set) {
+				buffer.pushDescriptorSetKHR(bind_point, layout, set_index, count_in_set, set_writes);
+			} else {
+				// A freshly allocated set, bound nowhere yet: updating it here, before its bind,
+				// is what CommitBindings did on its own thread.
+				for (uint32_t i = 0; i < count_in_set; i++) {
+					set_writes[i].dstSet = set;
+				}
+				vk::Device(header.device).updateDescriptorSets(count_in_set, set_writes, 0, nullptr);
+				buffer.bindDescriptorSets(bind_point, layout, set_index, 1, &set, 0, nullptr);
+			}
+		}
+		set_writes += count_in_set;
 	}
 }
 
-// Hands the push constants (with nonempty stages) and push descriptor sets to the thread that
+// Hands the push constants (with nonempty stages) and both descriptor sets to the thread that
 // records `buffer`, as one payload call instead of one deep-copied call each; false when its
-// recording is not deferred, and the caller makes the calls. KYTY_DEBUG_AB=pushpayload has the
-// caller make them in every other window.
-bool RecordPushedBindings(vk::CommandBuffer buffer, vk::PipelineBindPoint bind_point,
-                          vk::PipelineLayout layout, vk::ShaderStageFlags push_stages,
+// recording is not deferred, and the caller makes the calls. A set that does not push
+// (push[set] false) gets its set from allocate(set) here, once the call is certain, and the
+// recording thread updates and binds it. KYTY_DEBUG_AB=pushpayload has the caller make the
+// calls in every other window.
+template <typename Allocate>
+bool RecordPushedBindings(vk::CommandBuffer buffer, vk::Device device,
+                          vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+                          vk::ShaderStageFlags push_stages,
                           const ShaderRecompiler::IR::PushData&    push_data,
                           std::span<const vk::WriteDescriptorSet> set0,
-                          std::span<const vk::WriteDescriptorSet> set1) {
+                          std::span<const vk::WriteDescriptorSet> set1, std::array<bool, 2> push,
+                          Allocate&& allocate) {
 	static const bool ab = AbSelected("pushpayload");
 	if (ab && AbFeatureOff()) {
 		return false;
@@ -1323,10 +1344,16 @@ bool RecordPushedBindings(vk::CommandBuffer buffer, vk::PipelineBindPoint bind_p
 		return false;
 	}
 	auto& header       = *::new (payload) RecordedBindings;
+	header.device      = static_cast<VkDevice>(device);
 	header.layout      = static_cast<VkPipelineLayout>(layout);
 	header.bind_point  = static_cast<VkPipelineBindPoint>(bind_point);
 	header.push_stages = static_cast<VkShaderStageFlags>(push_stages);
 	header.set_writes  = {static_cast<uint32_t>(set0.size()), static_cast<uint32_t>(set1.size())};
+	for (uint32_t set_index = 0; set_index < 2; set_index++) {
+		if (header.set_writes[set_index] != 0 && !push[set_index]) {
+			header.sets[set_index] = static_cast<VkDescriptorSet>(allocate(set_index));
+		}
+	}
 	header.push_data   = push_data;
 	auto* writes = reinterpret_cast<RecordedWrite*>(payload + sizeof(RecordedBindings));
 	auto* infos  = payload + sizeof(RecordedBindings) + write_count * sizeof(RecordedWrite);
@@ -1548,15 +1575,18 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	// Set 0 holds compute or vertex-side descriptors; the pixel shader's tail goes to set 1.
 	const auto set0 = std::span(m_descriptor_writes).first(pixel_write_start);
 	const auto set1 = std::span(m_descriptor_writes).subspan(pixel_write_start);
-	if ((set0.empty() || pipeline.uses_push_descriptors) &&
-	    (set1.empty() || pipeline.pixel_uses_push)) {
-		EXIT_IF((!set0.empty() && pipeline.descriptor_set_layout == nullptr) ||
-		        (!set1.empty() && pipeline.pixel_set_layout == nullptr));
-		if (RecordPushedBindings(vk_buffer, pipeline_bind_point, pipeline.pipeline_layout,
-		                         has_push_data ? push_stages : vk::ShaderStageFlags {}, push_data,
-		                         set0, set1)) {
-			return;
-		}
+	EXIT_IF((!set0.empty() && pipeline.descriptor_set_layout == nullptr) ||
+	        (!set1.empty() && pipeline.pixel_set_layout == nullptr));
+	// A graphics layout pushes at most one of its two sets, so the payload carries the other as
+	// an allocated set (see RecordPushedBindings).
+	if (RecordPushedBindings(
+	        vk_buffer, m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout,
+	        has_push_data ? push_stages : vk::ShaderStageFlags {}, push_data, set0, set1,
+	        {pipeline.uses_push_descriptors, pipeline.pixel_uses_push}, [&](uint32_t set_index) {
+		        return m_context.GetDescriptorHeap().Commit(
+		            set_index == 0 ? pipeline.descriptor_set_layout : pipeline.pixel_set_layout);
+	        })) {
+		return;
 	}
 	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
