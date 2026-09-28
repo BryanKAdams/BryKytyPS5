@@ -810,6 +810,9 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	for (const auto ticks: current) {
 		sum += ticks;
 	}
+	// DRAW_INDEX_AUTO draws, also on their own (see Begin).
+	static std::array<uint64_t, Count> auto_totals {};
+	static uint64_t                    auto_draws = 0;
 	if (pixel_hash == Hash() || Hash() == AllDraws) {
 		for (uint32_t i = 0; i < Count; i++) {
 			totals[i] += current[i];
@@ -818,6 +821,12 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 			probe_totals[i] += probes[i];
 		}
 		draws++;
+		if (auto_kind) {
+			for (uint32_t i = 0; i < Count; i++) {
+				auto_totals[i] += current[i];
+			}
+			auto_draws++;
+		}
 	} else {
 		other_draws++;
 		other_ticks += sum;
@@ -874,6 +883,20 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 		                    draws != 0 ? probe_totals[i] * to_us / draws : 0.0);
 	}
 	std::printf("%s\n", line.c_str());
+	if (auto_draws != 0) {
+		uint64_t auto_all = 0;
+		for (const auto ticks: auto_totals) {
+			auto_all += ticks;
+		}
+		std::string auto_line = fmt::format("draw-phases auto: draws/s={:.0f} us/draw={:.2f} |",
+		                                    auto_draws / seconds, auto_all * to_us / auto_draws);
+		for (uint32_t i = 0; i < Count; i++) {
+			auto_line += fmt::format(" {}={:.2f}", Names[i], auto_totals[i] * to_us / auto_draws);
+		}
+		std::printf("%s\n", auto_line.c_str());
+		auto_totals.fill(0);
+		auto_draws = 0;
+	}
 	if (UploadStatsEnabled()) {
 		PrintUploadStats(seconds);
 	}

@@ -124,9 +124,11 @@ struct DrawPhaseTimer {
 	static uint64_t Hash();
 	// The time stamp counter the phases are measured in.
 	static uint64_t Now();
-	void            Begin() {
+	// auto_draw: a DRAW_INDEX_AUTO packet's draw, also accounted on its own line.
+	void            Begin(bool auto_draw = false) {
 		if (Hash() != 0) [[unlikely]] {
-			active = true;
+			active    = true;
+			auto_kind = auto_draw;
 			current.fill(0);
 			probes.fill(0);
 			last = Now();
@@ -145,8 +147,9 @@ struct DrawPhaseTimer {
 	[[nodiscard]] bool Active() const noexcept { return active; }
 
 private:
-	bool                             active = false;
-	uint64_t                         last   = 0;
+	bool                             active    = false;
+	bool                             auto_kind = false;
+	uint64_t                         last      = 0;
 	std::array<uint64_t, Count>      current {};
 	std::array<uint64_t, ProbeCount> probes {};
 };

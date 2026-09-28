@@ -685,6 +685,19 @@ struct PipelineCache::ProgramCache {
 		const SourceEntry* refreshed = nullptr;
 		if (known_source != nullptr) {
 			auto& source = *static_cast<SourceEntry*>(const_cast<void*>(known_source));
+			if (verify_speculation) {
+				// KYTY_VERIFY_SPEC=1: the known source must be the entry the key finds.
+				lookup_key.stage           = stage;
+				lookup_key.hash            = params.hash;
+				lookup_key.user_data_count = params.user_data_count;
+				lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+				BuildStageStaticKey(input_info, lookup_key.static_state);
+				const auto found = programs.find(lookup_key);
+				if (found == programs.end() || &found->second != &source) {
+					EXIT("draw speculation: known source 0x%016llx is not the entry its key finds\n",
+					     static_cast<unsigned long long>(params.hash));
+				}
+			}
 			if (source.skip_dispatch) {
 				return {};
 			}
