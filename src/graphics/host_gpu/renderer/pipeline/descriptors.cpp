@@ -736,10 +736,14 @@ TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResource& re
 
 // A texture description is a pure function of its inputs, and draws bind the same textures over
 // and over, so recent descriptions are kept. An entry holds copies of both inputs: a hit is exact.
+// A scene can bind a few thousand distinct textures (Sky Garden missed half its lookups in a
+// 256-entry direct-mapped table), so the table is set-associative and evicts the least recently
+// used entry of a set.
 class TextureDescriptionCache {
 public:
 	struct Entry {
-		bool                                  valid = false;
+		uint32_t                              hash     = 0;
+		uint64_t                              last_use = 0; // 0: empty.
 		ShaderRecompiler::IR::DescriptorValue value;
 		ShaderRecompiler::IR::ImageResource   resource;
 		TextureDescription                    description;
@@ -750,6 +754,7 @@ public:
 		ImageId                               bound;
 	};
 
+	// The entry stays valid until the next call.
 	Entry& Get(const ShaderRecompiler::IR::ImageResource&   resource,
 	           const ShaderRecompiler::IR::DescriptorValue& value,
 	           const ShaderTextureResource&                 descriptor) {
@@ -758,20 +763,39 @@ public:
 			hash = (hash ^ dword) * 16777619u;
 		}
 		hash = (hash ^ resource.source) * 16777619u;
-		auto& entry = m_entries[(hash ^ (hash >> 15u)) % Size];
-		if (!entry.valid || !(entry.value == value) || !(entry.resource == resource)) {
-			entry.description = DescribeTexture(resource, descriptor);
-			entry.value       = value;
-			entry.resource    = resource;
-			entry.valid       = true;
-			entry.generation  = 0;
+		// Mix the high bits into the set index (MurmurHash3's finalizer).
+		hash ^= hash >> 16u;
+		hash *= 0x85ebca6bu;
+		hash ^= hash >> 13u;
+		hash *= 0xc2b2ae35u;
+		hash ^= hash >> 16u;
+		auto* const set    = &m_entries[(hash % Sets) * Ways];
+		Entry*      victim = set;
+		for (size_t way = 0; way < Ways; way++) {
+			auto& entry = set[way];
+			if (entry.last_use != 0 && entry.hash == hash && entry.value == value &&
+			    entry.resource == resource) {
+				entry.last_use = ++m_clock;
+				return entry;
+			}
+			if (entry.last_use < victim->last_use) {
+				victim = &entry;
+			}
 		}
-		return entry;
+		victim->description = DescribeTexture(resource, descriptor);
+		victim->hash        = hash;
+		victim->last_use    = ++m_clock;
+		victim->value       = value;
+		victim->resource    = resource;
+		victim->generation  = 0;
+		return *victim;
 	}
 
 private:
-	static constexpr size_t Size = 256;
-	std::vector<Entry> m_entries = std::vector<Entry>(Size);
+	static constexpr size_t Ways = 4;
+	static constexpr size_t Sets = 1024;
+	uint64_t                m_clock   = 0;
+	std::vector<Entry>      m_entries = std::vector<Entry>(Sets * Ways);
 };
 
 // KYTY_DEBUG_TEXTURE_REUSE=0 resolves every texture binding from scratch, for A/B runs (see also
