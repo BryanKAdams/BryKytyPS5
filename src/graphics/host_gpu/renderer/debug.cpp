@@ -652,7 +652,7 @@ bool DebugFullBarriers() noexcept {
 // second), like KYTY_DEBUG_FULL_BARRIERS_FILE.
 // Each shader is printed the first time it is skipped ("skip-shader: ps <hash>"), so a bisection
 // ends with the list of the shaders in its last half.
-bool DebugSkipShader(uint64_t shader_hash, DebugShaderKind kind) noexcept {
+bool DebugSkipShader(uint64_t shader_hash, DebugShaderKind kind, bool bisect) noexcept {
 	struct Entry {
 		uint64_t value;
 		uint64_t mask;
@@ -692,7 +692,8 @@ bool DebugSkipShader(uint64_t shader_hash, DebugShaderKind kind) noexcept {
 		const bool kind_match = kind == DebugShaderKind::Pixel    ? entry.pixel
 		                        : kind == DebugShaderKind::Vertex ? entry.vertex
 		                                                          : entry.compute;
-		return kind_match && (shader_hash & entry.mask) == entry.value;
+		return kind_match && (bisect || entry.mask == ~uint64_t {0}) &&
+		       (shader_hash & entry.mask) == entry.value;
 	});
 	if (!listed) {
 		return false;

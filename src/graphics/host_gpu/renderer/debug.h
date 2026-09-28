@@ -51,8 +51,11 @@ inline RenderDebugCounters g_render_debug_counters;
 // vertex shader and dispatches of a listed compute shader are left out, to find the draws behind a
 // visual defect. An entry <value>/<mask> skips every pixel and compute shader whose hash matches
 // value under mask (p: or c: before it limits that to one kind), to bisect an unknown shader.
+// Masks leave out only calls that pass bisect: draws of more than two triangles or with
+// GPU-written counts, so that the frame's full-screen passes stay.
 enum class DebugShaderKind { Pixel, Vertex, Compute };
-[[nodiscard]] bool DebugSkipShader(uint64_t shader_hash, DebugShaderKind kind) noexcept;
+[[nodiscard]] bool DebugSkipShader(uint64_t shader_hash, DebugShaderKind kind,
+                                   bool bisect = true) noexcept;
 void               RecordFullBarrier(vk::CommandBuffer command) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
