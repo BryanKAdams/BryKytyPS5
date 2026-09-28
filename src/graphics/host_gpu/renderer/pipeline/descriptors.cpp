@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandHooks.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -31,12 +32,14 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <vector>
@@ -156,7 +159,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	auto range = size + adjustment;
+	if (graphics.hardware_storage_buffer_bounds) {
+		// The device checks word accesses against the range, which the shader's own checks took
+		// in whole dwords: a trailing partial dword is out of range. A range without one whole
+		// dword is a null descriptor, which the device treats as empty.
+		range &= ~vk::DeviceSize {sizeof(uint32_t) - 1};
+		if (range == 0) {
+			buffer_offset = 0;
+			return {nullptr, 0, VK_WHOLE_SIZE};
+		}
+	}
+	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
 	if (resource.written) {
 		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::BufferInvalidate);
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
@@ -725,10 +739,14 @@ TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResource& re
 
 // A texture description is a pure function of its inputs, and draws bind the same textures over
 // and over, so recent descriptions are kept. An entry holds copies of both inputs: a hit is exact.
+// A scene can bind a few thousand distinct textures (Sky Garden missed half its lookups in a
+// 256-entry direct-mapped table), so the table is set-associative and evicts the least recently
+// used entry of a set.
 class TextureDescriptionCache {
 public:
 	struct Entry {
-		bool                                  valid = false;
+		uint32_t                              hash     = 0;
+		uint64_t                              last_use = 0; // 0: empty.
 		ShaderRecompiler::IR::DescriptorValue value;
 		ShaderRecompiler::IR::ImageResource   resource;
 		TextureDescription                    description;
@@ -739,6 +757,7 @@ public:
 		ImageId                               bound;
 	};
 
+	// The entry stays valid until the next call.
 	Entry& Get(const ShaderRecompiler::IR::ImageResource&   resource,
 	           const ShaderRecompiler::IR::DescriptorValue& value,
 	           const ShaderTextureResource&                 descriptor) {
@@ -747,20 +766,39 @@ public:
 			hash = (hash ^ dword) * 16777619u;
 		}
 		hash = (hash ^ resource.source) * 16777619u;
-		auto& entry = m_entries[(hash ^ (hash >> 15u)) % Size];
-		if (!entry.valid || !(entry.value == value) || !(entry.resource == resource)) {
-			entry.description = DescribeTexture(resource, descriptor);
-			entry.value       = value;
-			entry.resource    = resource;
-			entry.valid       = true;
-			entry.generation  = 0;
+		// Mix the high bits into the set index (MurmurHash3's finalizer).
+		hash ^= hash >> 16u;
+		hash *= 0x85ebca6bu;
+		hash ^= hash >> 13u;
+		hash *= 0xc2b2ae35u;
+		hash ^= hash >> 16u;
+		auto* const set    = &m_entries[(hash % Sets) * Ways];
+		Entry*      victim = set;
+		for (size_t way = 0; way < Ways; way++) {
+			auto& entry = set[way];
+			if (entry.last_use != 0 && entry.hash == hash && entry.value == value &&
+			    entry.resource == resource) {
+				entry.last_use = ++m_clock;
+				return entry;
+			}
+			if (entry.last_use < victim->last_use) {
+				victim = &entry;
+			}
 		}
-		return entry;
+		victim->description = DescribeTexture(resource, descriptor);
+		victim->hash        = hash;
+		victim->last_use    = ++m_clock;
+		victim->value       = value;
+		victim->resource    = resource;
+		victim->generation  = 0;
+		return *victim;
 	}
 
 private:
-	static constexpr size_t Size = 256;
-	std::vector<Entry> m_entries = std::vector<Entry>(Size);
+	static constexpr size_t Ways = 4;
+	static constexpr size_t Sets = 1024;
+	uint64_t                m_clock   = 0;
+	std::vector<Entry>      m_entries = std::vector<Entry>(Sets * Ways);
 };
 
 // KYTY_DEBUG_TEXTURE_REUSE=0 resolves every texture binding from scratch, for A/B runs (see also
@@ -1133,7 +1171,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			// A clean sampled image keeps the view FindTexture returned for this binding before.
 			binding.image_view = source.view;
 		} else {
-			const auto generation = texture_cache.ImageSetGeneration();
+			const auto generation = texture_cache.ImageGeneration(binding.image_id);
 			binding.image_view    = texture_cache.FindTexture(binding.image_id, binding.desc);
 			source.view_generation =
 			    binding.desc.type == TextureCache::BindingType::Texture ? generation : 0;
@@ -1185,6 +1223,131 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		RebindBuffers(*stage);
 	}
 }
+
+namespace {
+
+// A draw's push constants and push descriptor sets as CommitBindings hands them to the thread
+// recording its command buffer (see ReserveRecordedCall): this header, then the writes of set 0
+// and set 1, then each write's image or buffer infos in turn.
+struct RecordedBindings {
+	VkPipelineLayout               layout      = VK_NULL_HANDLE;
+	VkPipelineBindPoint            bind_point  = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	VkShaderStageFlags             push_stages = 0; // 0: no push constants.
+	std::array<uint32_t, 2>        set_writes {};
+	ShaderRecompiler::IR::PushData push_data;
+};
+
+struct RecordedWrite {
+	uint32_t         binding = 0;
+	uint32_t         count   = 0;
+	VkDescriptorType type    = VK_DESCRIPTOR_TYPE_SAMPLER;
+	uint32_t         images  = 0; // Whether the infos are image infos rather than buffer infos.
+};
+
+static_assert(sizeof(vk::DescriptorImageInfo) == sizeof(vk::DescriptorBufferInfo));
+static_assert(sizeof(RecordedBindings) % alignof(vk::DescriptorImageInfo) == 0 &&
+              sizeof(RecordedWrite) % alignof(vk::DescriptorImageInfo) == 0);
+constexpr size_t RecordedInfoBytes = sizeof(vk::DescriptorImageInfo);
+
+// On the recording thread: the calls CommitBindings would have made.
+void RunRecordedBindings(VkCommandBuffer command_buffer, const uint8_t* payload) {
+	const auto& header = *reinterpret_cast<const RecordedBindings*>(payload);
+	const auto* writes = reinterpret_cast<const RecordedWrite*>(payload + sizeof(RecordedBindings));
+	const auto  count  = header.set_writes[0] + header.set_writes[1];
+	const auto* infos  = payload + sizeof(RecordedBindings) + count * sizeof(RecordedWrite);
+	thread_local std::vector<vk::WriteDescriptorSet> vk_writes;
+	vk_writes.resize(count);
+	for (uint32_t i = 0; i < count; i++) {
+		const auto& write     = writes[i];
+		auto&       vk_write  = vk_writes[i];
+		vk_write              = vk::WriteDescriptorSet {};
+		vk_write.dstBinding      = write.binding;
+		vk_write.descriptorCount = write.count;
+		vk_write.descriptorType  = static_cast<vk::DescriptorType>(write.type);
+		if (write.images != 0) {
+			vk_write.pImageInfo = reinterpret_cast<const vk::DescriptorImageInfo*>(infos);
+		} else {
+			vk_write.pBufferInfo = reinterpret_cast<const vk::DescriptorBufferInfo*>(infos);
+		}
+		infos += write.count * RecordedInfoBytes;
+	}
+	const vk::CommandBuffer  buffer(command_buffer);
+	const vk::PipelineLayout layout(header.layout);
+	const auto               bind_point = static_cast<vk::PipelineBindPoint>(header.bind_point);
+	if (header.push_stages != 0) {
+		buffer.pushConstants(layout, static_cast<vk::ShaderStageFlags>(header.push_stages), 0,
+		                     sizeof(header.push_data), header.push_data.dwords.data());
+	}
+	if (header.set_writes[0] != 0) {
+		buffer.pushDescriptorSetKHR(bind_point, layout, 0, header.set_writes[0], vk_writes.data());
+	}
+	if (header.set_writes[1] != 0) {
+		buffer.pushDescriptorSetKHR(bind_point, layout, 1, header.set_writes[1],
+		                            vk_writes.data() + header.set_writes[0]);
+	}
+}
+
+// Hands the push constants (with nonempty stages) and push descriptor sets to the thread that
+// records `buffer`, as one payload call instead of one deep-copied call each; false when its
+// recording is not deferred, and the caller makes the calls. KYTY_DEBUG_AB=pushpayload has the
+// caller make them in every other window.
+bool RecordPushedBindings(vk::CommandBuffer buffer, vk::PipelineBindPoint bind_point,
+                          vk::PipelineLayout layout, vk::ShaderStageFlags push_stages,
+                          const ShaderRecompiler::IR::PushData&    push_data,
+                          std::span<const vk::WriteDescriptorSet> set0,
+                          std::span<const vk::WriteDescriptorSet> set1) {
+	static const bool ab = AbSelected("pushpayload");
+	if (ab && AbFeatureOff()) {
+		return false;
+	}
+	size_t info_count = 0;
+	for (const auto* set: {&set0, &set1}) {
+		for (const auto& write: *set) {
+			// Each write carries its infos in one of the two arrays; leave anything else to the
+			// calls as they were.
+			if ((write.pImageInfo == nullptr) == (write.pBufferInfo == nullptr)) {
+				return false;
+			}
+			info_count += write.descriptorCount;
+		}
+	}
+	const auto write_count = set0.size() + set1.size();
+	if (write_count == 0 && !push_stages) {
+		return true;
+	}
+	auto* payload =
+	    ReserveRecordedCall(static_cast<VkCommandBuffer>(buffer),
+	                        sizeof(RecordedBindings) + write_count * sizeof(RecordedWrite) +
+	                            info_count * RecordedInfoBytes);
+	if (payload == nullptr) {
+		return false;
+	}
+	auto& header       = *::new (payload) RecordedBindings;
+	header.layout      = static_cast<VkPipelineLayout>(layout);
+	header.bind_point  = static_cast<VkPipelineBindPoint>(bind_point);
+	header.push_stages = static_cast<VkShaderStageFlags>(push_stages);
+	header.set_writes  = {static_cast<uint32_t>(set0.size()), static_cast<uint32_t>(set1.size())};
+	header.push_data   = push_data;
+	auto* writes = reinterpret_cast<RecordedWrite*>(payload + sizeof(RecordedBindings));
+	auto* infos  = payload + sizeof(RecordedBindings) + write_count * sizeof(RecordedWrite);
+	for (const auto* set: {&set0, &set1}) {
+		for (const auto& write: *set) {
+			const bool images = write.pImageInfo != nullptr;
+			*writes++         = {write.dstBinding, write.descriptorCount,
+			                     static_cast<VkDescriptorType>(write.descriptorType), images ? 1u : 0u};
+			const size_t bytes = write.descriptorCount * RecordedInfoBytes;
+			std::memcpy(infos,
+			            images ? static_cast<const void*>(write.pImageInfo)
+			                   : static_cast<const void*>(write.pBufferInfo),
+			            bytes);
+			infos += bytes;
+		}
+	}
+	CommitRecordedCall(RunRecordedBindings);
+	return true;
+}
+
+} // namespace
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
@@ -1312,7 +1475,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					case BindingKind::Buffers:
 						for (const auto resource: binding.resources) {
 							const auto& view = descriptors.buffers.at(resource);
-							EXIT_IF(view.buffer == nullptr);
+							// With hardware bounds, a range without a whole dword is a null
+							// descriptor (see NativeStorageBuffer).
+							EXIT_IF(view.buffer == nullptr &&
+							        !m_context.GetGraphics().hardware_storage_buffer_bounds);
 							m_descriptor_buffers.push_back(view);
 						}
 						break;
@@ -1375,11 +1541,24 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
-	if (has_push_data) {
+	if (has_push_data && pipeline.push_constant_stages) {
 		// The stages must match the layout's push constant range exactly.
-		if (pipeline.push_constant_stages) {
-			push_stages = pipeline.push_constant_stages;
+		push_stages = pipeline.push_constant_stages;
+	}
+	// Set 0 holds compute or vertex-side descriptors; the pixel shader's tail goes to set 1.
+	const auto set0 = std::span(m_descriptor_writes).first(pixel_write_start);
+	const auto set1 = std::span(m_descriptor_writes).subspan(pixel_write_start);
+	if ((set0.empty() || pipeline.uses_push_descriptors) &&
+	    (set1.empty() || pipeline.pixel_uses_push)) {
+		EXIT_IF((!set0.empty() && pipeline.descriptor_set_layout == nullptr) ||
+		        (!set1.empty() && pipeline.pixel_set_layout == nullptr));
+		if (RecordPushedBindings(vk_buffer, pipeline_bind_point, pipeline.pipeline_layout,
+		                         has_push_data ? push_stages : vk::ShaderStageFlags {}, push_data,
+		                         set0, set1)) {
+			return;
 		}
+	}
+	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
 	}
@@ -1404,12 +1583,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, set_index, 1,
 		                             &set, 0, nullptr);
 	};
-	// Set 0 holds compute or vertex-side descriptors; the pixel shader's tail goes to set 1.
-	std::span<vk::WriteDescriptorSet> writes(m_descriptor_writes);
-	commit_set(0, pipeline.descriptor_set_layout, pipeline.uses_push_descriptors,
-	           writes.first(pixel_write_start));
-	commit_set(1, pipeline.pixel_set_layout, pipeline.pixel_uses_push,
-	           writes.subspan(pixel_write_start));
+	commit_set(0, pipeline.descriptor_set_layout, pipeline.uses_push_descriptors, set0);
+	commit_set(1, pipeline.pixel_set_layout, pipeline.pixel_uses_push, set1);
 }
 
 } // namespace Libs::Graphics

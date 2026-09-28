@@ -676,6 +676,53 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+// KYTY_VERIFY_DEPTH_REUSE=1: a draw that keeps its depth target's view acquires it anyway and
+// reports what the full acquisition changed or returned differently (see IsDepthTargetCurrent).
+static bool VerifyDepthReuse() {
+	static const bool enabled = std::getenv("KYTY_VERIFY_DEPTH_REUSE") != nullptr;
+	return enabled;
+}
+
+static void CheckDepthReuse(TextureCache& cache, const RenderDepthInfo& depth,
+                            vk::ImageView kept) {
+	const auto& image           = cache.GetImage(depth.image_id);
+	const bool  gpu_modified    = image.IsGpuModified();
+	const bool  depth_target    = image.usage.depth_target;
+	const bool  buffer_modified = image.IsBufferModified();
+	const bool  cpu_dirty       = image.IsCpuDirty();
+	const auto  stencil         = image.info.stencil;
+	const auto  metadata        = image.info.metadata;
+	const auto  meta_generation = cache.SurfaceMetaGeneration();
+	const auto  set_generation  = cache.ImageGeneration(depth.image_id);
+	const auto  view            = cache.FindDepthTarget(depth.image_id, depth.desc);
+	const auto& after           = cache.GetImage(depth.image_id);
+	const char* field           = nullptr;
+	if (view != kept) {
+		field = "view";
+	} else if (after.IsGpuModified() != gpu_modified || after.usage.depth_target != depth_target) {
+		field = "gpu-modified or usage";
+	} else if (after.IsBufferModified() != buffer_modified || after.IsCpuDirty() != cpu_dirty) {
+		field = "dirty state";
+	} else if (!(after.info.stencil == stencil) || !(after.info.metadata == metadata)) {
+		field = "stencil or metadata";
+	} else if (cache.SurfaceMetaGeneration() != meta_generation ||
+	           cache.ImageGeneration(depth.image_id) != set_generation) {
+		field = "surface metadata or image set";
+	}
+	static std::atomic<uint64_t> checked {0};
+	static std::atomic<uint64_t> missed {0};
+	const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (field != nullptr && missed.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("depth-reuse verify: 0x%016" PRIx64 " kept view would have missed a change: %s\n",
+		            image.info.data.address, field);
+	}
+	if (count % 100000 == 0) {
+		std::printf("depth-reuse verify: reuses=%" PRIu64 " missed=%" PRIu64 "\n", count,
+		            missed.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+	}
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -704,7 +751,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    cache.IsRenderTargetCurrent(target.image_id, acquired.view_generation)) {
 			image_view = acquired.view;
 		} else {
-			const auto generation    = cache.ImageSetGeneration();
+			const auto generation    = cache.ImageGeneration(target.image_id);
 			image_view               = cache.FindRenderTarget(target.image_id, target.desc);
 			acquired.view            = image_view;
 			acquired.view_image      = target.image_id;
@@ -737,7 +784,32 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
 			EXIT("depth target changed after render-state discovery\n");
 		}
-		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
+		// A clean depth target the previous draw acquired keeps its view (see
+		// IsDepthTargetCurrent). KYTY_DEBUG_AB=depthreuse acquires it every draw in every other
+		// window.
+		static const bool depth_ab = AbSelected("depthreuse");
+		auto&             acquired = m_depth_target_source;
+		vk::ImageView     image_view;
+		if (TargetReuseEnabled() && !(depth_ab && AbFeatureOff()) &&
+		    acquired.view_image == depth.image_id && acquired.view_info == depth.desc.view_info &&
+		    cache.IsDepthTargetCurrent(depth.image_id, acquired.view_generation,
+		                               acquired.view_meta_generation, depth.desc)) {
+			image_view = acquired.view;
+			if (VerifyDepthReuse()) [[unlikely]] {
+				CheckDepthReuse(cache, depth, image_view);
+			}
+		} else {
+			// Both generations from before the acquisition: its own changes make the next draw
+			// acquire again rather than trust a state it did not check.
+			const auto generation      = cache.ImageGeneration(depth.image_id);
+			const auto meta_generation = cache.SurfaceMetaGeneration();
+			image_view                 = cache.FindDepthTarget(depth.image_id, depth.desc);
+			acquired.view              = image_view;
+			acquired.view_image        = depth.image_id;
+			acquired.view_info         = depth.desc.view_info;
+			acquired.view_generation   = generation;
+			acquired.view_meta_generation = meta_generation;
+		}
 		const auto& metadata   = depth.desc.info.metadata;
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
 		    !cache.ClearMeta(metadata.range.address)) {
@@ -1738,16 +1810,24 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
+		g_pm4_ops.outcome = Pm4OpTimer::Empty;
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	// A color metadata operation, depth copy or resolve instead of a draw.
+	const auto operation =
+	    ConsumeMetadataColorOperation(buffer) ? Pm4OpTimer::MetadataOp
+	    : DepthStencilCopy(buffer)            ? Pm4OpTimer::DepthCopy
+	    : ResolveColorTargets(buffer, args.render_target_slice_offset) ? Pm4OpTimer::Resolve
+	                                                                   : Pm4OpTimer::Drawn;
+	if (operation != Pm4OpTimer::Drawn) {
+		g_pm4_ops.outcome = operation;
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
 		return;
 	}
 
@@ -1774,6 +1854,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
 		return;
 	}
 
@@ -1816,6 +1897,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                        args.instance_count, args.first_instance, args.indirect_args};
 	DrawRenderState state;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NotPrepared;
 		ResetBindings();
 		return;
 	}
@@ -1841,7 +1923,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
-	g_draw_phases.Begin();
+	g_draw_phases.Begin(true);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1858,16 +1940,24 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
+		g_pm4_ops.outcome = Pm4OpTimer::Empty;
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	// A color metadata operation, depth copy or resolve instead of a draw.
+	const auto operation =
+	    ConsumeMetadataColorOperation(buffer) ? Pm4OpTimer::MetadataOp
+	    : DepthStencilCopy(buffer)            ? Pm4OpTimer::DepthCopy
+	    : ResolveColorTargets(buffer, args.render_target_slice_offset) ? Pm4OpTimer::Resolve
+	                                                                   : Pm4OpTimer::Drawn;
+	if (operation != Pm4OpTimer::Drawn) {
+		g_pm4_ops.outcome = operation;
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
 		return;
 	}
 
@@ -1893,11 +1983,13 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NoShader;
 		ResetBindings();
 		return;
 	}
 	DrawRenderState state;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+		g_pm4_ops.outcome = Pm4OpTimer::NotPrepared;
 		ResetBindings();
 		return;
 	}
@@ -1912,6 +2004,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
+		g_pm4_ops.outcome = Pm4OpTimer::RectListSkip;
 		ResetBindings();
 		return;
 	}

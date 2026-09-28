@@ -42,6 +42,10 @@ struct GraphicContext {
 	// VK_KHR_pipeline_executable_properties, enabled only for KYTY_DEBUG_PIPELINE_STATS.
 	bool                               pipeline_executable_info_enabled      = false;
 	bool                               supports_block_texel_view              = false;
+	// Storage buffer word accesses leave their range check to robustBufferAccess2, and storage
+	// buffer ranges are rounded down to whole dwords (see
+	// ShaderRecompiler::SetHardwareStorageBufferBounds).
+	bool                               hardware_storage_buffer_bounds         = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

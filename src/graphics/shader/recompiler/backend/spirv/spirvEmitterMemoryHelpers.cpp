@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
@@ -156,6 +158,15 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 	const auto in_bounds = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_bounds, index, access.length);
 	return in_bounds;
+}
+
+uint32_t EmitWordAccessInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                uint32_t index) {
+	if (HardwareStorageBufferBounds() && (access.kind == IR::ResourceKind::Buffer ||
+	                                      access.kind == IR::ResourceKind::ScalarBuffer)) {
+		return ConstantBool(state, true);
+	}
+	return EmitMemoryElementInBounds(state, access, index);
 }
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,

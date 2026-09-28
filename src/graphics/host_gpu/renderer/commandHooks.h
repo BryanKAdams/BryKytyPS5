@@ -32,6 +32,16 @@ void MarkCommandHookThread();
 // taking the queue lock.
 void DrainGpuThreadCommands();
 
+// A call with a payload, recorded in order with the commands this thread records into `buffer`:
+// ReserveRecordedCall returns 16-byte-aligned room for `bytes` of payload, or null when `buffer` is
+// not routed through a stream this thread produces for (recording is not deferred, or another
+// thread routed it); then record the commands directly. Fill the payload, making no other Vulkan
+// calls into the stream, and CommitRecordedCall appends the call: the stream's consumer runs
+// run(buffer, payload), whose Vulkan calls go straight to the driver. The payload lives until run
+// returns.
+[[nodiscard]] uint8_t* ReserveRecordedCall(VkCommandBuffer buffer, size_t bytes);
+void CommitRecordedCall(void (*run)(VkCommandBuffer buffer, const uint8_t* payload));
+
 // An ordered stream of recorded Vulkan calls and other work, from the thread that routed it last
 // to one consumer. At most four exist at a time.
 class CommandStream {

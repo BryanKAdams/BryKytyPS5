@@ -405,6 +405,12 @@ uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess&
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
 
+// EmitMemoryElementInBounds for a plain word load or store (not an atomic, a formatted or a
+// subword store): constant true for a storage buffer whose range the device checks (see
+// HardwareStorageBufferBounds).
+uint32_t EmitWordAccessInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                uint32_t index);
+
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
 
@@ -494,6 +500,10 @@ void DefineGetBdaPointer(EmitterState& state);
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) {
+		fn();
+		return;
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);

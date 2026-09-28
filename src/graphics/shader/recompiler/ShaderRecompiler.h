@@ -38,6 +38,14 @@ struct CompileResult {
 	IR::Program            program;
 };
 
+// Plain word loads and stores of storage buffers leave their range check to the device: with
+// robustBufferAccess2, a load outside the bound range reads zero and a store there is dropped, as
+// the shader's comparison with the range would do. Set before any compile, only when the device
+// enables robustBufferAccess2 and nullDescriptor, checks storage buffer ranges in units of at most
+// four bytes, and the renderer rounds storage buffer ranges down to whole dwords.
+void SetHardwareStorageBufferBounds(bool enabled);
+[[nodiscard]] bool HardwareStorageBufferBounds();
+
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
 [[nodiscard]] CompileResult CompileProgram(TranslateResult translated,

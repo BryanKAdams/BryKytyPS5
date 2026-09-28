@@ -29,6 +29,9 @@ uint32_t LoadElementOrZero(EmitterState& state, const MemoryResourceAccess& reso
 	if (!IsStorageBufferAccess(resource)) {
 		return EmitValueOrZeroIfCondition(state, in_bounds, [&]() { return load(index); });
 	}
+	if (in_bounds == ConstantBool(state, true)) {
+		return load(index);
+	}
 	return Select(state, TypeU32(state), in_bounds, load(index), ConstantU32(state, 0));
 }
 
@@ -306,7 +309,7 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
-	const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+	const auto in_bounds = EmitWordAccessInBounds(ctx.state, resource, index);
 	return LoadElementOrZero(ctx.state, resource, in_bounds, index, [&](uint32_t element) {
 		return LoadWordInBounds(ctx, resource, element);
 	});
@@ -327,7 +330,7 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	                              ConstantU32(ctx.state, 2));
 	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
 	return LoadElementOrZero(
-	    ctx.state, resource, EmitMemoryElementInBounds(ctx.state, resource, index), index,
+	    ctx.state, resource, EmitWordAccessInBounds(ctx.state, resource, index), index,
 	    [&](uint32_t element) {
 		    return LoadSubwordInBounds(ctx, resource, address, element, bits, sign_extend);
 	    });
@@ -533,7 +536,7 @@ void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resour
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
-	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+	EmitIfCondition(ctx.state, EmitWordAccessInBounds(ctx.state, resource, index), [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});
 }
@@ -962,7 +965,7 @@ uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 			                                  address, ConstantU32(state, 2));
 			    const auto index     = EmitMemoryElementIndex(state, resource, raw_index);
 			    values[component]    = LoadElementOrZero(
-			        state, resource, EmitMemoryElementInBounds(state, resource, index), index,
+			        state, resource, EmitWordAccessInBounds(state, resource, index), index,
 			        [&](uint32_t element) { return LoadWordInBounds(ctx, resource, element); });
 		    }
 		    return ConstructU32Composite(state, components, values);
@@ -982,7 +985,7 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			const auto raw_index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
 			                              ConstantU32(state, 2));
 			const auto index = EmitMemoryElementIndex(state, resource, raw_index);
-			EmitIfCondition(state, EmitMemoryElementInBounds(state, resource, index),
+			EmitIfCondition(state, EmitWordAccessInBounds(state, resource, index),
 			                [&]() {
 				                StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, component + 1u));
 			                });
@@ -1216,7 +1219,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	const auto element   = EmitMemoryElementIndex(state, access, index);
-	const auto condition = EmitMemoryElementInBounds(state, access, element);
+	const auto condition = EmitWordAccessInBounds(state, access, element);
 	ctx.Define(inst, LoadElementOrZero(state, access, condition, element, [&](uint32_t target) {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(
 		               state, EmitMemoryElementPointer(state, access, target));

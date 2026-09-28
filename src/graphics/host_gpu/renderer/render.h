@@ -303,6 +303,13 @@ private:
 		uint32_t                metadata_base_layer = 0;
 		TextureCache::ImageDesc desc;
 		ImageId                 image_id;
+		// The view FindDepthTarget last returned (see TextureCache::IsDepthTargetCurrent);
+		// view_generation 0: none.
+		vk::ImageView           view;
+		ImageId                 view_image;
+		ImageViewInfo           view_info;
+		uint64_t                view_generation      = 0;
+		uint64_t                view_meta_generation = 0;
 	};
 
 	RenderContext&                        m_context;

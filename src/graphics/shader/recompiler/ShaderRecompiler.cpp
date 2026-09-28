@@ -483,6 +483,16 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
+static std::atomic<bool> g_hardware_storage_buffer_bounds {false};
+
+void SetHardwareStorageBufferBounds(bool enabled) {
+	g_hardware_storage_buffer_bounds.store(enabled, std::memory_order_relaxed);
+}
+
+bool HardwareStorageBufferBounds() {
+	return g_hardware_storage_buffer_bounds.load(std::memory_order_relaxed);
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");

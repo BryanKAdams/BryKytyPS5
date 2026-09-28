@@ -30,7 +30,10 @@ inline RenderDebugCounters g_render_debug_counters;
 // cpwrite (BDA epochs started by the GPU thread's own guest memory writes), streamhost (the stream
 // ring in cached host memory rather than device memory), colorclear (skipped color clear
 // rechecks), prioritywait (draw entry leaving operations queued rather than waiting for the
-// priority thread). 
+// priority thread), pushpayload (push constants and descriptors handed to the recording thread
+// as one payload call), pipelinememo (the last graphics pipeline reused without a map lookup),
+// depthreuse (a clean depth target keeping its view between draws), regiongen (image lookups and
+// views checked against the images over their own range rather than the whole image set).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
@@ -95,6 +98,10 @@ struct DrawPhaseTimer {
 		StreamCopy,       // ObtainBuffer's copies of small CPU-written buffers.
 		PendingOps,       // The scheduler's completed operations run at draw entry.
 		Bda,              // PrepareBda for stages reading memory through addresses.
+		SpeculationReads, // Repeating a speculated stage's guest reads before adopting it.
+		ResourceRefresh,  // Refreshing a stage's resources that were not adopted.
+		ProgramMatch,     // Finding the refreshed stage's permutation.
+		InputsCheck,      // Comparing the registers of speculation-prepared stage inputs.
 		ProbeCount
 	};
 	class ProbeScope {
@@ -116,9 +123,13 @@ struct DrawPhaseTimer {
 		uint64_t        m_start;
 	};
 	static uint64_t Hash();
-	void            Begin() {
+	// The time stamp counter the phases are measured in.
+	static uint64_t Now();
+	// auto_draw: a DRAW_INDEX_AUTO packet's draw, also accounted on its own line.
+	void            Begin(bool auto_draw = false) {
 		if (Hash() != 0) [[unlikely]] {
-			active = true;
+			active    = true;
+			auto_kind = auto_draw;
 			current.fill(0);
 			probes.fill(0);
 			last = Now();
@@ -137,14 +148,39 @@ struct DrawPhaseTimer {
 	[[nodiscard]] bool Active() const noexcept { return active; }
 
 private:
-	static uint64_t Now();
-
-	bool                             active = false;
-	uint64_t                         last   = 0;
+	bool                             active    = false;
+	bool                             auto_kind = false;
+	uint64_t                         last      = 0;
 	std::array<uint64_t, Count>      current {};
 	std::array<uint64_t, ProbeCount> probes {};
 };
 inline thread_local DrawPhaseTimer g_draw_phases;
+
+// With KYTY_DEBUG_DRAW_PHASES: the render thread's time in each PM4 packet's handler, by opcode,
+// and in ProcessPm4 between handlers, printed as a "pm4-ops" line after each draw-phases line.
+// Draw handlers include their draw phases; the rest is the time no draw phase covers.
+struct Pm4OpTimer {
+	// How a draw packet's handler ended (set by the handler, reset before each packet).
+	enum Outcome : uint8_t {
+		Drawn,
+		Empty,         // No vertices or instances.
+		MetadataOp,    // A color metadata (clear) operation instead of a draw.
+		DepthCopy,     // A depth/stencil copy instead of a draw.
+		Resolve,       // A color resolve instead of a draw.
+		NoShader,      // No valid vertex shader or no topology.
+		NotPrepared,   // Programs pending or no target (PrepareDrawRenderState).
+		RectListSkip,  // A rect list with nothing to interpolate.
+		OutcomeCount
+	};
+	std::array<uint64_t, 256> ticks {};
+	std::array<uint64_t, 256> counts {};
+	uint64_t                  between = 0;
+	Outcome                   outcome = Drawn;
+	// By outcome: [0] indexed draw packets, [1] DRAW_INDEX_AUTO.
+	std::array<std::array<uint64_t, OutcomeCount>, 2> outcome_ticks {};
+	std::array<std::array<uint64_t, OutcomeCount>, 2> outcome_counts {};
+};
+inline thread_local Pm4OpTimer g_pm4_ops;
 
 // KYTY_DEBUG_UPLOADS=1 (with KYTY_DEBUG_DRAW_PHASES): guest memory copied for the GPU, counted
 // per source and printed after each draw-phases line with the images and 4 MiB regions copied

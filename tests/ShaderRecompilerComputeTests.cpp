@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandHooks.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/meshIndirect.h"
@@ -1201,6 +1202,82 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
+// --hardware-buffer-bounds: the cases run with storage buffer word accesses left to the
+// device's robustBufferAccess2 (ShaderRecompiler::SetHardwareStorageBufferBounds).
+bool g_hardware_buffer_bounds_requested = false;
+
+// Payload calls (ReserveRecordedCall/CommitRecordedCall) run on the stream's consumer in order
+// with pushed work, with the routed buffer and their whole payload; other threads and buffers
+// that are not routed get no room. No GPU: the command buffer is only a handle.
+namespace CommandStreamPayloadTest {
+std::vector<int64_t> g_order; // Consumer only, read after a drain.
+bool g_payload_ok = true;
+const auto g_buffer = reinterpret_cast<VkCommandBuffer>(uintptr_t{0x1230});
+
+void Run(VkCommandBuffer buffer, const uint8_t *payload) {
+  uint32_t index = 0;
+  uint32_t size = 0;
+  std::memcpy(&index, payload, sizeof(index));
+  std::memcpy(&size, payload + 4, sizeof(size));
+  g_payload_ok = g_payload_ok && buffer == g_buffer &&
+                 reinterpret_cast<uintptr_t>(payload) % 16u == 0;
+  for (uint32_t i = 8; i < size; i++) {
+    g_payload_ok = g_payload_ok && payload[i] == static_cast<uint8_t>(index + i);
+  }
+  g_order.push_back(index);
+}
+} // namespace CommandStreamPayloadTest
+
+void CheckCommandStreamPayloads() {
+  using namespace CommandStreamPayloadTest;
+  using Libs::Graphics::CommitRecordedCall;
+  using Libs::Graphics::ReserveRecordedCall;
+  constexpr const char *name = "CommandStreamPayloads";
+  Libs::Graphics::CommandStream stream;
+  std::jthread consumer([&](std::stop_token stop) { stream.Consume(stop); });
+  stream.Route(g_buffer);
+  Require(name, "other buffer",
+          ReserveRecordedCall(reinterpret_cast<VkCommandBuffer>(uintptr_t{0x4560}), 16) ==
+              nullptr,
+          "a buffer that is not routed got payload room");
+  bool other_thread_refused = false;
+  std::thread([&] { other_thread_refused = ReserveRecordedCall(g_buffer, 16) == nullptr; })
+      .join();
+  Require(name, "other thread", other_thread_refused,
+          "a thread that did not route the buffer got payload room");
+  std::vector<int64_t> expected;
+  for (uint32_t i = 0; i < 3000; i++) {
+    const uint32_t size = 8u + (i * 37u) % 1500u;
+    auto *payload = ReserveRecordedCall(g_buffer, size);
+    Require(name, "reserve", payload != nullptr, "the routing thread got no payload room");
+    std::memcpy(payload, &i, sizeof(i));
+    std::memcpy(payload + 4, &size, sizeof(size));
+    for (uint32_t b = 8; b < size; b++) {
+      payload[b] = static_cast<uint8_t>(i + b);
+    }
+    CommitRecordedCall(Run);
+    expected.push_back(i);
+    if (i % 7u == 0) {
+      const auto marker = -static_cast<int64_t>(i) - 1;
+      stream.Push([marker] { g_order.push_back(marker); });
+      expected.push_back(marker);
+    }
+    if (i % 500u == 0) {
+      stream.Wake();
+    }
+  }
+  stream.Route(VK_NULL_HANDLE);
+  stream.Wake();
+  stream.Drain();
+  Require(name, "order", g_order == expected,
+          "payload calls and pushed work ran out of order or went missing");
+  Require(name, "payload", g_payload_ok,
+          "a payload call saw the wrong buffer, a misaligned payload or changed bytes");
+  consumer.request_stop();
+  consumer.join();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -1492,7 +1569,11 @@ void CheckRectListShaders() {
 }
 
 void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
-  if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
+  // The cases' SPIR-V shapes are checked in the default run; with hardware
+  // bounds the range compares they may count on are gone, so only results are
+  // checked.
+  if ((test.required_spirv.empty() && test.forbidden_spirv.empty()) ||
+      g_hardware_buffer_bounds_requested) {
     return;
   }
 
@@ -16361,6 +16442,8 @@ private:
         m_provoking_vertex_supported;
     m_runtime_context.conditional_rendering_enabled =
         m_conditional_rendering_supported;
+    m_runtime_context.hardware_storage_buffer_bounds =
+        g_hardware_buffer_bounds_requested && m_hardware_buffer_bounds_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -16509,9 +16592,11 @@ private:
     available_conditional_rendering.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
     available_min_lod.pNext = &available_conditional_rendering;
+    vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
+    available_robustness2.pNext = &available_min_lod;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_min_lod;
+    available_features2.pNext = &available_robustness2;
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
@@ -16592,6 +16677,18 @@ private:
     m_conditional_rendering_supported =
         available_conditional_rendering.conditionalRendering &&
         has_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+    // As the emulator does: robustBufferAccess2 and null descriptors when available.
+    m_robustness2_supported = has_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) &&
+                              available_robustness2.robustBufferAccess2 &&
+                              available_robustness2.nullDescriptor;
+    if (m_robustness2_supported) {
+      vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties{};
+      vk::PhysicalDeviceProperties2 properties2{};
+      properties2.pNext = &robustness2_properties;
+      m_physical_device.getProperties2(&properties2);
+      m_hardware_buffer_bounds_supported =
+          robustness2_properties.robustStorageBufferAccessSizeAlignment <= sizeof(u32);
+    }
     std::printf("[host] Optional features: attachment feedback=%s, dynamic "
                 "feedback=%s, provoking vertex last=%s, conditional rendering=%s\n",
                 m_feedback_loop_supported ? "yes" : "no",
@@ -16732,12 +16829,27 @@ private:
       device_info.pNext = &executable_info;
       device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }
+    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
+    if (m_robustness2_supported) {
+      robustness2.robustBufferAccess2 = true;
+      robustness2.nullDescriptor = true;
+      robustness2.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &robustness2;
+      device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
+    if (g_hardware_buffer_bounds_requested) {
+      if (!m_hardware_buffer_bounds_supported) {
+        std::printf("[host] hardware storage buffer bounds are not supported; skipped\n");
+        std::exit(0);
+      }
+      ShaderRecompiler::SetHardwareStorageBufferBounds(true);
+    }
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
@@ -17066,6 +17178,8 @@ private:
   bool m_feedback_dynamic_supported = false;
   bool m_provoking_vertex_supported = false;
   bool m_conditional_rendering_supported = false;
+  bool m_robustness2_supported = false;
+  bool m_hardware_buffer_bounds_supported = false;
   bool m_executable_info_supported = false;
   bool m_subgroup_size_control_supported = false;
   std::unique_ptr<RenderContext> m_renderer;
@@ -35147,6 +35261,16 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   CheckAttachmentFeedbackPipelineKeys();
+  if (argc >= 2 && std::strcmp(argv[1], "--hardware-buffer-bounds") == 0) {
+    g_hardware_buffer_bounds_requested = true;
+    argv[1] = argv[0];
+    ++argv;
+    --argc;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--command-stream-only") == 0) {
+    CheckCommandStreamPayloads();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--shader-precompile-only") == 0) {
     VulkanHarness vulkan;
     CheckShaderPrecompileGpu(vulkan);

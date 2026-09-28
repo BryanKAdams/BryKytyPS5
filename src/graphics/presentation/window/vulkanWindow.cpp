@@ -19,6 +19,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -601,6 +602,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
+	vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
+	if (robustness2_ext_enabled) {
+		robustness2_properties.pNext = properties2.pNext;
+		properties2.pNext            = &robustness2_properties;
+	}
 	physical_device.getProperties2(&properties2);
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
@@ -716,9 +722,26 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
-	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
+	// Storage buffer range checks can be left to the device when out-of-range dword accesses are
+	// defined (robustBufferAccess2, checked in units of at most a dword) and a range too short for
+	// one dword can be bound as a null descriptor. KYTY_DEBUG_HW_BUFFER_BOUNDS=1 enables it while
+	// its gain is measured.
+	const char* hardware_bounds = std::getenv("KYTY_DEBUG_HW_BUFFER_BOUNDS");
+	graphics.hardware_storage_buffer_bounds =
+	    hardware_bounds != nullptr && std::strcmp(hardware_bounds, "1") == 0 &&
+	    robustness2_ext_enabled && robustness2.robustBufferAccess2 == VK_TRUE &&
+	    robustness2.nullDescriptor == VK_TRUE &&
+	    robustness2_properties.robustStorageBufferAccessSizeAlignment <= sizeof(uint32_t);
+	ShaderRecompiler::SetHardwareStorageBufferBounds(graphics.hardware_storage_buffer_bounds);
+
+	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s robustBufferAccess2=%s "
+	     "nullDescriptor=%s storage alignment=%u hardware storage buffer bounds=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
-	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
+	     robustness2_ext_enabled && robustness2.robustBufferAccess2 == VK_TRUE ? "true" : "false",
+	     robustness2_ext_enabled && robustness2.nullDescriptor == VK_TRUE ? "true" : "false",
+	     static_cast<uint32_t>(robustness2_properties.robustStorageBufferAccessSizeAlignment),
+	     graphics.hardware_storage_buffer_bounds ? "on" : "off");
 
 	vk::DeviceCreateInfo create_info {};
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};

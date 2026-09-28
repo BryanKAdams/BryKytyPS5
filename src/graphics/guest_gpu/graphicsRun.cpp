@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -970,6 +971,9 @@ static bool IsDispatchOpcode(uint32_t opcode) {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	// KYTY_DEBUG_DRAW_PHASES: the time in each handler and between them (see Pm4OpTimer).
+	static const bool timed       = DrawPhaseTimer::Hash() != 0;
+	uint64_t          handler_end = 0;
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -1058,9 +1062,33 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    m_speculator != nullptr && IsDrawOpcode(opcode) && DrawSpeculator::Enabled();
 		if (speculated) {
 			t_speculated_draw = m_speculator->Take(packet);
+			// KYTY_DEBUG_AB=specprefetch skips the prefetch in every other window.
+			static const bool ab_prefetch = AbSelected("specprefetch"); // AB-TEMP
+			if (t_speculated_draw != nullptr && !(ab_prefetch && AbFeatureOff())) {
+				PrefetchSpeculatedDraw(*t_speculated_draw);
+			}
+		}
+		uint64_t handler_start = 0;
+		if (timed) [[unlikely]] {
+			handler_start = DrawPhaseTimer::Now();
+			if (handler_end != 0) {
+				g_pm4_ops.between += handler_start - handler_end;
+			}
+			g_pm4_ops.outcome = Pm4OpTimer::Drawn;
 		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		if (timed) [[unlikely]] {
+			handler_end       = DrawPhaseTimer::Now();
+			const auto ticks = handler_end - handler_start;
+			g_pm4_ops.ticks[opcode] += ticks;
+			g_pm4_ops.counts[opcode]++;
+			if (IsDrawOpcode(opcode)) {
+				const auto kind = opcode == Pm4::IT_DRAW_INDEX_AUTO ? 1u : 0u;
+				g_pm4_ops.outcome_ticks[kind][g_pm4_ops.outcome] += ticks;
+				g_pm4_ops.outcome_counts[kind][g_pm4_ops.outcome]++;
+			}
+		}
 		if (speculated) {
 			m_speculator->Release(t_speculated_draw);
 			t_speculated_draw = nullptr;

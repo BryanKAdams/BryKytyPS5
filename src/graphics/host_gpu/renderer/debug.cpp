@@ -794,7 +794,8 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	    "pipeline", "records",   "commit",     "record",     "tail"};
 	static constexpr std::array<const char*, ProbeCount> ProbeNames {
 	    "rt-image", "tex-image", "tex-describe", "buf-written", "buf-read", "buf-invalidate",
-	    "upload",   "find-finish", "stream-copy", "pending-ops", "bda"};
+	    "upload",   "find-finish", "stream-copy", "pending-ops", "bda",       "spec-reads",
+	    "refresh",  "prog-match",  "inputs-check"};
 	static std::array<uint64_t, Count>      totals {};
 	static std::array<uint64_t, ProbeCount> probe_totals {};
 	static uint64_t draws        = 0;
@@ -809,6 +810,9 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	for (const auto ticks: current) {
 		sum += ticks;
 	}
+	// DRAW_INDEX_AUTO draws, also on their own (see Begin).
+	static std::array<uint64_t, Count> auto_totals {};
+	static uint64_t                    auto_draws = 0;
 	if (pixel_hash == Hash() || Hash() == AllDraws) {
 		for (uint32_t i = 0; i < Count; i++) {
 			totals[i] += current[i];
@@ -817,6 +821,12 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 			probe_totals[i] += probes[i];
 		}
 		draws++;
+		if (auto_kind) {
+			for (uint32_t i = 0; i < Count; i++) {
+				auto_totals[i] += current[i];
+			}
+			auto_draws++;
+		}
 	} else {
 		other_draws++;
 		other_ticks += sum;
@@ -873,8 +883,57 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 		                    draws != 0 ? probe_totals[i] * to_us / draws : 0.0);
 	}
 	std::printf("%s\n", line.c_str());
+	if (auto_draws != 0) {
+		uint64_t auto_all = 0;
+		for (const auto ticks: auto_totals) {
+			auto_all += ticks;
+		}
+		std::string auto_line = fmt::format("draw-phases auto: draws/s={:.0f} us/draw={:.2f} |",
+		                                    auto_draws / seconds, auto_all * to_us / auto_draws);
+		for (uint32_t i = 0; i < Count; i++) {
+			auto_line += fmt::format(" {}={:.2f}", Names[i], auto_totals[i] * to_us / auto_draws);
+		}
+		std::printf("%s\n", auto_line.c_str());
+		auto_totals.fill(0);
+		auto_draws = 0;
+	}
 	if (UploadStatsEnabled()) {
 		PrintUploadStats(seconds);
+	}
+	{
+		// The PM4 handlers that took the most time, as opcode:packets/s:ms/s.
+		auto&                                          ops = g_pm4_ops;
+		std::array<std::pair<uint64_t, uint32_t>, 256> ranked {};
+		uint64_t                                       handled = 0;
+		for (uint32_t op = 0; op < 256; op++) {
+			ranked[op] = {ops.ticks[op], op};
+			handled += ops.ticks[op];
+		}
+		std::ranges::sort(ranked, std::greater {});
+		std::string pm4 = fmt::format("pm4-ops: handlers ms/s={:.1f} between ms/s={:.1f} |",
+		                              handled * to_us / 1000.0 / seconds,
+		                              ops.between * to_us / 1000.0 / seconds);
+		for (uint32_t i = 0; i < 12 && ranked[i].first != 0; i++) {
+			const auto op = ranked[i].second;
+			pm4 += fmt::format(" {:02x}:{:.0f}:{:.2f}", op, ops.counts[op] / seconds,
+			                   ops.ticks[op] * to_us / 1000.0 / seconds);
+		}
+		// Draw packets by how their handler ended, as outcome:packets/s:ms/s.
+		static constexpr std::array<const char*, Pm4OpTimer::OutcomeCount> OutcomeNames {
+		    "drawn", "empty", "metadata", "depth-copy", "resolve", "no-shader", "not-prepared",
+		    "rect-skip"};
+		for (uint32_t kind = 0; kind < 2; kind++) {
+			pm4 += kind == 0 ? " | indexed:" : " | auto:";
+			for (uint32_t outcome = 0; outcome < Pm4OpTimer::OutcomeCount; outcome++) {
+				if (ops.outcome_counts[kind][outcome] != 0) {
+					pm4 += fmt::format(" {}:{:.0f}:{:.2f}", OutcomeNames[outcome],
+					                   ops.outcome_counts[kind][outcome] / seconds,
+					                   ops.outcome_ticks[kind][outcome] * to_us / 1000.0 / seconds);
+				}
+			}
+		}
+		std::printf("%s\n", pm4.c_str());
+		ops = {};
 	}
 	if (AbEnabled()) {
 		g_ab_off.store(!AbFeatureOff(), std::memory_order_relaxed);

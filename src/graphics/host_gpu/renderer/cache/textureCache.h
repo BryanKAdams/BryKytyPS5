@@ -50,24 +50,43 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	// When the lookup finds exactly one image with the same backing, *unique_generation receives
-	// the image set's generation, else 0: until an image is registered or unregistered, the same
-	// request finds the same image, and RefindImage does the rest of FindImage for it.
+	// the generation of the images over the request's range (RangeGeneration), else 0: until an
+	// image over the range is registered or unregistered, the same request finds the same image,
+	// and RefindImage does the rest of FindImage for it.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      uint64_t* unique_generation = nullptr);
 	// FindImage's bookkeeping for a request FindImage resolved to id under generation (see
-	// unique_generation). Returns false, doing nothing, when the image set changed since.
+	// unique_generation). Returns false, doing nothing, when the images over the request's range
+	// changed since.
 	[[nodiscard]] bool          RefindImage(ImageId id, uint64_t generation, const ImageDesc& desc,
 	                                        uint32_t metadata_base_layer);
-	[[nodiscard]] uint64_t      ImageSetGeneration() const noexcept {
-		return m_image_set_generation.load(std::memory_order_acquire);
+	// The newest registration or unregistration of an image over `range`, as a stamp of the whole
+	// image set's generation (never 0): unchanged while no image over the range came or went.
+	// Registering an image stamps its range with a newer value, so a range that gained an image
+	// never shows an older one, whatever image slots are reused. Reads without m_lock.
+	[[nodiscard]] uint64_t      RangeGeneration(GuestRange range) const noexcept;
+	// RangeGeneration over the image's range.
+	[[nodiscard]] uint64_t      ImageGeneration(ImageId id) const noexcept {
+		return RangeGeneration(m_slot_images[id].info.data);
 	}
-	// Whether FindTexture for a sampled texture that returned a view while the image set had this
-	// generation would now only touch the image and return that view again: the image and its
-	// views still live, and it needs no refresh. Reads the image without m_lock, as GetImage does.
+	// Whether FindTexture for a sampled texture that returned a view while the image had this
+	// generation (ImageGeneration) would now only touch the image and return that view again: the
+	// image and its views still live, and it needs no refresh. Reads the image without m_lock, as
+	// GetImage does.
 	[[nodiscard]] bool          IsTextureCurrent(ImageId id, uint64_t generation) const noexcept;
 	// The same for FindRenderTarget: the target is also GPU-owned already, so marking it written
 	// changes nothing.
 	[[nodiscard]] bool IsRenderTargetCurrent(ImageId id, uint64_t generation) const noexcept;
+	// The same for FindDepthTarget with a depth-only request: the target is also GPU-owned and a
+	// depth target already, with the request's metadata, and no surface metadata entry was added
+	// or removed since meta_generation (SurfaceMetaGeneration before that acquisition), so the
+	// entry it made is still there.
+	[[nodiscard]] bool     IsDepthTargetCurrent(ImageId id, uint64_t generation,
+	                                            uint64_t meta_generation,
+	                                            const ImageDesc& desc) const noexcept;
+	[[nodiscard]] uint64_t SurfaceMetaGeneration() const noexcept {
+		return m_surface_meta_generation.load(std::memory_order_acquire);
+	}
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -234,7 +253,8 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	// Bumped when m_surface_metas gains an entry (see ColorClearUnchanged).
+	// Bumped when m_surface_metas gains or loses an entry (see ColorClearUnchanged and
+	// IsDepthTargetCurrent).
 	std::atomic<uint64_t>                             m_surface_meta_generation {0};
 	RangeSet                                          m_dcc_metadata_seen;
 	struct DccCheckedSlice {
@@ -265,8 +285,12 @@ private:
 	// every request field SameBacking and the lookup's checks read. A lookup only sees registered
 	// images, whose fields SameBacking reads never change, so a result stays right until an image
 	// is registered or unregistered, which bumps m_image_set_generation. Caller holds m_lock.
+	// A scene looks up more distinct textures than a small direct-mapped table holds (Sky Garden
+	// missed 55% of lookups in 512 entries), so the table is set-associative and replaces entries
+	// of an older image set first, then the least recently used.
 	struct ImageLookup {
 		uint64_t            generation = 0;
+		uint64_t            last_use   = 0;
 		GuestRange          data;
 		vk::Extent3D        extent;
 		ImageSubresources   resources;
@@ -285,16 +309,20 @@ private:
 			       type == info.type && exact_format == exact;
 		}
 	};
-	[[nodiscard]] static size_t ImageLookupSlot(const ImageInfo& info, bool exact) noexcept {
+	static constexpr size_t ImageLookupWays = 4;
+	static constexpr size_t ImageLookupSets = 1024;
+	// The first entry of the request's set.
+	[[nodiscard]] ImageLookup* ImageLookupSet(const ImageInfo& info, bool exact) noexcept {
 		auto hash = info.data.address ^ (info.data.size * 0x9e3779b97f4a7c15ull) ^
 		            (static_cast<uint64_t>(info.pixel_format) << 1u) ^ (exact ? 1u : 0u);
 		hash ^= hash >> 29u;
 		hash *= 0xbf58476d1ce4e5b9ull;
 		hash ^= hash >> 32u;
-		return static_cast<size_t>(hash % ImageLookupCount);
+		return &m_image_lookups[static_cast<size_t>(hash % ImageLookupSets) * ImageLookupWays];
 	}
-	static constexpr size_t              ImageLookupCount = 512;
-	std::array<ImageLookup, ImageLookupCount> m_image_lookups {};
+	std::vector<ImageLookup> m_image_lookups =
+	    std::vector<ImageLookup>(ImageLookupSets * ImageLookupWays);
+	uint64_t m_image_lookup_clock = 0;
 	// Each cache counts from its own base, so a generation remembered from one cache (a test's
 	// earlier context, say) never matches another's.
 	[[nodiscard]] static uint64_t        NextGenerationBase() noexcept {
@@ -303,6 +331,16 @@ private:
 	}
 	// Changed under m_lock; IsTextureCurrent reads it without.
 	std::atomic<uint64_t>                m_image_set_generation {NextGenerationBase()};
+	const uint64_t m_image_set_base = m_image_set_generation.load(std::memory_order_relaxed);
+	// The stamp (an m_image_set_generation value) of the newest registration or unregistration
+	// over each 2 MiB guest region, hashed into buckets: a bucket shared by two regions only costs
+	// extra misses. Stamped under m_lock; RangeGeneration reads without.
+	static constexpr uint32_t RegionGenerationBits    = 21;
+	static constexpr size_t   RegionGenerationBuckets = size_t {1} << 16u;
+	std::vector<std::atomic<uint64_t>> m_region_generations =
+	    std::vector<std::atomic<uint64_t>>(RegionGenerationBuckets);
+	// Advances the image set's generation and stamps the image's regions with it.
+	void AdvanceImageSetGeneration(GuestRange range) noexcept;
 	// Bumped whenever an image becomes GPU-modified (MarkGpuModified); with the image set
 	// generation it validates IsRegionGpuModified's per-thread record of clean pages.
 	std::atomic<uint64_t>                m_gpu_modified_generation {NextGenerationBase()};

@@ -306,6 +306,34 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Changes whenever a shader is registered: stage inputs prepared while it held still hold for the
+// shader map (read it before preparing).
+[[nodiscard]] uint64_t ShaderMapVersion();
+
+// The guest reads a vertex stage's input preparation makes of its attribute and buffer tables (see
+// ShaderApplyAttribSemantics), recorded on a thread while t_vertex_table_reads points here.
+struct VertexTableReads {
+	struct Read {
+		uint64_t address = 0;
+		uint32_t dwords  = 0;
+		uint32_t first   = 0; // Into words.
+	};
+	uint32_t                                                        count    = 0;
+	bool                                                            complete = true; // All fit.
+	std::array<Read, 2>                                             reads;
+	std::array<uint32_t, 256 + 4 * ShaderVertexInputInfo::RES_MAX> words;
+};
+inline thread_local VertexTableReads* t_vertex_table_reads = nullptr;
+// GPU thread: whether each recorded read, made again, gives the same words.
+[[nodiscard]] bool VertexTableReadsUnchanged(const VertexTableReads& reads);
+
+// Copies the parts of a prepared vertex stage input that are read: the fields, and the resource and
+// buffer entries up to their counts. `target` may be unconstructed.
+void CopyVertexInputInfo(ShaderVertexInputInfo& target, const ShaderVertexInputInfo& source);
+// Whether two prepared stage inputs are the same, field by field (their `stage` aside).
+[[nodiscard]] bool SameVertexInputInfo(const ShaderVertexInputInfo& a,
+                                       const ShaderVertexInputInfo& b);
+[[nodiscard]] bool SamePixelInputInfo(const ShaderPixelInputInfo& a, const ShaderPixelInputInfo& b);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

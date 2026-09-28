@@ -259,12 +259,9 @@ private:
 			        (hash >> 2u);
 		}
 
-		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
-			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-			for (std::size_t i = 0; i < sizeof(params); i++) {
-				Mix(hash, bytes[i]);
-			}
-		}
+		// One hash of the packed parameters: mixing their 129 bytes one at a time was a chain of
+		// dependent steps on every draw's pipeline lookup.
+		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params);
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
 			Mix(hash, rendering.color_count);
@@ -311,6 +308,10 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_prefetched;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// The last pipeline GetGraphicsPipeline returned and its key, under m_mutex: consecutive draws
+	// mostly use the same pipeline, and comparing keys is cheaper than hashing one.
+	GraphicsPipelineKey m_last_graphics_key;
+	Pipeline*           m_last_graphics_pipeline = nullptr;
 	// Asynchronous pipelines: draws skipped so far for each pipeline whose parts are compiling.
 	std::unordered_map<GraphicsPipelineKey, uint32_t, GraphicsPipelineKeyHash> m_deferred_draws;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
