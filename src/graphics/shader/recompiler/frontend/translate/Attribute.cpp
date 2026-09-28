@@ -136,6 +136,23 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 			              IR::Value(std::bit_cast<uint32_t>(1.0f))};
 		}
 	}
+	if (DebugPsTap().Active(program) && inst.exp.target < 8u && inst.exp.en != 0u) [[unlikely]] {
+		for (uint32_t source = 0; source < std::min(inst.src_count, 4u); source++) {
+			ir.Emit(IR::ValueOpcode::ReferenceU32, {components[source]});
+		}
+		const auto tapped = [&](uint32_t index) {
+			return IR::U32(
+			    ir.GetVectorReg(static_cast<IR::VectorReg>(PsTap::FirstRegister + index)));
+		};
+		if (inst.exp.compr) {
+			components[0] = PackHalf2x16(ir.BitCastF32(tapped(0)), ir.BitCastF32(tapped(1)));
+			components[1] = PackHalf2x16(ir.BitCastF32(tapped(2)),
+			                             ir.BitCastF32(IR::U32(IR::Value(std::bit_cast<uint32_t>(1.0f)))));
+		} else {
+			components = {tapped(0), tapped(1), tapped(2),
+			              IR::Value(std::bit_cast<uint32_t>(1.0f))};
+		}
+	}
 	const auto data = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
 	                          {components[0], components[1], components[2], components[3]});
 	ir.Emit(IR::ValueOpcode::SetAttribute, {data, ir.GetExec()}, AddExportInfo(inst));

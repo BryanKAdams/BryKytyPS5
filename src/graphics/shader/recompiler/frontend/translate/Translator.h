@@ -21,6 +21,22 @@ struct LoopHeat {
 };
 const LoopHeat& DebugLoopHeat();
 
+// Debug: KYTY_DEBUG_PS_TAP=<hash>:<pc>:<vgpr>[:<vgpr>[:<vgpr>]] makes that pixel shader export, in
+// place of every colour target, the values those guest VGPRs held right after the instruction at
+// <pc> (red, green, blue; 0 where the wave did not run it): pictures of intermediate values, to
+// find the first one that is wrong. PC and VGPR numbers are hexadecimal and decimal respectively.
+struct PsTap {
+	static constexpr uint32_t FirstRegister = 247; // Spare VGPRs holding the tapped values.
+	uint64_t                  hash          = 0;
+	uint32_t                  pc            = UINT32_MAX;
+	std::array<uint32_t, 3>   vgprs {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+
+	[[nodiscard]] bool Active(const IR::Program& program) const {
+		return hash != 0 && program.shader_hash == hash && program.stage == ShaderType::Pixel;
+	}
+};
+const PsTap& DebugPsTap();
+
 // Whether a wave32 guest program may run in a 64-lane host subgroup: pixel and compute pipelines
 // require the guest's wave size, but drivers need not take a required size for vertex stages
 // (AMD runs them as wave64). Host lanes 32-63 are then a second guest wave: their EXEC, VCC and
@@ -37,6 +53,7 @@ public:
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void CountLoopHeat(uint32_t counter);
+	void CopyPsTap();
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info);

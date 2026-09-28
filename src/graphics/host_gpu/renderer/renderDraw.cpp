@@ -1909,14 +1909,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              : 0;
 		std::printf("draw-log: t=%.3f draw=%" PRIu64 " vs=%016" PRIx64
 		            " mesh=%u gpu_args=%u indexed=%u prim=%u index_count=%u instances=%u"
-		            " index_limit=%" PRIu64 " index_bytes=%u per_group=%u groups=%u extent=%ux%u\n",
+		            " index_limit=%" PRIu64 " index_bytes=%u per_group=%u groups=%u extent=%ux%u"
+		            " args=0x%" PRIx64 "\n",
 		            DrawLog::Seconds(), draws, vertex != nullptr ? vertex->shader_hash : 0,
 		            mesh_active, gpu_args, draw.IsIndexed(),
 		            static_cast<uint32_t>(ucfg.GetPrimType()), draw.index_count, draw.instance_count,
 		            index_limit, index_source.guest_element_size,
 		            mesh_active ? state.vertex_info[0].mesh.primitives_per_group : 0u, mesh_groups,
 		            state.color_count > 0 ? state.color_info[0].Extent().width : 0u,
-		            state.color_count > 0 ? state.color_info[0].Extent().height : 0u);
+		            state.color_count > 0 ? state.color_info[0].Extent().height : 0u,
+		            draw.indirect_args);
 		if (gpu_args) {
 			DrawLog::PendingOutputs().push_back(
 			    {gpu_output_mapped, draws, std::chrono::steady_clock::now()});

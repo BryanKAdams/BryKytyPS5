@@ -144,6 +144,47 @@ const LoopHeat& DebugLoopHeat() {
 	return heat;
 }
 
+const PsTap& DebugPsTap() {
+	static const PsTap tap = [] {
+		PsTap       result;
+		const char* text = std::getenv("KYTY_DEBUG_PS_TAP");
+		if (text == nullptr) {
+			return result;
+		}
+		char* end   = nullptr;
+		result.hash = std::strtoull(text, &end, 16);
+		if (end == nullptr || *end != ':') {
+			result.hash = 0;
+			return result;
+		}
+		result.pc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		for (auto& vgpr: result.vgprs) {
+			if (end == nullptr || *end != ':') {
+				break;
+			}
+			vgpr = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+		}
+		return result;
+	}();
+	return tap;
+}
+
+void Translator::CopyPsTap() {
+	const auto& tap = DebugPsTap();
+	for (uint32_t i = 0; i < tap.vgprs.size(); i++) {
+		if (tap.vgprs[i] < PsTap::FirstRegister) {
+			ir.SetVectorReg(static_cast<IR::VectorReg>(PsTap::FirstRegister + i),
+			                ir.GetVectorReg(static_cast<IR::VectorReg>(tap.vgprs[i])));
+		}
+	}
+}
+
+// Counts, in every lane, each time the wave runs this point: the lane's exec does not matter.
+void Translator::CountLoopHeat(uint32_t counter) {
+	const auto reg = static_cast<IR::VectorReg>(LoopHeat::FirstRegister + counter);
+	ir.SetVectorReg(reg, ir.IAdd(ir.GetVectorReg(reg), IR::U32(IR::Value(1u))));
+}
+
 bool WaveHalvesInHostSubgroup(const IR::Program& program) {
 	// KYTY_DEBUG_WAVE_HALVES=0 translates as if the host subgroup matched the guest wave (A/B).
 	static const bool enabled = [] {
@@ -1125,6 +1166,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      IR::U32(IR::Value(0u)));
 			}
 		}
+		if (DebugPsTap().Active(result)) {
+			for (uint32_t i = 0; i < 3u; i++) {
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(PsTap::FirstRegister + i),
+				                      IR::U32(IR::Value(0u)));
+			}
+		}
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.input_info.compute;
 			const auto  thread_ids =
@@ -1357,6 +1404,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	const auto& heat        = DebugLoopHeat();
 	const bool  heat_active = heat.Active(result);
+	const bool  tap_active  = DebugPsTap().Active(result);
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit);
@@ -1386,6 +1434,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				continue;
 			}
 			translator.TranslateInstruction(instruction);
+			if (tap_active && instruction.pc == DebugPsTap().pc) [[unlikely]] {
+				translator.CopyPsTap();
+			}
 		}
 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
 	}
