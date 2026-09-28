@@ -32,7 +32,8 @@ inline RenderDebugCounters g_render_debug_counters;
 // rechecks), prioritywait (draw entry leaving operations queued rather than waiting for the
 // priority thread), pushpayload (push constants and descriptors handed to the recording thread
 // as one payload call), pipelinememo (the last graphics pipeline reused without a map lookup),
-// depthreuse (a clean depth target keeping its view between draws).
+// depthreuse (a clean depth target keeping its view between draws), regiongen (image lookups and
+// views checked against the images over their own range rather than the whole image set).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.

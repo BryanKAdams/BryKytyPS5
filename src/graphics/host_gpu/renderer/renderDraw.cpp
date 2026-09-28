@@ -693,7 +693,7 @@ static void CheckDepthReuse(TextureCache& cache, const RenderDepthInfo& depth,
 	const auto  stencil         = image.info.stencil;
 	const auto  metadata        = image.info.metadata;
 	const auto  meta_generation = cache.SurfaceMetaGeneration();
-	const auto  set_generation  = cache.ImageSetGeneration();
+	const auto  set_generation  = cache.ImageGeneration(depth.image_id);
 	const auto  view            = cache.FindDepthTarget(depth.image_id, depth.desc);
 	const auto& after           = cache.GetImage(depth.image_id);
 	const char* field           = nullptr;
@@ -706,7 +706,7 @@ static void CheckDepthReuse(TextureCache& cache, const RenderDepthInfo& depth,
 	} else if (!(after.info.stencil == stencil) || !(after.info.metadata == metadata)) {
 		field = "stencil or metadata";
 	} else if (cache.SurfaceMetaGeneration() != meta_generation ||
-	           cache.ImageSetGeneration() != set_generation) {
+	           cache.ImageGeneration(depth.image_id) != set_generation) {
 		field = "surface metadata or image set";
 	}
 	static std::atomic<uint64_t> checked {0};
@@ -751,7 +751,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    cache.IsRenderTargetCurrent(target.image_id, acquired.view_generation)) {
 			image_view = acquired.view;
 		} else {
-			const auto generation    = cache.ImageSetGeneration();
+			const auto generation    = cache.ImageGeneration(target.image_id);
 			image_view               = cache.FindRenderTarget(target.image_id, target.desc);
 			acquired.view            = image_view;
 			acquired.view_image      = target.image_id;
@@ -801,7 +801,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		} else {
 			// Both generations from before the acquisition: its own changes make the next draw
 			// acquire again rather than trust a state it did not check.
-			const auto generation      = cache.ImageSetGeneration();
+			const auto generation      = cache.ImageGeneration(depth.image_id);
 			const auto meta_generation = cache.SurfaceMetaGeneration();
 			image_view                 = cache.FindDepthTarget(depth.image_id, depth.desc);
 			acquired.view              = image_view;

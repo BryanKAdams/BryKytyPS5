@@ -342,6 +342,34 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+void TextureCache::AdvanceImageSetGeneration(GuestRange range) noexcept {
+	const auto stamp = m_image_set_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+	const auto first = range.address >> RegionGenerationBits;
+	const auto last  = (range.End() - 1) >> RegionGenerationBits;
+	for (auto region = first; region <= last; region++) {
+		m_region_generations[region % RegionGenerationBuckets].store(stamp,
+		                                                            std::memory_order_release);
+	}
+}
+
+// KYTY_DEBUG_AB=regiongen uses the whole image set's generation for every range in every other
+// window. The two agree on what they call unchanged: the whole set's generation is at least every
+// range's, and equals a range's only when that range saw the newest change.
+uint64_t TextureCache::RangeGeneration(GuestRange range) const noexcept {
+	static const bool ab = AbSelected("regiongen");
+	if ((ab && AbFeatureOff()) || range.size == 0) {
+		return m_image_set_generation.load(std::memory_order_acquire);
+	}
+	uint64_t   generation = m_image_set_base;
+	const auto first      = range.address >> RegionGenerationBits;
+	const auto last       = (range.End() - 1) >> RegionGenerationBits;
+	for (auto region = first; region <= last; region++) {
+		generation = std::max(generation, m_region_generations[region % RegionGenerationBuckets].load(
+		                                      std::memory_order_acquire));
+	}
+	return generation;
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
@@ -354,7 +382,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
-	m_image_set_generation++;
+	AdvanceImageSetGeneration(image.info.data);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	image.lru_tick   = m_gc_tick;
@@ -377,7 +405,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
-	m_image_set_generation++;
+	AdvanceImageSetGeneration(image.info.data);
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -1746,10 +1774,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 			const char* text = std::getenv("KYTY_DEBUG_IMAGE_MEMO");
 			return text == nullptr || std::strcmp(text, "0") != 0;
 		}();
-		auto* const  lookups    = ImageLookupSet(desc.info, exact_format);
-		ImageLookup* remembered = nullptr;
+		auto* const  lookups          = ImageLookupSet(desc.info, exact_format);
+		const auto   range_generation = RangeGeneration(desc.info.data);
+		ImageLookup* remembered       = nullptr;
 		for (size_t way = 0; memo_enabled && way < ImageLookupWays; way++) {
-			if (lookups[way].generation == m_image_set_generation &&
+			if (lookups[way].generation == range_generation &&
 			    lookups[way].Matches(desc.info, exact_format)) {
 				remembered = &lookups[way];
 				break;
@@ -1786,7 +1815,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 			remembered->last_use = ++m_image_lookup_clock;
 			result               = remembered->id;
 			if (unique_generation != nullptr) {
-				*unique_generation = m_image_set_generation;
+				*unique_generation = range_generation;
 			}
 		} else {
 			lookup();
@@ -1811,9 +1840,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 					inserted.MarkBufferModified();
 				}
 			} else if (backing_matches == 1 && view_mip < 0 && view_layer < 0) {
-				auto* victim = lookups;
+				// The lookup can have registered or freed images: take the range's generation now.
+				const auto found_generation = RangeGeneration(desc.info.data);
+				auto*      victim           = lookups;
 				for (size_t way = 0; way < ImageLookupWays; way++) {
-					if (lookups[way].generation != m_image_set_generation) {
+					if (lookups[way].generation != RangeGeneration(lookups[way].data)) {
 						victim = &lookups[way];
 						break;
 					}
@@ -1821,7 +1852,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 						victim = &lookups[way];
 					}
 				}
-				*victim = {.generation      = m_image_set_generation,
+				*victim = {.generation      = found_generation,
 				           .last_use        = ++m_image_lookup_clock,
 				           .data            = desc.info.data,
 				           .extent          = desc.info.extent,
@@ -1834,7 +1865,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 				           .exact_format    = exact_format,
 				           .id              = result};
 				if (unique_generation != nullptr) {
-					*unique_generation = m_image_set_generation;
+					*unique_generation = found_generation;
 				}
 			}
 		}
@@ -1856,14 +1887,14 @@ bool TextureCache::RefindImage(ImageId id, uint64_t generation, const ImageDesc&
                                uint32_t metadata_base_layer) {
 	// Only Thread_Gpu (the caller) registers, frees and touches images, so when this tick and GC
 	// tick already saw the image, the bookkeeping below would change nothing: skip the lock.
-	if (generation == 0 || generation != m_image_set_generation.load(std::memory_order_acquire)) {
+	if (generation == 0 || generation != RangeGeneration(desc.info.data)) {
 		return false;
 	}
 	const auto tick  = m_scheduler.CurrentTick();
 	auto&      image = m_slot_images[id];
 	if (image.tick_accessed_last != tick || (image.registered && image.lru_tick != m_gc_tick)) {
 		std::scoped_lock lock {m_lock};
-		if (generation != m_image_set_generation) {
+		if (generation != RangeGeneration(desc.info.data)) {
 			return false;
 		}
 		image.tick_accessed_last = tick;
@@ -1874,12 +1905,14 @@ bool TextureCache::RefindImage(ImageId id, uint64_t generation, const ImageDesc&
 }
 
 bool TextureCache::IsTextureCurrent(ImageId id, uint64_t generation) const noexcept {
-	if (generation == 0 || generation != m_image_set_generation.load(std::memory_order_acquire)) {
+	// The image may have been freed since; a slot reused by another image has a newer generation.
+	const auto* owner = m_slot_images.try_get(id);
+	if (owner == nullptr || generation == 0 || generation != RangeGeneration(owner->info.data)) {
 		return false;
 	}
+	const auto& image = *owner;
 	// FindTexture's RefreshImage and stencil refresh would do nothing: the image is tracked over
 	// its whole range and neither CPU nor buffer writes made it dirty.
-	const auto& image = m_slot_images[id];
 	return image.registered && !image.depth_id && !image.binding.needs_rebind &&
 	       !image.info.data.Empty() && !image.info.HasStencil() && !image.IsCpuDirty() &&
 	       !image.IsBufferModified() && image.track_addr == image.info.data.address &&
