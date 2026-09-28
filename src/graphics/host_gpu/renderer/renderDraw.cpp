@@ -1380,35 +1380,66 @@ void NoteImageUsers(TextureCache& cache, std::span<PreparedBindings* const> stag
 	static std::map<std::string, uint64_t> counts;
 	static auto window_start = std::chrono::steady_clock::now();
 	const auto  address      = ImageUsersAddress();
-	const auto  note         = [&](const char* role, uint32_t stage, uint32_t slot, ImageId id,
-                              const ImageViewInfo& view) {
+	// The binding's guest request (desc.info) and the cache image it resolved to (id), which can
+	// be a larger image holding the request.
+	const auto note = [&](const char* role, uint32_t stage, uint32_t slot, ImageId id,
+	                      const TextureCache::ImageDesc& desc, const char* extra) {
 		if (!id) {
 			return;
 		}
-		const auto& image = cache.GetImage(id);
-		if (address < image.info.data.address || address >= image.info.data.End()) {
+		const auto& image     = cache.GetImage(id);
+		const auto& request   = desc.info.data;
+		const bool  requested = address >= request.address && address < request.End();
+		if (!requested && (address < image.info.data.address || address >= image.info.data.End())) {
 			return;
 		}
-		counts[fmt::format("ps={:016x} vs={:016x} {} stage={} slot={} image=0x{:x}+0x{:x} {} "
-		                   "{}x{} view={}+{} layers {}+{}",
-		                   pixel_hash, vertex_hash, role, stage, slot, image.info.data.address,
+		const auto& view = desc.view_info;
+		counts[fmt::format("ps={:016x} vs={:016x} {} stage={} slot={}{} req=0x{:x}+0x{:x} {} "
+		                   "guest_fmt={} {}x{} view={}+{} layers {}+{} -> image=0x{:x}+0x{:x} {} {}x{}"
+		                   " cpu_dirty={} buf_mod={} gpu_mod={}",
+		                   pixel_hash, vertex_hash, role, stage, slot, extra, request.address,
+		                   request.size, vk::to_string(desc.info.pixel_format),
+		                   static_cast<uint32_t>(desc.info.guest_format), desc.info.extent.width,
+		                   desc.info.extent.height, view.base_level, view.level_count,
+		                   view.base_layer, view.layer_count, image.info.data.address,
 		                   image.info.data.size, vk::to_string(image.info.pixel_format),
-		                   image.info.extent.width, image.info.extent.height, view.base_level,
-		                   view.level_count, view.base_layer, view.layer_count)]++;
+		                   image.info.extent.width, image.info.extent.height,
+		                   image.IsCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+		                   image.IsGpuModified() ? 1 : 0)]++;
 	};
 	for (const auto* stage: stages) {
-		const auto stage_type = static_cast<uint32_t>(stage->runtime->program->stage);
+		const auto& program    = *stage->runtime->program;
+		const auto  stage_type = static_cast<uint32_t>(program.stage);
+		// Storage buffers over the address: a written one makes the texture cache drop the GPU
+		// contents of every image there (InvalidateMemoryFromGPU).
+		const auto buffer_count = std::min(program.info.buffers.size(), stage->buffer_sources.size());
+		for (uint32_t i = 0; i < buffer_count; i++) {
+			const auto& source = stage->buffer_sources[i];
+			if (source.size != 0 && address >= source.address && address < source.address + source.size) {
+				const auto& resource = program.info.buffers[i];
+				counts[fmt::format("ps={:016x} vs={:016x} buffer stage={} slot={} range=0x{:x}+0x{:x}"
+				                   " written={} stored={} atomic={}",
+				                   pixel_hash, vertex_hash, stage_type, i, source.address, source.size,
+				                   resource.written ? 1 : 0, resource.stored ? 1 : 0,
+				                   resource.atomic ? 1 : 0)]++;
+			}
+		}
 		for (uint32_t i = 0; i < stage->images.size(); i++) {
 			const auto& binding = stage->images[i];
 			note(binding.desc.type == TextureCache::BindingType::Storage ? "storage" : "texture",
-			     stage_type, i, binding.image_id, binding.desc.view_info);
+			     stage_type, i, binding.image_id, binding.desc, "");
 		}
 	}
 	for (const auto& color: colors) {
-		note("color", 0, color.target_slot, color.image_id, color.desc.view_info);
+		note("color", 0, color.target_slot, color.image_id, color.desc, "");
 	}
 	if (depth != nullptr) {
-		note("depth", 0, 0, depth->image_id, depth->desc.view_info);
+		const auto extra = fmt::format(
+		    " test={} write={} clear={} load_clear={} htile={}", depth->depth_test_enable ? 1 : 0,
+		    depth->depth_write_enable ? 1 : 0, depth->depth_clear_enable ? 1 : 0,
+		    depth->depth_load_clear_enable ? 1 : 0,
+		    depth->desc.info.metadata.kind == ImageMetadataKind::Htile ? 1 : 0);
+		note("depth", 0, 0, depth->image_id, depth->desc, extra.c_str());
 	}
 	const auto now = std::chrono::steady_clock::now();
 	if (now - window_start < std::chrono::seconds(5)) {
