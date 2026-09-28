@@ -135,9 +135,12 @@ static void Flush() {
 		uint32_t command[3] {};
 		std::memcpy(record, item.output + MeshIndirectArgs::RecordOffset, sizeof(record));
 		std::memcpy(command, item.output + MeshIndirectArgs::CommandOffset, sizeof(command));
+		// A plain (not mesh-emulated) draw's record is its VkDrawIndexedIndirectCommand.
 		std::printf("draw-log gpu: draw=%" PRIu64 " index_count=%u first_instance=%u groups=%u "
-		            "instances=%u z=%u\n",
-		            item.draw, record[0], record[2], command[0], command[1], command[2]);
+		            "instances=%u z=%u plain_instances=%u plain_first_index=%u "
+		            "plain_vertex_offset=%d plain_first_instance=%u\n",
+		            item.draw, record[0], record[2], command[0], command[1], command[2], record[1],
+		            record[2], static_cast<int32_t>(record[3]), record[4]);
 		return true;
 	});
 }
