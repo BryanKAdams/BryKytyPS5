@@ -18,18 +18,13 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
-#include <atomic>
 #include <bit>
 #include <cinttypes>
-#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <immintrin.h>
 #include <memory>
-#include <mutex>
 #include <span>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -39,96 +34,6 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
-
-// Copies the chunks of a large upload on a few threads at once, the caller among them, and
-// returns when all are done. An upload's ranges are scattered guest pages, so one thread spends
-// most of its copy waiting on memory. Workers read the backing, which never faults; a chunk
-// whose backing read fails is left for the caller (Chunk::done stays false).
-class UploadCopyPool {
-public:
-	struct Chunk {
-		uint8_t* destination = nullptr;
-		uint64_t address     = 0;
-		uint64_t size        = 0;
-		bool     done        = false; // Written before its release of Job::pending.
-	};
-
-	static UploadCopyPool& Instance() {
-		static UploadCopyPool pool;
-		return pool;
-	}
-
-	void Run(std::span<Chunk> chunks) {
-		Job job {chunks};
-		job.pending.store(chunks.size(), std::memory_order_relaxed);
-		{
-			std::lock_guard lock(m_mutex);
-			m_job = &job;
-			m_job_id++;
-		}
-		m_wake.notify_all();
-		job.Work();
-		while (job.pending.load(std::memory_order_acquire) != 0) {
-			_mm_pause();
-		}
-		// The job lives on this stack: withdraw it, then wait out the workers that took it.
-		std::unique_lock lock(m_mutex);
-		m_job = nullptr;
-		m_released.wait(lock, [&] { return job.refs == 0; });
-	}
-
-private:
-	static constexpr uint32_t Workers = 3;
-
-	struct Job {
-		std::span<Chunk>    chunks;
-		std::atomic<size_t> next {0};
-		std::atomic<size_t> pending {0};
-		uint32_t            refs = 0; // Workers holding the job, under m_mutex.
-
-		void Work() {
-			for (;;) {
-				const auto index = next.fetch_add(1, std::memory_order_relaxed);
-				if (index >= chunks.size()) {
-					return;
-				}
-				auto& chunk = chunks[index];
-				chunk.done  = Libs::LibKernel::Memory::TryReadBacking(chunk.address, chunk.destination,
-				                                                      chunk.size);
-				pending.fetch_sub(1, std::memory_order_release);
-			}
-		}
-	};
-
-	UploadCopyPool() {
-		for (uint32_t i = 0; i < Workers; i++) {
-			std::thread([this] {
-				uint64_t seen = 0;
-				for (;;) {
-					Job* job = nullptr;
-					{
-						std::unique_lock lock(m_mutex);
-						m_wake.wait(lock, [&] { return m_job != nullptr && m_job_id != seen; });
-						job  = m_job;
-						seen = m_job_id;
-						job->refs++;
-					}
-					job->Work();
-					std::lock_guard lock(m_mutex);
-					if (--job->refs == 0) {
-						m_released.notify_all();
-					}
-				}
-			}).detach();
-		}
-	}
-
-	std::mutex              m_mutex;
-	std::condition_variable m_wake;
-	std::condition_variable m_released;
-	Job*                    m_job    = nullptr;
-	uint64_t                m_job_id = 0;
-};
 
 } // namespace
 
@@ -727,39 +632,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// Copying on several threads measured no faster (A/B 2026-09-28): the staging memory's
+		// write bandwidth, not one thread's latency, bounds it.
 		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::UploadCopy);
-		// Large uploads copy their GPU-clean pieces on the copy pool (see UploadCopyPool).
-		// KYTY_DEBUG_AB=parcopy copies everything here in every other window.
-		constexpr uint64_t ParallelMinimum = 256 * 1024;
-		constexpr uint64_t ChunkBytes      = 64 * 1024;
-		static const bool  ab              = AbSelected("parcopy");
-		thread_local std::vector<UploadCopyPool::Chunk> chunks;
-		chunks.clear();
-		const bool parallel = total_size >= ParallelMinimum && !(ab && AbFeatureOff());
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			if (!parallel) {
-				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address),
-				            copy.size);
-			} else {
-				// Upload ranges are bytes the CPU wrote, on pages the guest can read, and the memory
-				// tracker's lock is held here (a guest read that faulted would take it again).
-				// Their backing therefore holds the bytes a guest read gets.
-				for (uint64_t offset = 0; offset < copy.size; offset += ChunkBytes) {
-					const auto piece = std::min(ChunkBytes, copy.size - offset);
-					chunks.push_back({mapped + copy.srcOffset + offset, address + offset, piece});
-				}
-			}
+			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
 			copy.srcOffset += base_offset;
-		}
-		if (!chunks.empty()) {
-			UploadCopyPool::Instance().Run(chunks);
-			for (const auto& chunk: chunks) {
-				if (!chunk.done) {
-					std::memcpy(chunk.destination, reinterpret_cast<const void*>(chunk.address),
-					            chunk.size);
-				}
-			}
 		}
 		m_staging_buffer.Commit();
 		return m_staging_buffer.Handle();
