@@ -1377,7 +1377,7 @@ static const std::vector<uint64_t>& ImageUsersShaders() {
 	static const std::vector<uint64_t> shaders = [] {
 		std::vector<uint64_t> list;
 		const char*           text = std::getenv("KYTY_DEBUG_IMAGE_USERS_SHADER");
-		while (text != nullptr && *text != ' ') {
+		while (text != nullptr && *text != '\0') {
 			char* end = nullptr;
 			list.push_back(std::strtoull(text, &end, 16));
 			text = (end != nullptr && *end == ',') ? end + 1 : nullptr;
