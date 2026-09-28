@@ -31,7 +31,7 @@ inline RenderDebugCounters g_render_debug_counters;
 // ring in cached host memory rather than device memory), colorclear (skipped color clear
 // rechecks), prioritywait (draw entry leaving operations queued rather than waiting for the
 // priority thread), pushpayload (push constants and descriptors handed to the recording thread
-// as one payload call).
+// as one payload call), pipelinememo (the last graphics pipeline reused without a map lookup).
 [[nodiscard]] bool AbSelected(const char* feature) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.

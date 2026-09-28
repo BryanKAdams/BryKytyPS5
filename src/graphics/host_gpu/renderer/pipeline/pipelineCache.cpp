@@ -1695,6 +1695,12 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+void PipelineCache::PipelineKeyHash::MixStaticParams(std::size_t&                    hash,
+                                                     const PipelineStaticParameters& params) {
+	// The struct is packed, so its bytes are exactly its fields.
+	Mix(hash, static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
+}
+
 PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -1839,12 +1845,22 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		auto& found = *iter->second;
-		if (found.optimize_pending) [[unlikely]] {
-			InstallOptimizedPipeline(found, command);
+	// KYTY_DEBUG_AB=pipelinememo looks every key up in the map in every other window.
+	static const bool ab    = AbSelected("pipelinememo");
+	Pipeline*         found = nullptr;
+	if (m_last_graphics_pipeline != nullptr && !(ab && AbFeatureOff()) &&
+	    key == m_last_graphics_key) {
+		found = m_last_graphics_pipeline;
+	} else if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		found                    = iter->second.get();
+		m_last_graphics_key      = key;
+		m_last_graphics_pipeline = found;
+	}
+	if (found != nullptr) {
+		if (found->optimize_pending) [[unlikely]] {
+			InstallOptimizedPipeline(*found, command);
 		}
-		return &found;
+		return found;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1920,6 +1936,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	m_last_graphics_key      = iter->first;
+	m_last_graphics_pipeline = iter->second.get();
 
 	return iter->second.get();
 }
