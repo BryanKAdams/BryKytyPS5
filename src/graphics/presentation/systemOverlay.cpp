@@ -1131,6 +1131,23 @@ struct SystemOverlay::Impl {
 		    "draw and prepares it itself when anything changed. Uses one more CPU core.");
 		ImGui::PopTextWrapPos();
 		ImGui::Separator();
+
+		if (record_thread_choice < 0) {
+			record_thread_choice = Config::RecordThreadEnabled() ? 1 : 0;
+		}
+		bool record_thread = record_thread_choice != 0;
+		if (ImGui::Checkbox("Record commands on a second thread", &record_thread)) {
+			record_thread_choice = record_thread ? 1 : 0;
+			settings_save_failed =
+			    !Common::SettingsFile::Save("record-thread", record_thread ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "The render thread hands its Vulkan commands to a second CPU thread, which records and "
+		    "submits them, so scenes with many draws run faster. Uses one more CPU core. Applies "
+		    "at the next start.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
 		if (settings_save_failed) {
 			ImGui::TextColored({1.0f, 0.5f, 0.4f, 1.0f}, "Could not save %s",
 			                   Common::SettingsFile::FileName);
@@ -1239,6 +1256,7 @@ struct SystemOverlay::Impl {
 	float                                 button_height      = 42.0f;
 	int                                   settings_saved_percent = 100;
 	bool                                  settings_save_failed   = false;
+	int                                   record_thread_choice   = -1;
 	ImVec2                                panel_offset {};
 	ImVec2                                right_stick {};
 	OverlaySession                        session;

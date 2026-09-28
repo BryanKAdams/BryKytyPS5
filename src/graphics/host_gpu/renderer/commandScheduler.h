@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/commandHooks.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -133,6 +134,9 @@ private:
 	std::condition_variable_any  m_submit_available;
 	std::deque<SubmitJob>        m_submit_jobs;
 	std::jthread                 m_submit_thread;
+	// Deferred recording: the GPU thread's commands and submits, recorded and submitted in
+	// order by the submit thread (see CommandStream).
+	std::unique_ptr<CommandStream> m_stream;
 	bool                         m_async_submit = false;
 	// --drain-stats on the render scheduler: GPU execution time from timestamps written at the
 	// start and end of each command buffer, read back once its tick completes.

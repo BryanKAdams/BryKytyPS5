@@ -107,6 +107,8 @@ static void PrintUsage() {
 	         "writing without waiting; a value can be a frame old. Default: false.\n");
 	::printf("  --speculative-draws <true|false>     Prepare draws' shader resources on a second "
 	         "thread ahead of the GPU thread. Default: true.\n");
+	::printf("  --record-thread <true|false>         Record the GPU thread's Vulkan commands on the "
+	         "submit thread. Default: true.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -456,6 +458,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--speculative-draws") {
 			if (!ParseBool(value, options.config.speculative_draws_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--record-thread") {
+			if (!ParseBool(value, options.config.record_thread_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

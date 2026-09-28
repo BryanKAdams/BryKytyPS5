@@ -83,6 +83,7 @@ struct ConfigOptions {
 	bool                   async_pipelines_enabled     = false;
 	bool                   relaxed_readback_enabled    = false;
 	bool                   speculative_draws_enabled   = true;
+	bool                   record_thread_enabled       = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -170,6 +171,9 @@ void SetRelaxedReadbackEnabled(bool enabled);
 bool SpeculativeDrawsEnabled();
 // Changes it while running (the settings panel).
 void SetSpeculativeDrawsEnabled(bool enabled);
+// The render thread queues its Vulkan commands for the submit thread, which records and submits
+// them. Faster in scenes with many draws; uses one more CPU core. Read at start.
+bool RecordThreadEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

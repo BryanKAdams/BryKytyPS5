@@ -224,6 +224,10 @@ void SetSpeculativeDrawsEnabled(bool enabled) {
 	g_speculative_draws_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
+bool RecordThreadEnabled() {
+	return g_config->record_thread_enabled;
+}
+
 static std::atomic<int> g_relaxed_readback_override {-1};
 
 bool RelaxedReadbackEnabled() {

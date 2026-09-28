@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandHooks.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/gpuZones.h"
@@ -395,6 +396,16 @@ CommandBuffer& CommandScheduler::Current() {
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
+	if (m_async_submit) {
+		MarkCommandHookThread();
+	}
+	if (m_stream != nullptr) {
+		// Its Begin and every command the GPU thread records into it go through the stream.
+		// KYTY_DEBUG_AB=recorder records directly in every other window (after draining).
+		static const bool ab    = AbSelected("recorder");
+		const bool        route = !(ab && AbFeatureOff());
+		m_stream->Route(route ? m_command.m_buffer : VK_NULL_HANDLE);
+	}
 	m_command.Begin();
 	if (m_async_submit && DrainStats::Enabled()) {
 		WriteStartTimestamp();
@@ -566,6 +577,15 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		QueueSubmit(job);
 		return job.tick;
 	}
+	if (m_stream != nullptr) {
+		// The submit thread records the stream's commands and submits in order.
+		job.tick = m_master.NextTick();
+		job.submit.AddSignal(m_master.Handle(), job.tick);
+		m_stream->Route(VK_NULL_HANDLE);
+		m_stream->Push([this, job]() mutable { QueueSubmit(job); });
+		m_stream->Wake();
+		return job.tick;
+	}
 	{
 		// Ticks are allocated in queue order, so the timeline is signaled in order.
 		std::lock_guard lock(m_submit_mutex);
@@ -589,6 +609,10 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		                                 .count());
 	};
 	vk::Result result;
+	if (!m_async_submit) {
+		// After what the GPU thread's command stream still holds, and outside the queue lock.
+		DrainGpuThreadCommands();
+	}
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		if (stats) {
@@ -634,6 +658,10 @@ void CommandScheduler::EnableAsyncSubmit() {
 	// Switching needs no other submitter running; the owner enables it during construction.
 	EXIT_IF(m_async_submit);
 	m_async_submit  = true;
+	InstallCommandHooks();
+	if (CommandRecordingDeferred()) {
+		m_stream = std::make_unique<CommandStream>();
+	}
 	// Only the render scheduler submits asynchronously, so it alone owns the zone marker.
 	if (const char* zones = std::getenv("KYTY_GPU_ZONES");
 	    zones != nullptr && zones[0] == '1' && GpuZones::g_marker == nullptr) {
@@ -646,6 +674,10 @@ void CommandScheduler::EnableAsyncSubmit() {
 
 void CommandScheduler::SubmitThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuQueueSubmit");
+	if (m_stream != nullptr) {
+		m_stream->Consume(stop);
+		return;
+	}
 	for (;;) {
 		SubmitJob job;
 		{

@@ -639,6 +639,54 @@ file, `--speculative-draws`), and it is on by default. Other switches:
 - `KYTY_DEBUG_AB=specprep` alternates adoption within one run.
 - `KYTY_DEBUG_SPEC_STATS=1` prints the walk's and adoption's counters.
 
+### Recording commands on a second thread
+
+Timing every Vulkan call the GPU thread makes (`KYTY_DEBUG_VK_TIME=1`) put them at about
+79 ms a second in Sky Garden: roughly 800,000 calls a second, mostly `vkCmd*`. With
+asynchronous submission on, these calls now go to the submit thread instead.
+`InstallCommandHooks` replaces the command functions in the default Vulkan dispatcher. The render
+scheduler routes each command buffer it begins through a 64 MB ring (`CommandStream`). The 48
+commands the renderer uses, and the GPU thread's descriptor updates, are deep-copied into it:
+arrays, barriers, rendering info and descriptor writes by type. Any thread may record into the
+routed buffer, since Vulkan already requires that to be synchronized. The submit thread replays
+the calls in order and submits each buffer when it reaches the submit.
+
+The ring must be empty before these calls, which then go to Vulkan directly:
+- any other command into the routed buffer (about 230 functions, and command buffer resets);
+- command pool calls (every stream);
+- on the GPU thread, direct queue submits, descriptor updates outside a routed buffer, and
+  recording into any other command buffer.
+
+The submit thread spins briefly when the ring is empty, then sleeps. The GPU thread wakes it
+only when it is asleep, about 1,000 times a second. A pNext chain or an unsupported descriptor
+type exits with a message instead of recording something wrong.
+
+Sky Garden level start, two pairs of separate runs of one build (off, on; then on, off), with
+draws prepared ahead in all four:
+
+| | recorded on the GPU thread | recorded on the submit thread |
+| --- | --- | --- |
+| fps | 21.5 / 21.6 | 22.2 / 22.7 |
+| draws a second | 107,200 / 107,000 | 109,100 / 112,400 |
+| record phase (µs a draw) | 0.45 / 0.44 | 0.21 / 0.20 |
+
+The ring carries about 870,000 calls (190 MB) a second there. It never had to empty, and no
+command went to Vulkan directly. A cold new game at the crash site with `KYTY_VERIFY_SPEC=1`
+ran at 60 fps apart from one first-use stutter, again with no waits.
+
+In the GPU-bound overworld (ship save at its spawn, `--gpu-timestamp-scale 115`), two pairs of
+runs held a flat 60 fps both ways, with the same GPU time (11.6 ms a frame). The emulator used
+2.2 to 2.3 CPU cores with the recorder, against 1.9 without.
+
+The switch is "Record commands on a second thread" in the settings panel (`record-thread` in the
+settings file, `--record-thread`). It is on by default, applies at the next start and needs
+asynchronous submission. Other switches:
+- `KYTY_RECORD_THREAD=0` or `1` overrides it for A/B runs.
+- `KYTY_DEBUG_AB=recorder` records directly in every other window of one run. The hooks stay
+  installed in both windows, so this comparison favors the recorder.
+- `KYTY_DEBUG_STREAM_STATS=1` prints the ring's calls, bytes, wakes and waits, and the
+  commands recorded directly after a wait, every 5 seconds.
+
 ## First-use stutter (pipeline compiles)
 
 `--drain-stats` prints a `hitch:` line for every game frame of 50 ms or more, listing what was
