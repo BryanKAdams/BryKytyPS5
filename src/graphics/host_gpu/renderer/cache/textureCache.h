@@ -50,20 +50,29 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	// When the lookup finds exactly one image with the same backing, *unique_generation receives
-	// the image set's generation, else 0: until an image is registered or unregistered, the same
-	// request finds the same image, and RefindImage does the rest of FindImage for it.
+	// the generation of the images over the request's range (RangeGeneration), else 0: until an
+	// image over the range is registered or unregistered, the same request finds the same image,
+	// and RefindImage does the rest of FindImage for it.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      uint64_t* unique_generation = nullptr);
 	// FindImage's bookkeeping for a request FindImage resolved to id under generation (see
-	// unique_generation). Returns false, doing nothing, when the image set changed since.
+	// unique_generation). Returns false, doing nothing, when the images over the request's range
+	// changed since.
 	[[nodiscard]] bool          RefindImage(ImageId id, uint64_t generation, const ImageDesc& desc,
 	                                        uint32_t metadata_base_layer);
-	[[nodiscard]] uint64_t      ImageSetGeneration() const noexcept {
-		return m_image_set_generation.load(std::memory_order_acquire);
+	// The newest registration or unregistration of an image over `range`, as a stamp of the whole
+	// image set's generation (never 0): unchanged while no image over the range came or went.
+	// Registering an image stamps its range with a newer value, so a range that gained an image
+	// never shows an older one, whatever image slots are reused. Reads without m_lock.
+	[[nodiscard]] uint64_t      RangeGeneration(GuestRange range) const noexcept;
+	// RangeGeneration over the image's range.
+	[[nodiscard]] uint64_t      ImageGeneration(ImageId id) const noexcept {
+		return RangeGeneration(m_slot_images[id].info.data);
 	}
-	// Whether FindTexture for a sampled texture that returned a view while the image set had this
-	// generation would now only touch the image and return that view again: the image and its
-	// views still live, and it needs no refresh. Reads the image without m_lock, as GetImage does.
+	// Whether FindTexture for a sampled texture that returned a view while the image had this
+	// generation (ImageGeneration) would now only touch the image and return that view again: the
+	// image and its views still live, and it needs no refresh. Reads the image without m_lock, as
+	// GetImage does.
 	[[nodiscard]] bool          IsTextureCurrent(ImageId id, uint64_t generation) const noexcept;
 	// The same for FindRenderTarget: the target is also GPU-owned already, so marking it written
 	// changes nothing.
@@ -322,6 +331,16 @@ private:
 	}
 	// Changed under m_lock; IsTextureCurrent reads it without.
 	std::atomic<uint64_t>                m_image_set_generation {NextGenerationBase()};
+	const uint64_t m_image_set_base = m_image_set_generation.load(std::memory_order_relaxed);
+	// The stamp (an m_image_set_generation value) of the newest registration or unregistration
+	// over each 2 MiB guest region, hashed into buckets: a bucket shared by two regions only costs
+	// extra misses. Stamped under m_lock; RangeGeneration reads without.
+	static constexpr uint32_t RegionGenerationBits    = 21;
+	static constexpr size_t   RegionGenerationBuckets = size_t {1} << 16u;
+	std::vector<std::atomic<uint64_t>> m_region_generations =
+	    std::vector<std::atomic<uint64_t>>(RegionGenerationBuckets);
+	// Advances the image set's generation and stamps the image's regions with it.
+	void AdvanceImageSetGeneration(GuestRange range) noexcept;
 	// Bumped whenever an image becomes GPU-modified (MarkGpuModified); with the image set
 	// generation it validates IsRegionGpuModified's per-thread record of clean pages.
 	std::atomic<uint64_t>                m_gpu_modified_generation {NextGenerationBase()};

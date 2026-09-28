@@ -1171,7 +1171,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			// A clean sampled image keeps the view FindTexture returned for this binding before.
 			binding.image_view = source.view;
 		} else {
-			const auto generation = texture_cache.ImageSetGeneration();
+			const auto generation = texture_cache.ImageGeneration(binding.image_id);
 			binding.image_view    = texture_cache.FindTexture(binding.image_id, binding.desc);
 			source.view_generation =
 			    binding.desc.type == TextureCache::BindingType::Texture ? generation : 0;
