@@ -93,14 +93,14 @@ PermutationRecord MakeRecord(ShaderType stage) {
     i.resources_dst[0] = {.register_start = 5,
                           .registers_num = 4,
                           .attr_id = 7,
-                          .fetch_index = 1};
-    i.buffers_num = 1;
-    i.buffers[0].addr = 0x765432100000ull;
-    i.buffers[0].stride = 16;
-    i.buffers[0].num_records = 4096;
-    i.buffers[0].attr_num = 1;
-    i.buffers[0].attr_indices[0] = 0;
-    i.buffers[0].attr_offsets[0] = 12;
+                          .fetch_index = 1,
+                          .buffer_index = 1};
+    i.buffers_num = 2;
+    i.buffers[0].stride = 8;
+    i.buffers[1].addr = 0x765432100000ull;
+    i.buffers[1].stride = 16;
+    i.buffers[1].num_records = 4096;
+    i.buffers[1].fetch_index = 1;
     i.fetch_external = true;
     i.fetch_embedded = true;
     i.fetch_attrib_reg = 8;
@@ -165,10 +165,11 @@ void TestAllStagesRoundTrip() {
                 i->tess.output_topology == 3,
             "mesh and tessellation compilation metadata survives");
       Check(i->resources[0].Base48() == 0 &&
-                i->resources[0].NumRecords() == 0 && i->buffers[0].addr == 0 &&
+                i->resources[0].NumRecords() == 0 && i->buffers[1].addr == 0 &&
+                i->buffers[1].num_records == 0 && i->buffers[1].stride == 16 &&
                 i->resources[0].Stride() == 16 &&
                 i->resources_dst[0].attr_id == 7 &&
-                i->buffers[0].attr_offsets[0] == 12,
+                i->resources_dst[0].buffer_index == 1,
             "vertex shape survives without serializing runtime addresses");
       Check(std::bit_cast<uint32_t>(i->clip_space.scale[0]) == 0x7fc12345u &&
                 std::bit_cast<uint32_t>(i->clip_space.scale[1]) == 0x80000000u,

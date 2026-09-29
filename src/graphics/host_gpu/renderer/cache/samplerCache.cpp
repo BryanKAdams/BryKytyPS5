@@ -14,8 +14,9 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
-vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
-	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3]};
+vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
+	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3],
+	                      static_cast<uint32_t>(integer_border)};
 	// Every draw looks up each of its samplers. Samplers live as long as the cache, so each thread
 	// keeps its recent lookups and repeats them without the lock and the map.
 	struct Recent {
@@ -36,6 +37,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 vk::Sampler SamplerCache::FindOrCreateSampler(const ShaderSamplerResource& r,
                                               const SamplerKey&            key) {
 	Common::LockGuard lock(m_mutex);
+	const bool        integer_border = key[4] != 0;
 
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
 		return iter->second;
@@ -112,23 +114,23 @@ vk::Sampler SamplerCache::FindOrCreateSampler(const ShaderSamplerResource& r,
 		return vk::SamplerAddressMode::eClampToBorder;
 	};
 
-	vk::BorderColor border = vk::BorderColor::eIntTransparentBlack;
+	vk::BorderColor border = integer_border ? vk::BorderColor::eIntTransparentBlack
+	                                       : vk::BorderColor::eFloatTransparentBlack;
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
-		case Prospero::SamplerBorderColor::kTransBlack:
-			border = vk::BorderColor::eIntTransparentBlack;
-			break;
+		case Prospero::SamplerBorderColor::kTransBlack: break;
 		case Prospero::SamplerBorderColor::kOpaqueBlack:
-			border = vk::BorderColor::eIntOpaqueBlack;
+			border = integer_border ? vk::BorderColor::eIntOpaqueBlack
+			                        : vk::BorderColor::eFloatOpaqueBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueWhite:
-			border = vk::BorderColor::eIntOpaqueWhite;
+			border = integer_border ? vk::BorderColor::eIntOpaqueWhite
+			                        : vk::BorderColor::eFloatOpaqueWhite;
 			break;
 		case Prospero::SamplerBorderColor::kFromTable:
 			LOGF(
 			    "temporary: approximating table border color as transparent black, index = %" PRIu16
 			    "\n",
 			    r.BorderColorPtr());
-			border = vk::BorderColor::eIntTransparentBlack;
 			break;
 		default: EXIT("unknown border color: %d", static_cast<int>(r.BorderColorType()));
 	}
@@ -142,8 +144,11 @@ vk::Sampler SamplerCache::FindOrCreateSampler(const ShaderSamplerResource& r,
 	sampler_info.addressModeU = to_vk_address_mode(r.ClampX());
 	sampler_info.addressModeV = to_vk_address_mode(r.ClampY());
 	sampler_info.addressModeW = to_vk_address_mode(r.ClampZ());
-	sampler_info.mipLodBias =
-	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
+    const auto max_lod_bias = m_graphics.GetPhysicalDeviceProperties().limits.maxSamplerLodBias;
+    sampler_info.mipLodBias = std::clamp(
+        static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f,
+        -max_lod_bias, max_lod_bias
+    );
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);

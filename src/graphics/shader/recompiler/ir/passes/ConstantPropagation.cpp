@@ -909,6 +909,13 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				}
 			}
 			return;
+		case ValueOpcode::ConditionRef: {
+			// Fold on the emitted condition (argument 1): the analysis predicate may be known
+			// while the branch still tests the raw whole-wave flag.
+			const auto value = Arg(inst, 1);
+			if (IsImmediate(value, Type::U1)) Replace(inst, value);
+			return;
+		}
 		case ValueOpcode::LogicalNot: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U1)) {

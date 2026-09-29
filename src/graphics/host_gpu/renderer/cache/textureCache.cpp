@@ -296,14 +296,6 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
-bool TextureCache::SafeToDownload(const Image& image) {
-	if (!image.SafeToDownload()) {
-		return false;
-	}
-	const auto range = image.info.data;
-	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
-}
-
 // Debugging aid: KYTY_DEBUG_IMAGE_CHURN=1 prints every image the cache creates or frees, with the
 // path that did it (ChurnReason), to find images recreated in steady state.
 namespace {
@@ -2069,7 +2061,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		if (ensure_valid && owner->depth_id) {
 			owner = m_slot_images.try_get(owner->depth_id);
 		}
-		if (owner == nullptr || (ensure_valid && !SafeToDownload(*owner))) {
+		if (owner == nullptr || (ensure_valid && !owner->SafeToDownload())) {
 			continue;
 		}
 		matches.push_back(id);
@@ -2495,7 +2487,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!m_texture_cache.SafeToDownload(image)) {
+	if (!image.SafeToDownload()) {
 		return false;
 	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
@@ -2558,7 +2550,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		return false;
 	}
 	auto transfer = BuildDownload(image);
-	if (!transfer.valid || !SafeToDownload(image)) {
+	if (!transfer.valid || !image.SafeToDownload()) {
 		return false;
 	}
 	const auto range    = image.info.data;
@@ -2696,20 +2688,26 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	// Taken before the scan, so a change racing with it leaves the record stale, never clean.
 	const auto images       = m_image_set_generation.load(std::memory_order_acquire);
 	const auto gpu_writes   = m_gpu_modified_generation.load(std::memory_order_acquire);
-	const auto gpu_modified = [this](uint64_t begin, uint64_t bytes) {
+	// PPSA17168: S_LOAD_DWORD reads shader data at an address overlapping an old render target
+	// whose memory the CPU has reused. The cached image still retains its earlier GPU-modified
+	// flag, so a definitely CPU-dirty image doesn't count. The clean-page record ignores that
+	// exception: CPU-dirty clears without a generation bump, so only pages without any
+	// GPU-modified image are recorded.
+	const auto gpu_modified = [this](uint64_t begin, uint64_t bytes, bool honor_cpu_dirty) {
 		for (const auto id: FindImagesInRegion(begin, bytes, false)) {
 			const auto& image = m_slot_images[id];
-			if (!image.depth_id && image.IsGpuModified()) {
+			if (!image.depth_id && image.IsGpuModified() &&
+			    !(honor_cpu_dirty && image.IsDefinitelyCpuDirty())) {
 				return true;
 			}
 		}
 		return false;
 	};
-	if (one_page && !gpu_modified(page * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE)) {
+	if (one_page && !gpu_modified(page * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE, false)) {
 		slot = {page, images, gpu_writes};
 		return false;
 	}
-	return gpu_modified(address, size);
+	return gpu_modified(address, size, true);
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
@@ -2893,7 +2891,7 @@ bool TextureCache::CollectGarbage(bool pressure_only) {
 			if (gpu_modified) {
 				// The depth transfer preserves its plane only; the stencil ownership check above
 				// prevents retiring a dirty or unknown companion. Metadata remains conservative.
-				if (!pressured || !SafeToDownload(*owner) || owner->info.HasMetadata() ||
+				if (!pressured || !owner->SafeToDownload() || owner->info.HasMetadata() ||
 				    (owner->info.IsTiled() && !aggressive)) {
 					continue;
 				}

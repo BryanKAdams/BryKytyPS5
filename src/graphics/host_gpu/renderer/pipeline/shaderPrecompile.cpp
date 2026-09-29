@@ -12,7 +12,7 @@ namespace Libs::Graphics::ShaderPrecompile {
 namespace {
 
 constexpr std::array<uint8_t, 8> Magic {'K', 'Y', 'T', 'Y', 'S', 'H', 'D', 'R'};
-constexpr uint32_t               FormatVersion  = 3; // 3: buffers record zero_stride_oob.
+constexpr uint32_t               FormatVersion  = 4; // 4: vertex buffer_index, pixel alpha_blend_source_remap.
 constexpr uint32_t               MaxCodeWords   = 256u * 1024u;
 constexpr uint32_t               MaxRecordBytes = 4u * 1024u * 1024u;
 constexpr uint64_t               MaxFileBytes   = 256u * 1024u * 1024u;
@@ -145,17 +145,11 @@ void Fields(Archive& a, ShaderVertexInputInfo& i) {
 		i.resources[n].fields[1] = high & 0xffff0000u;
 		i.resources[n].fields[2] = 0;
 		auto& d                  = i.resources_dst[n];
-		a(d.register_start, d.registers_num, d.attr_id, d.fetch_index);
+		a(d.register_start, d.registers_num, d.attr_id, d.fetch_index, d.buffer_index);
 	}
 	for (int n = 0; n < i.buffers_num; ++n) {
 		auto& b = i.buffers[n];
-		a(b.stride, b.fetch_index, b.attr_num);
-		if (b.attr_num < 0 || b.attr_num > ShaderVertexInputBuffer::ATTR_MAX) {
-			a.ok = false;
-			return;
-		}
-		for (int j = 0; j < b.attr_num; ++j)
-			a(b.attr_indices[j], b.attr_offsets[j]);
+		a(b.stride, b.fetch_index);
 		b.addr        = 0;
 		b.num_records = 0;
 	}
@@ -178,7 +172,7 @@ void Fields(Archive& a, ShaderPixelInputInfo& i) {
 	a(i.scratch_size_dwords, i.ps_pos_x, i.ps_pos_y, i.ps_pos_z, i.ps_pos_w, i.ps_front_face,
 	  i.ps_ancillary, i.ps_no_perspective, i.ps_pixel_kill_enable, i.ps_depth_export_enable,
 	  i.ps_sample_mask_export_enable, i.ps_sample_shading, i.dual_source_blending, i.ps_early_z,
-	  i.ps_execute_on_noop);
+	  i.ps_execute_on_noop, i.alpha_blend_source_remap);
 }
 
 template <typename Archive>
@@ -255,15 +249,9 @@ bool Valid(const PermutationRecord& r) {
 		for (int n = 0; n < i->resources_num; ++n) {
 			const auto& d = i->resources_dst[n];
 			if (d.register_start < 0 || d.register_start > 255 || d.registers_num < 0 ||
-			    d.registers_num > 4 || d.attr_id < -1 || d.attr_id >= 32)
+			    d.registers_num > 4 || d.attr_id < -1 || d.attr_id >= 32 || d.buffer_index < 0 ||
+			    d.buffer_index >= i->buffers_num)
 				return false;
-		}
-		for (int n = 0; n < i->buffers_num; ++n) {
-			const auto& b = i->buffers[n];
-			if (b.attr_num < 0 || b.attr_num > ShaderVertexInputBuffer::ATTR_MAX) return false;
-			for (int j = 0; j < b.attr_num; ++j) {
-				if (b.attr_indices[j] < 0 || b.attr_indices[j] >= i->resources_num) return false;
-			}
 		}
 		return true;
 	}

@@ -2308,7 +2308,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
 
 	auto trigger_interrupt = [&]() {
-		bool queued = false;
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
@@ -2316,12 +2315,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x02:
 			case 0x04:
 				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
-				queued = true;
+				cp.BufferFlushForInterrupt();
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
-		}
-		if (queued) {
-			cp.BufferFlushForInterrupt();
 		}
 	};
 

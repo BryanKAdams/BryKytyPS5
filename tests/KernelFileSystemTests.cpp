@@ -2,7 +2,9 @@
 #include <SDL3/SDL_main.h>
 
 #include "common/emulatorConfig.h"
+#include "common/archive.h"
 #include "common/file.h"
+#include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -134,7 +136,7 @@ void CheckMountRoot(const std::filesystem::path &root) {
   FileSystem::Mount(root, "/app0");
   Check(FileSystem::GetRealFilename("/app0/rpf.cache") == root / "rpf.cache",
         "resolve mount descendant");
-  Check(FileSystem::GetRealFilename("/app01/rpf.cache") == "/app01/rpf.cache",
+  Check(FileSystem::GetRealFilename("/app01/rpf.cache").empty(),
         "mount prefix must end at a path component");
 
   for (const char *path : {"/app0", "/app0/"}) {
@@ -164,16 +166,169 @@ void CheckMountRoot(const std::filesystem::path &root) {
     }
   }
   FileSystem::Umount("/app0");
-  Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+  Check(FileSystem::GetRealFilename("/app0/rpf.cache").empty(),
         "unmount by guest path");
   for (const auto &folder : {root, root / ""}) {
     for (const auto &host : {root, root / ""}) {
       FileSystem::Mount(folder, "/app0");
       FileSystem::Umount(Common::PathToGenericString(host));
-      Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+      Check(FileSystem::GetRealFilename("/app0/rpf.cache").empty(),
             "unmount by host path with or without trailing separator");
     }
   }
+}
+
+void CheckUnmappedPaths(const std::filesystem::path &root) {
+  const auto host_file = root / "host-only.dat";
+  const auto host_path = Common::PathToGenericString(host_file);
+  Common::File fixture;
+  Check(fixture.Create(host_file), "create unmapped host file");
+  fixture.Close();
+
+  FileSystem::FileStat stat {};
+  Check(FileSystem::GetRealFilename(host_path).empty() &&
+            FileSystem::KernelOpen(host_path.c_str(), 0, 0) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelStat(host_path.c_str(), &stat) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelCheckReachability(host_path.c_str()) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "existing host files are absent from the guest namespace");
+  Check(FileSystem::KernelUnlink(host_path.c_str()) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelRmdir(Common::PathToGenericString(root).c_str()) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            std::filesystem::exists(host_file),
+        "unmapped host files and directories cannot be removed");
+
+  const auto missing = Common::PathToGenericString(root / "unmapped-create");
+  Check(FileSystem::KernelOpen(missing.c_str(), 0x601, 0777) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelMkdir(missing.c_str(), 0777) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            !std::filesystem::exists(root / "unmapped-create"),
+        "creation requires a mounted guest destination");
+
+  FileSystem::Mount(root, "/app0");
+  Check(FileSystem::KernelRename("/app0/host-only.dat", missing.c_str()) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            std::filesystem::exists(host_file) &&
+            !std::filesystem::exists(root / "unmapped-create"),
+        "rename to an unmapped destination preserves the source");
+  FileSystem::Umount("/app0");
+}
+
+void CheckArchiveMount(const std::filesystem::path &root) {
+  const auto archive = root / u8"game-日本語.zar";
+  std::vector<uint8_t> payload(2 * 64 * 1024 + 33);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>(i * 37 + 11);
+  }
+  Check(ArchiveTests::CreateArchive(archive, payload), "create mounted archive fixture");
+  const auto archive_root = Common::MakeArchivePath(archive);
+  const auto host_member = archive_root / "assets/subdir/data.bin";
+  constexpr char GuestMember[] = "/app0/assets/subdir/data.bin";
+  FileSystem::Mount(archive_root, "/app0");
+  Check(FileSystem::GetRealFilename(GuestMember) == host_member &&
+            FileSystem::GetRealFilename("/app01/eboot.bin").empty(),
+        "resolve archive mounts at path-component boundaries");
+  Check(FileSystem::KernelOpen("/app0/../outside.bin", 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelOpen("/app0/missing.bin", 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "reject traversal outside an archive and missing members");
+
+  FileSystem::FileStat path_stat{}, descriptor_stat{};
+  Check(FileSystem::KernelStat(GuestMember, &path_stat) == OK &&
+            path_stat.st_size == payload.size() &&
+            path_stat.st_size == Common::File::Size(host_member) &&
+            FileSystem::KernelCheckReachability(GuestMember) == OK,
+        "archive path stat and reachability agree with Common::File");
+  const int fd = FileSystem::KernelOpen("/app0/ASSETS/subdir/DATA.BIN", 0, 0);
+  Check(fd >= 3 && FileSystem::KernelFstat(fd, &descriptor_stat) == OK &&
+            descriptor_stat.st_size == path_stat.st_size &&
+            descriptor_stat.st_mode == path_stat.st_mode,
+        "case-insensitive archive open and descriptor stat agree");
+  std::array<uint8_t, 97> bytes{};
+  constexpr int64_t Offset = 64 * 1024 - 19;
+  Check(FileSystem::KernelPread(fd, bytes.data(), bytes.size(), Offset) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin() + Offset) &&
+            FileSystem::KernelLseek(fd, 0, 1) == 0,
+        "archive pread crosses a compression block without moving position");
+  Check(FileSystem::KernelLseek(fd, Offset, 0) == Offset &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin() + Offset) &&
+            FileSystem::KernelLseek(fd, 0, 1) == Offset + bytes.size(),
+        "archive seek and sequential read share descriptor position");
+  Check(FileSystem::KernelLseek(fd, -9, 2) == payload.size() - 9 &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == 9 &&
+            std::equal(bytes.begin(), bytes.begin() + 9, payload.end() - 9) &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == 0,
+        "archive reads stop at the member boundary");
+  Check(FileSystem::KernelWrite(fd, bytes.data(), 1) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelPwrite(fd, bytes.data(), 1, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelFtruncate(fd, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "archive read-only descriptors reject write and truncate");
+
+  const auto unicode_guest = std::string("/app0/") + std::string(ArchiveTests::UnicodeFilename);
+  const int unicode = FileSystem::KernelOpen(unicode_guest.c_str(), 0, 0);
+  Check(unicode >= 3 && FileSystem::KernelRead(unicode, bytes.data(), bytes.size()) ==
+            ArchiveTests::Eboot.size() &&
+            std::memcmp(bytes.data(), ArchiveTests::Eboot.data(), ArchiveTests::Eboot.size()) == 0,
+        "open and read a Unicode archive member");
+  Check(FileSystem::KernelClose(unicode) == OK, "close Unicode archive member");
+
+  const int directory = FileSystem::KernelOpen("/app0/", 0x00020000, 0);
+  Check(directory >= 3, "open mounted archive directory");
+  std::array<char, 512> block{};
+  const auto expected_entries = Common::File::GetDirEntries(archive_root);
+  size_t entries_seen = 0;
+  for (;;) {
+    const int length = FileSystem::KernelGetdents(directory, block.data(), block.size());
+    Check(length >= 0 && length <= block.size(), "read archive directory records");
+    if (length == 0) {
+      break;
+    }
+    for (size_t offset = 0; offset < static_cast<size_t>(length);) {
+      uint16_t record_length = 0;
+      Check(length - offset >= 8, "archive directory record header fits");
+      std::memcpy(&record_length, block.data() + offset + 4, sizeof(record_length));
+      const auto name_length = static_cast<uint8_t>(block[offset + 7]);
+      Check(record_length >= 9 + name_length && record_length <= length - offset,
+            "archive directory record fits");
+      const std::string_view name(block.data() + offset + 8, name_length);
+      Check(std::any_of(expected_entries.begin(), expected_entries.end(), [&](const auto &entry) {
+        return entry.name == name && block[offset + 6] == (entry.is_file ? 8 : 4);
+      }), "guest directory entry matches Common::File name and type");
+      ++entries_seen;
+      offset += record_length;
+    }
+  }
+  Check(entries_seen == expected_entries.size(), "guest enumerates every archive directory entry");
+  Check(FileSystem::KernelClose(directory) == OK, "close archive directory");
+
+  for (const int flags : {1, 2, 0x0200, 0x0400}) {
+    Check(FileSystem::KernelOpen(GuestMember, flags, 0777) ==
+              Libs::LibKernel::KERNEL_ERROR_EROFS,
+          "archive rejects write, create and truncate open flags");
+  }
+  Check(FileSystem::KernelUnlink(GuestMember) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelMkdir("/app0/new-dir", 0777) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelRmdir("/app0/assets") == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelRename(GuestMember, "/app0/renamed.bin") ==
+                Libs::LibKernel::KERNEL_ERROR_EROFS,
+        "archive mount rejects path mutations");
+  FileSystem::Umount("/app0");
+  Check(FileSystem::GetRealFilename(GuestMember).empty() &&
+            FileSystem::KernelOpen(GuestMember, 0, 0) == Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin()),
+        "unmount hides archive paths while open descriptors retain the reader");
+  Check(FileSystem::KernelClose(fd) == OK, "close last archive descriptor");
 }
 
 void CheckUnicodePaths(const std::filesystem::path &root) {
@@ -834,7 +989,7 @@ void CheckWindowsReceiveFlags() {
 
 } // namespace
 
-int main(int, char **) {
+int main(int, char**) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -855,6 +1010,8 @@ int main(int, char **) {
   TempDirectory temporary;
   FileSystem::Initialize();
   CheckMountRoot(temporary.Path());
+  CheckUnmappedPaths(temporary.Path());
+  CheckArchiveMount(temporary.Path());
   CheckUnicodePaths(temporary.Path());
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());

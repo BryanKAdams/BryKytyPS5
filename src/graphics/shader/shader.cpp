@@ -389,14 +389,15 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	for (int ri = 0; ri < info.resources_num; ri++) {
 		const auto& r = info.resources[ri];
 
-		bool merged = false;
-		for (int bi = 0; bi < info.buffers_num; bi++) {
+		auto& destination = info.resources_dst[ri];
+		int bi = 0;
+		for (; bi < info.buffers_num; bi++) {
 			auto& b = info.buffers[bi];
 
 			uint64_t stride = b.stride;
 
 			if (stride == r.Stride() &&
-			    b.fetch_index == static_cast<uint32_t>(info.resources_dst[ri].fetch_index)) {
+			    b.fetch_index == destination.fetch_index) {
 				uint64_t rbase   = r.Base48();
 				uint64_t base    = std::min(rbase, b.addr);
 				uint64_t offset1 = rbase - base;
@@ -405,38 +406,26 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 				if (offset1 < stride && offset2 < stride) {
 					EXIT_NOT_IMPLEMENTED(b.num_records != r.NumRecords());
 					b.addr = base;
-					EXIT_NOT_IMPLEMENTED(b.attr_num >= ShaderVertexInputBuffer::ATTR_MAX);
-					b.attr_indices[b.attr_num++] = ri;
-					merged                       = true;
 					break;
 				}
 			}
 		}
 
-		if (!merged) {
+		if (bi == info.buffers_num) {
 			EXIT_NOT_IMPLEMENTED(info.buffers_num >= ShaderVertexInputInfo::RES_MAX);
-			int bi                           = info.buffers_num++;
-			info.buffers[bi].addr            = r.Base48();
-			info.buffers[bi].stride          = r.Stride();
-			info.buffers[bi].num_records     = r.NumRecords();
-			info.buffers[bi].fetch_index     = info.resources_dst[ri].fetch_index;
-			info.buffers[bi].attr_num        = 1;
-			info.buffers[bi].attr_indices[0] = ri;
+			info.buffers[bi] = {.addr = r.Base48(),
+			                    .stride = r.Stride(),
+			                    .num_records = r.NumRecords(),
+			                    .fetch_index = destination.fetch_index};
+			info.buffers_num++;
 		}
-	}
-
-	for (int bi = 0; bi < info.buffers_num; bi++) {
-		auto& b = info.buffers[bi];
-		for (int ri = 0; ri < b.attr_num; ri++) {
-			b.attr_offsets[ri] = info.resources[b.attr_indices[ri]].Base48() - b.addr;
-		}
+		destination.buffer_index = bi;
 	}
 }
 
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
-                                       const ShaderSemantic*  input_semantics,
-                                       uint32_t num_input_semantics, const uint32_t* attrib,
-                                       const uint32_t* buffer) {
+                                       std::span<const ShaderSemantic> input_semantics,
+                                       const uint32_t* attrib, const uint32_t* buffer) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
@@ -448,7 +437,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	// read per attribute cost the GPU thread about 1.7% in Sky Garden.
 	uint32_t first_semantic = UINT32_MAX;
 	uint32_t last_semantic  = 0;
-	for (uint32_t i = 0; i < num_input_semantics; i++) {
+	for (uint32_t i = 0; i < input_semantics.size(); i++) {
 		first_semantic = std::min(first_semantic, uint32_t {input_semantics[i].semantic});
 		last_semantic  = std::max(last_semantic, uint32_t {input_semantics[i].semantic});
 	}
@@ -464,7 +453,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			std::copy_n(words, dwords, log->words.begin() + first);
 		}
 	};
-	if (num_input_semantics != 0) {
+	if (input_semantics.size() != 0) {
 		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(attrib + first_semantic),
 		                                        attributes.data(),
 		                                        (last_semantic - first_semantic + 1) * sizeof(uint32_t));
@@ -472,20 +461,20 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	}
 	uint32_t first_index = UINT32_MAX;
 	uint32_t last_index  = 0;
-	for (uint32_t i = 0; i < num_input_semantics; i++) {
+	for (uint32_t i = 0; i < input_semantics.size(); i++) {
 		const uint32_t index = attributes[input_semantics[i].semantic - first_semantic] & 0x1fu;
 		first_index          = std::min(first_index, index);
 		last_index           = std::max(last_index, index);
 	}
 	std::array<uint32_t, 4 * ShaderVertexInputInfo::RES_MAX> sharps; // By index, from first_index.
-	if (num_input_semantics != 0) {
+	if (input_semantics.size() != 0) {
 		LibKernel::Memory::ReadGuestOnGpuThread(reinterpret_cast<uint64_t>(buffer + first_index * 4),
 		                                        sharps.data(),
 		                                        (last_index - first_index + 1) * 4 * sizeof(uint32_t));
 		record(buffer + first_index * 4, sharps.data(), (last_index - first_index + 1) * 4);
 	}
 
-	for (uint32_t i = 0; i < num_input_semantics; i++) {
+	for (uint32_t i = 0; i < input_semantics.size(); i++) {
 		const auto& in = input_semantics[i];
 
 		EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
@@ -595,8 +584,8 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	return reg;
 }
 
-// `info = {}` without zeroing the vertex buffers' attribute lists (8 KB), of which only the first
-// attr_num entries are read: default initialization leaves them alone.
+// `info = {}` without zeroing the resource arrays, of which only the first resources_num and
+// buffers_num entries are read: default initialization leaves them alone.
 static void ResetVertexInputInfo(ShaderVertexInputInfo& info) {
 	std::destroy_at(&info);
 	::new (static_cast<void*>(&info)) ShaderVertexInputInfo;
@@ -646,8 +635,7 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			     shader_addr);
 			return false;
 		}
-		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
-		                           metadata.input_semantics_count, attrib, buffer);
+		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
 		ShaderDetectBuffers(info);
 	}
 	return true;
@@ -780,15 +768,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		key.push_back(destination.registers_num);
 		key.push_back(destination.fetch_index);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.Stride());
-		key.push_back(static_cast<uint32_t>(resource.SwizzleEnabled()));
-		key.push_back(resource.DstSelX());
-		key.push_back(resource.DstSelY());
-		key.push_back(resource.DstSelZ());
-		key.push_back(resource.DstSelW());
-		key.push_back(resource.RawFormat());
-		key.push_back(resource.OutOfBounds());
-		key.push_back(static_cast<uint32_t>(resource.AddTid()));
+		key.push_back(resource.fields[1] & 0xbfff0000u); // Stride and swizzle enable.
+		key.push_back(resource.fields[3] & 0x3087ffffu); // Channels, format, OOB, and add TID.
 	}
 }
 
@@ -814,6 +795,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
+	key.push_back(static_cast<uint32_t>(info.alpha_blend_source_remap));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
@@ -1017,9 +999,6 @@ void CopyVertexInputInfo(ShaderVertexInputInfo& target, const ShaderVertexInputI
 		to.stride        = from.stride;
 		to.num_records   = from.num_records;
 		to.fetch_index   = from.fetch_index;
-		to.attr_num      = from.attr_num;
-		std::copy_n(from.attr_indices, from.attr_num, to.attr_indices);
-		std::copy_n(from.attr_offsets, from.attr_num, to.attr_offsets);
 	}
 	target.stage               = source.stage;
 	target.logical_stage       = source.logical_stage;
@@ -1060,7 +1039,8 @@ bool SameVertexInputInfo(const ShaderVertexInputInfo& a, const ShaderVertexInput
 		if (!std::equal(std::begin(a.resources[i].fields), std::end(a.resources[i].fields),
 		                std::begin(b.resources[i].fields)) ||
 		    da.register_start != db.register_start || da.registers_num != db.registers_num ||
-		    da.attr_id != db.attr_id || da.fetch_index != db.fetch_index) {
+		    da.attr_id != db.attr_id || da.fetch_index != db.fetch_index ||
+		    da.buffer_index != db.buffer_index) {
 			return false;
 		}
 	}
@@ -1068,9 +1048,7 @@ bool SameVertexInputInfo(const ShaderVertexInputInfo& a, const ShaderVertexInput
 		const auto& ba = a.buffers[i];
 		const auto& bb = b.buffers[i];
 		if (ba.addr != bb.addr || ba.stride != bb.stride || ba.num_records != bb.num_records ||
-		    ba.fetch_index != bb.fetch_index || ba.attr_num != bb.attr_num ||
-		    !std::equal(ba.attr_indices, ba.attr_indices + ba.attr_num, bb.attr_indices) ||
-		    !std::equal(ba.attr_offsets, ba.attr_offsets + ba.attr_num, bb.attr_offsets)) {
+		    ba.fetch_index != bb.fetch_index) {
 			return false;
 		}
 	}
@@ -1104,7 +1082,8 @@ bool SamePixelInputInfo(const ShaderPixelInputInfo& a, const ShaderPixelInputInf
 	       a.ps_sample_mask_export_enable == b.ps_sample_mask_export_enable &&
 	       a.ps_sample_shading == b.ps_sample_shading &&
 	       a.dual_source_blending == b.dual_source_blending && a.ps_early_z == b.ps_early_z &&
-	       a.ps_execute_on_noop == b.ps_execute_on_noop;
+	       a.ps_execute_on_noop == b.ps_execute_on_noop &&
+	       a.alpha_blend_source_remap == b.alpha_blend_source_remap;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1125,8 +1104,9 @@ void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info) {
 
 		LOGF("\t\t register_start   = %d\n"
 		     "\t\t registers_num    = %d\n"
-		     "\t\t fetch_index      = %" PRIu32 "\n",
-		     rd.register_start, rd.registers_num, rd.fetch_index);
+		     "\t\t fetch_index      = %" PRIu32 "\n"
+		     "\t\t buffer_index     = %d\n",
+		     rd.register_start, rd.registers_num, rd.fetch_index, rd.buffer_index);
 		LOGF("\t\t fields           = %08" PRIx32 "%08" PRIx32 "%08" PRIx32 "%08" PRIx32 "\n",
 		     r.fields[3], r.fields[2], r.fields[1], r.fields[0]);
 		LOGF("\t\t Base()           = %" PRIx64 "\n"
@@ -1152,14 +1132,8 @@ void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info) {
 		LOGF("\t\t addr        = %" PRIx64 "\n"
 		     "\t\t stride      = %" PRIu32 "\n"
 		     "\t\t num_records = %" PRIu32 "\n"
-		     "\t\t fetch_index = %" PRIu32 "\n"
-		     "\t\t attr_num    = %" PRId32 "\n",
-		     r.addr, r.stride, r.num_records, r.fetch_index, r.attr_num);
-		for (int j = 0; j < r.attr_num; j++) {
-			LOGF("\t\t attr_indices[%d]  = %d\n"
-			     "\t\t attr_offsets[%d]  = %u\n",
-			     j, r.attr_indices[j], j, r.attr_offsets[j]);
-		}
+		     "\t\t fetch_index = %" PRIu32 "\n",
+		     r.addr, r.stride, r.num_records, r.fetch_index);
 	}
 }
 
