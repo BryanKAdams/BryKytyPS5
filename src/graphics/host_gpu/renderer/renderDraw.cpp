@@ -948,13 +948,27 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	return state;
 }
 
+// Slots the render target and shader masks let a draw write, whatever their export format.
+static uint32_t DrawColorWriteMask(const HW::Context& ctx) {
+	const auto& sh_regs    = ctx.GetShaderRegisters();
+	const auto  write_mask = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
+	uint32_t    mask       = 0;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if (render_target_mask_slot(write_mask, slot) != 0) {
+			mask |= 1u << slot;
+		}
+	}
+	return mask;
+}
+
+// The writable slots that also have a nonzero SPI_SHADER_COL_FORMAT: whether the pixel shader
+// runs for its colour outputs, and which export mappings it is compiled with.
 static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
 	const auto& sh_regs     = ctx.GetShaderRegisters();
-	const auto  write_mask  = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
+	const auto  write_mask  = DrawColorWriteMask(ctx);
 	uint32_t    output_mask = 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if (sh_regs.target_output_mode[slot] != 0 &&
-		    render_target_mask_slot(write_mask, slot) != 0) {
+		if (sh_regs.target_output_mode[slot] != 0 && (write_mask & (1u << slot)) != 0) {
 			output_mask |= 1u << slot;
 		}
 	}
@@ -1281,7 +1295,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			}
 		}
 	}
-	mrt_mask &= color_output_mask;
+	// Attachments follow the write masks, not the export format: in Astro Bot's Sky Garden the tall
+	// grass beside the path (an alpha-tested shader, so it runs anyway) writes a slot whose format
+	// register reads 0 at the draw, and binding only formatted slots dropped that grass.
+	mrt_mask &= DrawColorWriteMask(buffer.GetRegisters());
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
