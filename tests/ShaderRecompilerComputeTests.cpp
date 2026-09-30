@@ -2504,6 +2504,90 @@ public:
             "a single 3:1 linear blit no longer aliases the checkerboard");
     Require(name, "downscale", downscaled <= 3,
             "presentation downscale aliased a one-texel checkerboard");
+
+    // Shrinking by less than 2x (a 4K frame in a maximized 1440p window): one
+    // linear blit keeps a quarter of the checkerboard, PresentFilter none.
+    struct FilterCase {
+      vk::Extent2D source;
+      vk::Extent2D target;
+      bool expected;
+    };
+    constexpr FilterCase filter_cases[] = {
+        {{3840, 2160}, {2560, 1369}, true},
+        {{3840, 2160}, {1920, 1080}, false},
+        {{1920, 1080}, {2560, 1440}, false},
+        {{1920, 1080}, {1920, 1080}, false},
+        {{1920, 1080}, {1280, 1080}, true},
+        {{3840, 2160}, {1280, 720}, false},
+        {{1920, 1080}, {1920, 1000}, true},
+    };
+    for (const auto &c : filter_cases) {
+      Require(name, "filter choice",
+              PresentNeedsFilter(c.source, c.target) == c.expected,
+              "presentation picked the wrong downscale path");
+    }
+    constexpr vk::Extent2D near_target{width * 2 / 3, height * 2 / 3};
+    // Skips the outermost pixels: there both paths clamp to the edge texel,
+    // which leaves part of the pattern.
+    auto deviation_of = [&](const std::vector<u32> &pixels) {
+      int deviation = 0;
+      for (u32 y = 1; y + 1 < near_target.height; y++) {
+        for (u32 x = 1; x + 1 < near_target.width; x++) {
+          const auto pixel = pixels[y * near_target.width + x];
+          deviation = std::max(deviation,
+                               std::abs(static_cast<int>(pixel & 0xffu) - 128));
+        }
+      }
+      return deviation;
+    };
+    // near_blit: one linear blit to near_target; near_filter: PresentFilter.
+    auto present_near = [&](bool filter) {
+      auto source =
+          CreateImageMips(name, width, height, vk::Format::eR8G8B8A8Unorm,
+                          vk::ImageUsageFlagBits::eSampled, mips, 1,
+                          filter ? vk::ImageLayout::eShaderReadOnlyOptimal
+                                 : vk::ImageLayout::eTransferSrcOptimal,
+                          vk::ImageType::e2D, vk::ImageViewType::e2D, 1);
+      auto destination =
+          CreateImage2D(name, near_target.width, near_target.height,
+                        vk::Format::eR8G8B8A8Unorm,
+                        vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
+                        filter ? vk::ImageLayout::eColorAttachmentOptimal
+                               : vk::ImageLayout::eTransferDstOptimal);
+      PresentFilter present_filter;
+      auto cmd = BeginCommands(name, "near present");
+      if (filter) {
+        present_filter.Record(m_device, cmd, source.view, 0, {width, height},
+                              destination.view, vk::Format::eR8G8B8A8Unorm,
+                              near_target);
+      } else {
+        vk::ImageBlit region{};
+        region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        region.srcOffsets[1] = vk::Offset3D{static_cast<int32_t>(width),
+                                            static_cast<int32_t>(height), 1};
+        region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        region.dstOffsets[1] =
+            vk::Offset3D{static_cast<int32_t>(near_target.width),
+                         static_cast<int32_t>(near_target.height), 1};
+        cmd.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal,
+                      destination.image, vk::ImageLayout::eTransferDstOptimal,
+                      1, &region, vk::Filter::eLinear);
+      }
+      EndSubmitAndFree(name, "near present", cmd);
+      present_filter.Release(m_device);
+      const auto pixels = ReadImage(name, &destination);
+      DestroyImage(&destination);
+      DestroyImage(&source);
+      return deviation_of(pixels);
+    };
+    const auto near_blit = present_near(false);
+    const auto near_filter = present_near(true);
+    std::printf("[host]    %-32s 1.5:1 blit %d, filtered %d\n", name, near_blit,
+                near_filter);
+    Require(name, "near fixture", near_blit >= 20,
+            "a single 1.5:1 linear blit no longer aliases the checkerboard");
+    Require(name, "near filter", near_filter <= 2,
+            "the presentation filter aliased a one-texel checkerboard");
     std::printf("[host]    %-32s ok (single blit %d, downscaled %d)\n", name,
                 single_blit, downscaled);
   }
@@ -2579,6 +2663,50 @@ public:
                     downscale ? "downscaled" : "single blit", level,
                     samples[samples.size() / 2], samples[samples.size() * 9 / 10]);
       }
+      DestroyImage(&destination);
+    }
+    DestroyImage(&source);
+
+    // PresentFilter from level 0 into a maximized 1440p window (about 1.5:1).
+    source = CreateImageMips(name, width, height, vk::Format::eR8G8B8A8Unorm,
+                             vk::ImageUsageFlagBits::eSampled, mips, 1,
+                             vk::ImageLayout::eShaderReadOnlyOptimal,
+                             vk::ImageType::e2D, vk::ImageViewType::e2D, 1);
+    for (const vk::Extent2D target :
+         {vk::Extent2D{2560, 1417}, vk::Extent2D{3440, 1392}}) {
+      auto destination = CreateImage2D(
+          name, target.width, target.height, vk::Format::eR8G8B8A8Unorm,
+          vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
+          vk::ImageLayout::eColorAttachmentOptimal);
+      PresentFilter filter;
+      std::vector<double> samples;
+      for (int iteration = 0; iteration < 110; iteration++) {
+        auto cmd = BeginCommands(name, "present filter");
+        cmd.resetQueryPool(pool, 0, 2);
+        cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, pool, 0);
+        filter.Record(m_device, cmd, source.view, 0, {width, height},
+                      destination.view, vk::Format::eR8G8B8A8Unorm, target);
+        cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, 1);
+        EndSubmitAndFree(name, "present filter", cmd);
+        std::array<uint64_t, 2> ticks{};
+        RequireVk(
+            name, "query results",
+            m_device.getQueryPoolResults(
+                pool, 0, 2, sizeof(ticks), ticks.data(), sizeof(uint64_t),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+            "vkGetQueryPoolResults");
+        if (iteration >= 10) {
+          samples.push_back(static_cast<double>(ticks[1] - ticks[0]) *
+                            ns_per_tick / 1000.0);
+        }
+      }
+      filter.Release(m_device);
+      std::sort(samples.begin(), samples.end());
+      std::printf(
+          "[host]    %s: 3840x2160 -> %ux%u %-11s level 0: median %.1f us, "
+          "p90 %.1f us\n",
+          name, target.width, target.height, "filtered",
+          samples[samples.size() / 2], samples[samples.size() * 9 / 10]);
       DestroyImage(&destination);
     }
     m_device.destroyQueryPool(pool, nullptr);

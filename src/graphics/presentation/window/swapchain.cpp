@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+#include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
@@ -22,6 +23,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <span>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -32,6 +34,8 @@ namespace Libs::Graphics {
 struct Presenter::Frame {
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
+	// Every mip level, for the filtered presentation downscale (see PresentFilter).
+	vk::ImageView mips_view    = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
 
@@ -49,6 +53,7 @@ public:
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
 		for (auto& frame: m_frames) {
 			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
+			m_window.graphic_ctx.device.destroyImageView(frame->mips_view, nullptr);
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
 			}
@@ -178,7 +183,9 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 
 	if (dst.image != nullptr) {
 		graphics.device.destroyImageView(view, nullptr);
-		view = nullptr;
+		graphics.device.destroyImageView(mips_view, nullptr);
+		view      = nullptr;
+		mips_view = nullptr;
 		graphics.DeleteImage(dst);
 	}
 
@@ -311,6 +318,180 @@ void RecordPresentDownscale(vk::CommandBuffer command, vk::Image image, vk::Exte
 	}
 }
 
+// A pipeline that draws the fullscreen triangle with `fragment` into one `format` attachment,
+// optionally blending premultiplied alpha over it.
+static vk::Pipeline CreateFullscreenPipeline(vk::Device device, vk::PipelineLayout layout,
+                                             std::span<const uint32_t> fragment_code,
+                                             vk::Format format, bool blend_over) {
+	const auto vertex   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, device);
+	const auto fragment = CompileSPV(fragment_code, device);
+	std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
+	stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
+	stages[0].module = vertex;
+	stages[0].pName  = "main";
+	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
+	stages[1].module = fragment;
+	stages[1].pName  = "main";
+	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
+	vk::PipelineInputAssemblyStateCreateInfo assembly {};
+	assembly.topology = vk::PrimitiveTopology::eTriangleList;
+	vk::PipelineViewportStateCreateInfo viewport {};
+	viewport.viewportCount = 1;
+	viewport.scissorCount  = 1;
+	vk::PipelineRasterizationStateCreateInfo rasterization {};
+	rasterization.lineWidth = 1.0f;
+	vk::PipelineMultisampleStateCreateInfo multisample {};
+	multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+	vk::PipelineColorBlendAttachmentState attachment {};
+	attachment.blendEnable         = blend_over ? VK_TRUE : VK_FALSE;
+	attachment.srcColorBlendFactor = vk::BlendFactor::eOne;
+	attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+	attachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+	attachment.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+	attachment.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+	                            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+	vk::PipelineColorBlendStateCreateInfo blend {};
+	blend.attachmentCount = 1;
+	blend.pAttachments    = &attachment;
+	const std::array dynamic_states {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo dynamic {};
+	dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
+	dynamic.pDynamicStates    = dynamic_states.data();
+	vk::PipelineRenderingCreateInfo rendering {};
+	rendering.colorAttachmentCount    = 1;
+	rendering.pColorAttachmentFormats = &format;
+	vk::GraphicsPipelineCreateInfo create {};
+	create.pNext               = &rendering;
+	create.stageCount          = static_cast<uint32_t>(stages.size());
+	create.pStages             = stages.data();
+	create.pVertexInputState   = &vertex_input;
+	create.pInputAssemblyState = &assembly;
+	create.pViewportState      = &viewport;
+	create.pRasterizationState = &rasterization;
+	create.pMultisampleState   = &multisample;
+	create.pColorBlendState    = &blend;
+	create.pDynamicState       = &dynamic;
+	create.layout              = layout;
+	vk::Pipeline pipeline      = nullptr;
+	RequireVulkanSuccess(device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
+	                     "create video-out fullscreen pipeline");
+	device.destroyShaderModule(fragment, nullptr);
+	device.destroyShaderModule(vertex, nullptr);
+	return pipeline;
+}
+
+// A combined image sampler at binding 0, pushed per draw.
+static vk::DescriptorSetLayout CreatePushedSamplerLayout(vk::Device device) {
+	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eCombinedImageSampler, 1,
+	                                              vk::ShaderStageFlagBits::eFragment};
+	vk::DescriptorSetLayoutCreateInfo    descriptors {};
+	descriptors.flags              = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	descriptors.bindingCount       = 1;
+	descriptors.pBindings          = &binding;
+	vk::DescriptorSetLayout layout = nullptr;
+	RequireVulkanSuccess(device.createDescriptorSetLayout(&descriptors, nullptr, &layout),
+	                     "create video-out descriptor layout");
+	return layout;
+}
+
+bool PresentNeedsFilter(vk::Extent2D source, vk::Extent2D target) noexcept {
+	const bool shrinks = source.width > target.width || source.height > target.height;
+	const bool halves =
+	    source.width == 2ull * target.width && source.height == 2ull * target.height;
+	return shrinks && !halves && source.width <= 2ull * target.width &&
+	       source.height <= 2ull * target.height;
+}
+
+void PresentFilter::Record(vk::Device device, vk::CommandBuffer command, vk::ImageView source_view,
+                           uint32_t level, vk::Extent2D source, vk::ImageView target_view,
+                           vk::Format target_format, vk::Extent2D target) {
+	struct Constants {
+		int32_t  size[2];
+		float    scale[2];
+		uint32_t level;
+	};
+	static_assert(sizeof(Constants) == 20);
+	if (m_layout == nullptr) {
+		vk::SamplerCreateInfo sampler {};
+		sampler.magFilter    = vk::Filter::eLinear;
+		sampler.minFilter    = vk::Filter::eLinear;
+		sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+		sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+		sampler.maxLod       = VK_LOD_CLAMP_NONE;
+		RequireVulkanSuccess(device.createSampler(&sampler, nullptr, &m_sampler),
+		                     "create video-out downscale sampler");
+		m_descriptors = CreatePushedSamplerLayout(device);
+		const vk::PushConstantRange  constants {vk::ShaderStageFlagBits::eFragment, 0,
+		                                        sizeof(Constants)};
+		vk::PipelineLayoutCreateInfo layout {};
+		layout.setLayoutCount         = 1;
+		layout.pSetLayouts            = &m_descriptors;
+		layout.pushConstantRangeCount = 1;
+		layout.pPushConstantRanges    = &constants;
+		RequireVulkanSuccess(device.createPipelineLayout(&layout, nullptr, &m_layout),
+		                     "create video-out downscale pipeline layout");
+	}
+	if (m_pipeline != nullptr && m_format != target_format) {
+		device.destroyPipeline(m_pipeline, nullptr);
+		m_pipeline = nullptr;
+	}
+	if (m_pipeline == nullptr) {
+		m_pipeline = CreateFullscreenPipeline(device, m_layout, GPU_VIDEO_OUT_DOWNSCALE_SPV,
+		                                      target_format, false);
+		m_format   = target_format;
+	}
+
+	const vk::DescriptorImageInfo image {m_sampler, source_view,
+	                                     vk::ImageLayout::eShaderReadOnlyOptimal};
+	vk::WriteDescriptorSet        write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+	write.pImageInfo      = &image;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_layout, 0, 1, &write);
+	const Constants constants {
+	    {static_cast<int32_t>(source.width), static_cast<int32_t>(source.height)},
+	    {static_cast<float>(source.width) / static_cast<float>(target.width),
+		 static_cast<float>(source.height) / static_cast<float>(target.height)},
+	    level};
+	command.pushConstants(m_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants),
+	                      &constants);
+	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_pipeline);
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = target_view;
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eDontCare;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = target;
+	rendering.layerCount           = 1;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	command.beginRendering(&rendering);
+	const vk::Viewport viewport {
+	    0.0f, 0.0f, static_cast<float>(target.width), static_cast<float>(target.height),
+	    0.0f, 1.0f};
+	const vk::Rect2D scissor {{0, 0}, target};
+	command.setViewport(0, 1, &viewport);
+	command.setScissor(0, 1, &scissor);
+	command.draw(3, 1, 0, 0);
+	command.endRendering();
+}
+
+void PresentFilter::Release(vk::Device device) {
+	device.destroyPipeline(m_pipeline, nullptr);
+	device.destroyPipelineLayout(m_layout, nullptr);
+	device.destroyDescriptorSetLayout(m_descriptors, nullptr);
+	device.destroySampler(m_sampler, nullptr);
+	m_pipeline    = nullptr;
+	m_layout      = nullptr;
+	m_descriptors = nullptr;
+	m_sampler     = nullptr;
+	m_format      = vk::Format::eUndefined;
+}
+
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
 	command_buffer.EndRendering();
 	auto command = command_buffer.Handle();
@@ -361,6 +542,7 @@ private:
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
+	PresentFilter                  m_filter;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
 };
@@ -571,6 +753,7 @@ void Swapchain::Destroy() {
 	m_overlay_layout      = nullptr;
 	m_overlay_descriptors = nullptr;
 	m_overlay_sampler     = nullptr;
+	m_filter.Release(graphics.device);
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
@@ -669,15 +852,7 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
 		RequireVulkanSuccess(device.createSampler(&sampler, nullptr, &m_overlay_sampler),
 		                     "create video-out overlay sampler");
-		const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eCombinedImageSampler,
-		                                              1, vk::ShaderStageFlagBits::eFragment};
-		vk::DescriptorSetLayoutCreateInfo    descriptors {};
-		descriptors.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-		descriptors.bindingCount = 1;
-		descriptors.pBindings    = &binding;
-		RequireVulkanSuccess(
-		    device.createDescriptorSetLayout(&descriptors, nullptr, &m_overlay_descriptors),
-		    "create video-out overlay descriptor layout");
+		m_overlay_descriptors = CreatePushedSamplerLayout(device);
 		const vk::PushConstantRange alpha {vk::ShaderStageFlagBits::eFragment, 0, sizeof(uint32_t)};
 		vk::PipelineLayoutCreateInfo layout {};
 		layout.setLayoutCount         = 1;
@@ -686,61 +861,8 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 		layout.pPushConstantRanges    = &alpha;
 		RequireVulkanSuccess(device.createPipelineLayout(&layout, nullptr, &m_overlay_layout),
 		                     "create video-out overlay pipeline layout");
-		const auto vertex   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, device);
-		const auto fragment = CompileSPV(GPU_VIDEO_OUT_OVERLAY_SPV, device);
-		std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
-		stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
-		stages[0].module = vertex;
-		stages[0].pName  = "main";
-		stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-		stages[1].module = fragment;
-		stages[1].pName  = "main";
-		vk::PipelineVertexInputStateCreateInfo   vertex_input {};
-		vk::PipelineInputAssemblyStateCreateInfo assembly {};
-		assembly.topology = vk::PrimitiveTopology::eTriangleList;
-		vk::PipelineViewportStateCreateInfo viewport {};
-		viewport.viewportCount = 1;
-		viewport.scissorCount  = 1;
-		vk::PipelineRasterizationStateCreateInfo rasterization {};
-		rasterization.lineWidth = 1.0f;
-		vk::PipelineMultisampleStateCreateInfo multisample {};
-		multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
-		vk::PipelineColorBlendAttachmentState attachment {};
-		attachment.blendEnable         = VK_TRUE;
-		attachment.srcColorBlendFactor = vk::BlendFactor::eOne;
-		attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-		attachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
-		attachment.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-		attachment.colorWriteMask = vk::ColorComponentFlagBits::eR |
-		                            vk::ColorComponentFlagBits::eG |
-		                            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
-		vk::PipelineColorBlendStateCreateInfo blend {};
-		blend.attachmentCount = 1;
-		blend.pAttachments    = &attachment;
-		const std::array dynamic_states {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
-		vk::PipelineDynamicStateCreateInfo dynamic {};
-		dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
-		dynamic.pDynamicStates    = dynamic_states.data();
-		vk::PipelineRenderingCreateInfo rendering {};
-		rendering.colorAttachmentCount    = 1;
-		rendering.pColorAttachmentFormats = &m_format;
-		vk::GraphicsPipelineCreateInfo create {};
-		create.pNext               = &rendering;
-		create.stageCount          = static_cast<uint32_t>(stages.size());
-		create.pStages             = stages.data();
-		create.pVertexInputState   = &vertex_input;
-		create.pInputAssemblyState = &assembly;
-		create.pViewportState      = &viewport;
-		create.pRasterizationState = &rasterization;
-		create.pMultisampleState   = &multisample;
-		create.pColorBlendState    = &blend;
-		create.pDynamicState       = &dynamic;
-		create.layout              = m_overlay_layout;
-		RequireVulkanSuccess(
-		    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_overlay_pipeline),
-		    "create video-out overlay pipeline");
-		device.destroyShaderModule(fragment, nullptr);
-		device.destroyShaderModule(vertex, nullptr);
+		m_overlay_pipeline = CreateFullscreenPipeline(device, m_overlay_layout,
+		                                              GPU_VIDEO_OUT_OVERLAY_SPV, m_format, true);
 	}
 	auto& frame = *layer.frame;
 	if (frame.view == nullptr) {
@@ -803,21 +925,40 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	}
 
 	// A large frame shrinks through its mip chain first, so the final blit never skips source
-	// texels (see PresentSourceLevel).
+	// texels (see PresentSourceLevel). Shrinking by less than 2x draws with PresentFilter.
 	uint32_t     source_level = 0;
 	vk::Extent2D blit_extent {};
+	bool         filtered = false;
 	if (source != nullptr) {
 		const vk::Extent2D source_extent {source->image.extent.width, source->image.extent.height};
 		source_level = PresentSourceLevel(source_extent, m_extent, source->image.mip_levels);
 		RecordPresentDownscale(vk_command, source->image.image, source_extent, source_level);
 		blit_extent = MipExtent(source_extent, source_level);
+		filtered    = PresentNeedsFilter(blit_extent, m_extent);
+		if (filtered) {
+			if (source->mips_view == nullptr) {
+				vk::ImageViewCreateInfo view {};
+				view.image            = source->image.image;
+				view.viewType         = vk::ImageViewType::e2D;
+				view.format           = source->image.format;
+				view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0,
+				                         source->image.mip_levels, 0, 1};
+				RequireVulkanSuccess(
+				    m_window.graphic_ctx.device.createImageView(&view, nullptr, &source->mips_view),
+				    "create presentation source view");
+			}
+			source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
+			                vk::AccessFlagBits2::eShaderRead);
+		}
 	}
 
 	vk::ImageMemoryBarrier to_transfer {};
-	to_transfer.sType                           = vk::StructureType::eImageMemoryBarrier;
-	to_transfer.dstAccessMask                   = vk::AccessFlagBits::eTransferWrite;
-	to_transfer.oldLayout                       = vk::ImageLayout::eUndefined;
-	to_transfer.newLayout                       = vk::ImageLayout::eTransferDstOptimal;
+	to_transfer.sType = vk::StructureType::eImageMemoryBarrier;
+	to_transfer.dstAccessMask =
+	    filtered ? vk::AccessFlagBits::eColorAttachmentWrite : vk::AccessFlagBits::eTransferWrite;
+	to_transfer.oldLayout = vk::ImageLayout::eUndefined;
+	to_transfer.newLayout =
+	    filtered ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eTransferDstOptimal;
 	to_transfer.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_transfer.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_transfer.image                           = m_images[m_image_index];
@@ -827,11 +968,15 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_transfer.subresourceRange.baseArrayLayer = 0;
 	to_transfer.subresourceRange.layerCount     = 1;
 	// Match the acquire wait stage so the layout transition cannot precede acquisition.
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
-	                           nullptr, 0, nullptr, 1, &to_transfer);
+	const auto write_stage = filtered ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+	                                  : vk::PipelineStageFlagBits::eTransfer;
+	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, write_stage,
+	                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &to_transfer);
 
-	if (source != nullptr) {
+	if (filtered) {
+		m_filter.Record(m_window.graphic_ctx.device, vk_command, source->mips_view, source_level,
+		                blit_extent, m_image_views[m_image_index], m_format, m_extent);
+	} else if (source != nullptr) {
 		vk::ImageBlit region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 		region.srcSubresource.mipLevel       = source_level;
@@ -858,11 +1003,12 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 
 	vk::ImageMemoryBarrier to_present {};
 	to_present.sType               = vk::StructureType::eImageMemoryBarrier;
-	to_present.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	to_present.srcAccessMask =
+	    filtered ? vk::AccessFlagBits::eColorAttachmentWrite : vk::AccessFlagBits::eTransferWrite;
 	to_present.dstAccessMask       = draw_attachment ? vk::AccessFlagBits::eColorAttachmentRead |
 	                                                       vk::AccessFlagBits::eColorAttachmentWrite
 	                                                 : vk::AccessFlagBits::eMemoryRead;
-	to_present.oldLayout           = vk::ImageLayout::eTransferDstOptimal;
+	to_present.oldLayout           = to_transfer.newLayout;
 	to_present.newLayout           = draw_attachment ? vk::ImageLayout::eColorAttachmentOptimal
 	                                                 : vk::ImageLayout::ePresentSrcKHR;
 	to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -873,7 +1019,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_present.subresourceRange.levelCount     = 1;
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	vk_command.pipelineBarrier(write_stage,
 	                           draw_attachment ? vk::PipelineStageFlagBits::eColorAttachmentOutput
 	                                           : vk::PipelineStageFlagBits::eAllCommands,
 	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
