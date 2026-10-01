@@ -8,11 +8,14 @@
 // SHA-256 of the recompiler and pipeline sources; keys the per-title shader caches.
 #define KYTY_SHADER_CACHE_KEY "@KYTY_SHADER_CACHE_KEY@"
 
+// The product name: in the window title, the log, crash reports and the Vulkan application info.
+#define KYTY_PRODUCT_NAME "BryKytyPS5"
+
 /* Build provenance, shown in the window title and in crash reports. */
 #if defined(KYTY_OFFICIAL_BUILD)
-#define KYTY_BUILD_LABEL "Official build " KYTY_RELEASE_TAG
+#define KYTY_BUILD_LABEL KYTY_PRODUCT_NAME " official build " KYTY_RELEASE_TAG
 #elif defined(KYTY_FORK_BUILD)
-#define KYTY_BUILD_LABEL "Fork build " KYTY_BUILD_REPOSITORY " " KYTY_GIT_HASH
+#define KYTY_BUILD_LABEL KYTY_PRODUCT_NAME " fork build " KYTY_BUILD_REPOSITORY " " KYTY_GIT_HASH
 #else
-#define KYTY_BUILD_LABEL "Source build " KYTY_GIT_HASH
+#define KYTY_BUILD_LABEL KYTY_PRODUCT_NAME " source build " KYTY_GIT_HASH
 #endif

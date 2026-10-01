@@ -156,7 +156,7 @@ std::unique_ptr<WindowContext> g_window;
 
 } // namespace
 
-constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
+constexpr const char* KYTY_SDL_WINDOW_CAPTION = KYTY_PRODUCT_NAME;
 
 static void SetPause(WindowLoopState& game, bool flag) {
 	LOGF("Pause: %s\n", flag ? "true" : "false");

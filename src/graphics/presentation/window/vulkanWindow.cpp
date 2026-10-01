@@ -1006,9 +1006,11 @@ void WindowContext::CreateVulkan() {
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
-	app_info.pApplicationName   = "Kyty";
+	// The product name (KYTY_PRODUCT_NAME), spelled out here so this file does not rebuild with
+	// every commit's version header.
+	app_info.pApplicationName   = "BryKytyPS5";
 	app_info.applicationVersion = 1;
-	app_info.pEngineName        = "Kyty";
+	app_info.pEngineName        = "BryKytyPS5";
 	app_info.engineVersion      = 1;
 	app_info.apiVersion         = VULKAN_TARGET_API_VERSION; // NOLINT
 
