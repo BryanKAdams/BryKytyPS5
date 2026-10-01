@@ -12,11 +12,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
-#include <intrin.h>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+// __rdtsc: <intrin.h> is MSVC's (and clang-cl's); GCC and Clang elsewhere declare it in
+// <x86intrin.h>.
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 namespace Libs::Graphics {
 

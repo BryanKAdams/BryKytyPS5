@@ -18,7 +18,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fmt/format.h>
-#include <intrin.h>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -26,6 +25,14 @@
 #include <unordered_map>
 #include <vector>
 #include <xxhash.h>
+
+// __rdtsc: <intrin.h> is MSVC's (and clang-cl's); GCC and Clang elsewhere declare it in
+// <x86intrin.h>.
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 namespace Libs::Graphics {
 
