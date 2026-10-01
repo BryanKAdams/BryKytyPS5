@@ -1,15 +1,19 @@
-# KytyPS5
+# BryKytyPS5
 
-[![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (macOS)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
-**[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes and ongoing development.
+**BryKytyPS5** is Bryan's PlayStation 5 emulator: a fork of
+[KytyPS5](https://github.com/KytyPS5/KytyPS5), which is itself based on
+[Kyty](https://github.com/InoriRus/Kyty). It focuses on performance and rendering fixes, measured
+on Astro Bot with AMD hardware, and merges upstream KytyPS5 regularly. The emulator, its binaries
+and its options keep the KytyPS5 names, and the rest of this README is KytyPS5's and applies here
+too.
 
-**[Development on Discord](https://discord.gg/UNrkMqGaBg)** — KytyPS5 development.
+Upstream KytyPS5: **[weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** (game
+progress, recent fixes and ongoing development) and
+**[development on Discord](https://discord.gg/UNrkMqGaBg)**.
 
 KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
 with experimental macOS support. It is based on a heavily modified version of
@@ -379,16 +383,18 @@ untested generated changes may be closed without review.
 
 ## License
 
-KytyPS5 is licensed under the [GNU General Public License version 2](LICENSE)
-(`GPL-2.0-only`).
+BryKytyPS5, like KytyPS5, is licensed under the
+[GNU General Public License version 2](LICENSE) (`GPL-2.0-only`).
 
-This project is based on the original [Kyty](https://github.com/InoriRus/Kyty), which was released
-under the MIT License. Kyty's original copyright and license notice are preserved in
-[`LICENSES/Kyty-MIT.txt`](LICENSES/Kyty-MIT.txt). Third-party components remain subject to the
-licenses included with those components.
+BryKytyPS5 is a fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5), which is based on the
+original [Kyty](https://github.com/InoriRus/Kyty), released under the MIT License. Kyty's original
+copyright and license notice are preserved in [`LICENSES/Kyty-MIT.txt`](LICENSES/Kyty-MIT.txt).
+Third-party components remain subject to the licenses included with those components.
 
 ## Special Thanks
 
+- [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5) — BryKytyPS5 is a fork of KytyPS5; the
+  emulator is the work of its developers and contributors.
 - [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
   of the original Kyty project.
 - [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
