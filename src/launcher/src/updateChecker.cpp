@@ -16,9 +16,12 @@
 
 namespace {
 
-constexpr char DEFAULT_FEED_URL[]  = "https://kytyps5.github.io/data/updates.json";
+// BryKytyPS5's own releases: upstream KytyPS5's feed would offer its builds as updates to ours.
+// The fallback repeats the request once.
+constexpr char DEFAULT_FEED_URL[] =
+    "https://api.github.com/repos/BryanKAdams/BryKytyPS5/releases/latest";
 constexpr char FALLBACK_FEED_URL[] =
-    "https://api.github.com/repos/KytyPS5/KytyPS5/releases/latest";
+    "https://api.github.com/repos/BryanKAdams/BryKytyPS5/releases/latest";
 
 } // namespace
 
@@ -136,7 +139,7 @@ void UpdateChecker::ShowUpdateResult(const UpdateInfo& info, bool manual) {
 	    tr("An update is available.\n\nCurrent: %1\nLatest: %2\n\n"
 	       "Open the release page?")
 	        .arg(QString::fromLatin1(KYTY_RELEASE_TAG), info.tag);
-	if (QMessageBox::question(m_parent, tr("KytyPS5 Update"), message,
+	if (QMessageBox::question(m_parent, tr("BryKytyPS5 Update"), message,
 	                          QMessageBox::Open | QMessageBox::Cancel,
 	                          QMessageBox::Open) == QMessageBox::Open) {
 		QDesktopServices::openUrl(info.page_url);

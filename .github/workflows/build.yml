@@ -1,18 +1,18 @@
-name: Build and Release KytyPS5
+name: Build and Release BryKytyPS5
 
+# Releases are cut by hand (Actions > Build and Release BryKytyPS5 > Run workflow), so only work
+# Bryan has chosen to publish is released, and pushes to the private repo cost no build minutes.
 on:
   workflow_dispatch:
-  push:
-    branches: [ main, master ]
-  pull_request:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   SCCACHE_GHA_ENABLED: "true"
-  KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
+  # Official (release-tagged) builds only in the public BryKytyPS5 repository; copies build as forks.
+  KYTY_BUILD_ORIGIN: ${{ github.repository == 'BryanKAdams/BryKytyPS5' && 'Official' || 'Fork' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
         id: release_tag
         shell: bash
         run: |
-          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "value=BryKytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Build KytyPS5 (Windows)
@@ -431,11 +431,11 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Release KytyPS5
+    name: Release BryKytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'BryanKAdams/BryKytyPS5' &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
