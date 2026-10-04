@@ -799,6 +799,35 @@ void CollectReciprocalSquareRoots(const DecodedFunction& function,
 	}
 }
 
+// A host without SSE4a/MONITORX traps these instructions and emulates them in the exception
+// handler. Windows builds the exception frame just below RSP, which would overwrite a red zone
+// that is live at the instruction, so such sites run with RSP lowered past the red zone.
+bool IsHostEmulatedAmdInstruction(const ZydisDecodedInstruction& instruction) {
+	switch (instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_EXTRQ:
+		case ZYDIS_MNEMONIC_INSERTQ:
+		case ZYDIS_MNEMONIC_MONITORX:
+		case ZYDIS_MNEMONIC_MWAITX: return true;
+		default: return false;
+	}
+}
+
+void CollectHostEmulatedAmdInstructions(const DecodedFunction& function,
+                                        std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                        RedZonePatchResult& result) {
+	if (!function.uses_red_zone) {
+		return;
+	}
+	for (const auto& [address, decoded]: function.instructions) {
+		if (!IsHostEmulatedAmdInstruction(decoded.instruction) || !decoded.red_zone_live.any() ||
+		    rewrite_sites.contains(address)) {
+			continue;
+		}
+		rewrite_sites[address].protect_red_zone = true;
+		++result.host_emulated_instruction_count;
+	}
+}
+
 uint64_t ApplyReciprocalSquareRootPatches(const PatchModule& module,
                                         std::span<const ReciprocalSquareRootSite> sites,
                                         uint64_t trampoline_addr, uint64_t trampoline_size) {
@@ -1242,7 +1271,8 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 
 RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                           std::span<const uintptr_t> function_starts,
-                                          bool protect_memory, bool emulate_rsqrt) {
+                                          bool protect_memory, bool emulate_rsqrt,
+                                          bool protect_sse4a) {
 	RedZonePatchResult result {};
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
@@ -1289,6 +1319,9 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 		if (emulate_rsqrt) {
 			CollectReciprocalSquareRoots(function, rewrite_sites, reciprocal_sqrt_sites);
 		}
+		if (protect_sse4a) {
+			CollectHostEmulatedAmdInstructions(function, rewrite_sites, result);
+		}
 		if (!rewrite_sites.empty()) {
 			RelocateRedZoneInstructions(module, function, rewrite_sites, result);
 		}
@@ -1311,7 +1344,7 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 
 #else
 
-RedZonePatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool) {
+RedZonePatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool, bool) {
 	return {};
 }
 

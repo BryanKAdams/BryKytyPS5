@@ -37,6 +37,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <intrin.h>
 #include <windows.h>
 #else
 #if defined(__APPLE__)
@@ -655,6 +656,19 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 #endif
 	return true;
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// CPUID 0x80000001 ECX bit 6: SSE4a (AMD only; EXTRQ, INSERTQ, MOVNTSS, MOVNTSD).
+static bool HostHasSse4a() {
+	int regs[4] {};
+	__cpuid(regs, static_cast<int>(0x80000000u));
+	if (static_cast<unsigned>(regs[0]) < 0x80000001u) {
+		return false;
+	}
+	__cpuid(regs, static_cast<int>(0x80000001u));
+	return (regs[2] & (1 << 6)) != 0;
+}
+#endif
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
@@ -1817,8 +1831,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	const bool emulate_rsqrt = Config::AmdCpuEnabled();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool         protect_memory_faults   = Config::RedZoneProtectionEnabled();
-	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt;
+	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
+	// Guest code uses SSE4a (EXTRQ/INSERTQ) heavily. Without it on the host (every Intel CPU) each
+	// one is a trapped, emulated exception whose frame Windows builds below RSP, over a live red zone.
+	const bool         protect_sse4a           = !HostHasSse4a();
+	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt || protect_sse4a;
 	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (use_red_zone_protection) {
 		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
@@ -1951,16 +1968,16 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		if (use_red_zone_protection) {
 			const auto result =
 			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                           protect_memory_faults, emulate_rsqrt);
+			                           protect_memory_faults, emulate_rsqrt, protect_sse4a);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
+			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 ", host_emulated=%" PRIu64 "\n",
 			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
 			     result.red_zone_function_count, result.memory_instruction_count,
 			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
 			     result.stack_dependent_memory_instruction_count,
 			     result.control_flow_memory_instruction_count,
-			     result.unrelocatable_memory_instruction_count);
+			     result.unrelocatable_memory_instruction_count, result.host_emulated_instruction_count);
 			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
 		}
 #else

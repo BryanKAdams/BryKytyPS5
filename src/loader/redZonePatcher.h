@@ -23,6 +23,7 @@ struct RedZonePatchResult {
 	uint64_t unrelocatable_memory_instruction_count   = 0;
 	uint64_t indirect_red_zone_function_count         = 0;
 	uint64_t reciprocal_sqrt_instruction_count        = 0;
+	uint64_t host_emulated_instruction_count          = 0;
 };
 
 void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,
@@ -30,9 +31,12 @@ void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* tr
 void UnregisterRedZonePatchModule(void* module_ptr);
 
 // Analyze and protect fault sites before replacing reciprocal roots with traps.
+// protect_sse4a keeps the red zone intact around AMD-only instructions (EXTRQ, INSERTQ,
+// MONITORX, MWAITX) that a host without them traps and emulates.
 RedZonePatchResult PatchGuestInstructions(uint64_t segment_addr, uint64_t segment_size,
                                           std::span<const uintptr_t> function_starts,
-                                          bool protect_memory, bool emulate_rsqrt);
+                                          bool protect_memory, bool emulate_rsqrt,
+                                          bool protect_sse4a = false);
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);
